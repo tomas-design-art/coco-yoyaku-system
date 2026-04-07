@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# セキュリティ: 非rootユーザーで実行
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# 静的ファイルの権限設定
+RUN chown -R appuser:appuser /app
+
+USER appuser
+
+# 本番: --reload なし, ワーカー数2, アクセスログ有効
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--access-log"]

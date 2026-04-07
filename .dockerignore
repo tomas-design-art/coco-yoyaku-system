@@ -1,0 +1,30 @@
+# VCS / local cache
+.git
+.gitignore
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+
+# Environments / secrets
+.env
+.env.*
+!.env.example
+!.env.prod.example
+
+# Local data and logs
+*.log
+*.sqlite
+*.db
+*.bak
+*.tmp
+
+# Build caches
+node_modules
+frontend/node_modules
+backend/.venv
+.venv
+
+# Editor files
+.vscode
+.idea

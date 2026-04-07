@@ -1,0 +1,295 @@
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, or_, and_
+from typing import Literal
+import re
+
+from app.database import get_db
+from app.models.patient import Patient
+from app.schemas.patient import (
+    PatientCreate, PatientUpdate, PatientResponse, PatientPageResponse,
+    CandidateQuery, CandidateResponse, _normalize_phone, build_name,
+)
+
+router = APIRouter(prefix="/api/patients", tags=["patients"])
+
+
+def _normalize_for_compare(s: str | None) -> str:
+    """比較用の正規化文字列"""
+    if not s:
+        return ""
+    s = s.replace("\u3000", " ")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip().lower()
+
+
+async def _generate_patient_number(db: AsyncSession) -> str:
+    """P000001 形式で一意な患者番号を自動採番"""
+    result = await db.execute(
+        select(func.max(Patient.patient_number))
+        .where(Patient.patient_number.op("~")(r"^P\d+$"))
+    )
+    max_num = result.scalar()
+    if max_num:
+        next_val = int(max_num[1:]) + 1
+    else:
+        next_val = 1
+    return f"P{next_val:06d}"
+
+
+@router.get("/search", response_model=list[PatientResponse])
+async def search_patients(q: str = Query(..., min_length=1), db: AsyncSession = Depends(get_db)):
+    """名前・読み方・診察券番号・電話番号で部分一致検索(active only)"""
+    normalized_q = _normalize_for_compare(q)
+    phone_q = _normalize_phone(q) or q
+    result = await db.execute(
+        select(Patient).where(
+            and_(
+                Patient.is_active == True,
+                or_(
+                    Patient.name.ilike(f"%{normalized_q}%"),
+                    Patient.last_name.ilike(f"%{normalized_q}%"),
+                    Patient.first_name.ilike(f"%{normalized_q}%"),
+                    Patient.reading.ilike(f"%{normalized_q}%"),
+                    Patient.last_name_kana.ilike(f"%{normalized_q}%"),
+                    Patient.first_name_kana.ilike(f"%{normalized_q}%"),
+                    Patient.patient_number.ilike(f"%{q}%"),
+                    Patient.phone.ilike(f"%{phone_q}%"),
+                ),
+            )
+        ).order_by(Patient.name).limit(50)
+    )
+    return result.scalars().all()
+
+
+@router.post("/candidates", response_model=list[CandidateResponse])
+async def find_candidates(data: CandidateQuery, db: AsyncSession = Depends(get_db)):
+    """既存患者候補を検索 — 広範囲マッチで重複を防止"""
+    # 検索用の名前を組み立て
+    if data.registration_mode == "full_name":
+        query_name = _normalize_for_compare(data.full_name)
+    else:
+        query_name = _normalize_for_compare(
+            f"{data.last_name or ''} {data.first_name or ''}".strip()
+        )
+    query_name_nospace = query_name.replace(" ", "")
+
+    if not query_name_nospace:
+        return []
+
+    reading_q = _normalize_for_compare(data.reading) if data.reading else None
+    phone_q = _normalize_phone(data.phone) if data.phone else None
+
+    # 広範囲でOR検索
+    conditions = [
+        func.lower(func.replace(func.replace(Patient.name, "\u3000", " "), " ", ""))
+            .ilike(f"%{query_name_nospace}%"),
+    ]
+    if data.registration_mode == "split" and data.last_name:
+        conditions.append(
+            func.lower(func.trim(Patient.last_name)) == _normalize_for_compare(data.last_name)
+        )
+    if reading_q:
+        conditions.append(
+            func.lower(func.replace(func.replace(Patient.reading, "\u3000", " "), " ", ""))
+                .ilike(f"%{reading_q.replace(' ', '')}%")
+        )
+    if phone_q:
+        conditions.append(
+            func.replace(func.replace(Patient.phone, "-", ""), "ー", "") == phone_q
+        )
+
+    result = await db.execute(
+        select(Patient).where(
+            and_(
+                Patient.is_active == True,
+                or_(*conditions),
+            )
+        ).limit(50)
+    )
+    candidates = result.scalars().all()
+
+    responses = []
+    for p in candidates:
+        reasons = []
+        p_full = _normalize_for_compare(p.name)
+        p_full_nospace = p_full.replace(" ", "")
+        p_ln = _normalize_for_compare(p.last_name)
+        p_fn = _normalize_for_compare(p.first_name)
+
+        # 氏名一致判定
+        if data.registration_mode == "split":
+            ln = _normalize_for_compare(data.last_name)
+            fn = _normalize_for_compare(data.first_name)
+            if p_ln == ln and p_fn == fn:
+                reasons.append("姓名一致")
+            elif p_full_nospace == query_name_nospace:
+                reasons.append("氏名一致")
+            elif p_ln == ln:
+                reasons.append("姓一致")
+        else:
+            if p_full_nospace == query_name_nospace:
+                reasons.append("氏名一致")
+            elif query_name_nospace and query_name_nospace in p_full_nospace:
+                reasons.append("氏名部分一致")
+
+        # 読み方一致
+        if reading_q:
+            p_reading = _normalize_for_compare(p.reading)
+            p_kana = _normalize_for_compare(
+                f"{p.last_name_kana or ''} {p.first_name_kana or ''}".strip()
+            )
+            if p_reading and reading_q.replace(" ", "") == p_reading.replace(" ", ""):
+                reasons.append("読み方一致")
+            elif p_kana and reading_q.replace(" ", "") == p_kana.replace(" ", ""):
+                reasons.append("読み方一致")
+
+        # 電話番号一致
+        if phone_q and p.phone:
+            if _normalize_phone(p.phone) == phone_q:
+                if not reasons:
+                    reasons.append("電話番号一致")
+                else:
+                    reasons.append("電話番号一致")
+
+        # 生年月日一致
+        if data.birth_date and p.birth_date:
+            if p.birth_date == data.birth_date:
+                if not reasons:
+                    reasons.append("生年月日一致")
+                else:
+                    reasons.append("生年月日一致")
+
+        if reasons:
+            responses.append(CandidateResponse(
+                patient=PatientResponse.model_validate(p),
+                match_reasons=reasons,
+            ))
+
+    return responses
+
+
+@router.get("/", response_model=PatientPageResponse)
+async def list_patients(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(30, ge=1, le=100),
+    sort_by: Literal["name", "patient_number", "created_at"] = Query("name"),
+    sort_order: Literal["asc", "desc"] = Query("asc"),
+    include_inactive: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+):
+    base_filter = True if include_inactive else Patient.is_active == True
+
+    total_result = await db.execute(
+        select(func.count(Patient.id)).where(base_filter)
+    )
+    total = total_result.scalar() or 0
+
+    sort_col = {
+        "name": Patient.name,
+        "patient_number": Patient.patient_number,
+        "created_at": Patient.created_at,
+    }[sort_by]
+    order = sort_col.asc() if sort_order == "asc" else sort_col.desc()
+
+    offset = (page - 1) * per_page
+    result = await db.execute(
+        select(Patient).where(base_filter).order_by(order).offset(offset).limit(per_page)
+    )
+    items = result.scalars().all()
+    return PatientPageResponse(items=items, total=total, page=page, per_page=per_page)
+
+
+@router.get("/{patient_id}", response_model=PatientResponse)
+async def get_patient(patient_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Patient).where(Patient.id == patient_id))
+    patient = result.scalar_one_or_none()
+    if not patient:
+        raise HTTPException(status_code=404, detail="患者が見つかりません")
+    return patient
+
+
+@router.post("/", response_model=PatientResponse, status_code=201)
+async def create_patient(data: PatientCreate, db: AsyncSession = Depends(get_db)):
+    patient_number = await _generate_patient_number(db)
+    name = build_name(data.registration_mode, data.last_name, data.middle_name,
+                      data.first_name, data.full_name)
+
+    # full_name モードでも互換性のため reading → kana に転記
+    dump = data.model_dump(exclude={"full_name"})
+    if data.registration_mode == "full_name" and data.full_name:
+        dump["last_name"] = data.full_name  # 互換: last_name に格納
+        dump["first_name"] = None
+
+    patient = Patient(
+        **dump,
+        name=name,
+        patient_number=patient_number,
+    )
+    db.add(patient)
+    await db.commit()
+    await db.refresh(patient)
+    return patient
+
+
+@router.put("/{patient_id}", response_model=PatientResponse)
+async def update_patient(
+    patient_id: int, data: PatientUpdate, db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(select(Patient).where(Patient.id == patient_id))
+    patient = result.scalar_one_or_none()
+    if not patient:
+        raise HTTPException(status_code=404, detail="患者が見つかりません")
+
+    update_data = data.model_dump(exclude_unset=True)
+    full_name_val = update_data.pop("full_name", None)
+
+    for key, value in update_data.items():
+        setattr(patient, key, value)
+
+    # name を再生成
+    mode = update_data.get("registration_mode", patient.registration_mode) or "split"
+    if mode == "full_name" and full_name_val:
+        patient.name = full_name_val
+        patient.last_name = full_name_val
+        patient.first_name = None
+        patient.middle_name = None
+    else:
+        ln = update_data.get("last_name", patient.last_name) or ""
+        mn = update_data.get("middle_name", patient.middle_name) or ""
+        fn = update_data.get("first_name", patient.first_name) or ""
+        patient.name = " ".join(p for p in [ln, mn, fn] if p)
+
+    await db.commit()
+    await db.refresh(patient)
+    return patient
+
+
+@router.post("/{patient_id}/deactivate", response_model=PatientResponse)
+async def deactivate_patient(patient_id: int, db: AsyncSession = Depends(get_db)):
+    """患者を非表示化（論理削除）"""
+    result = await db.execute(select(Patient).where(Patient.id == patient_id))
+    patient = result.scalar_one_or_none()
+    if not patient:
+        raise HTTPException(status_code=404, detail="患者が見つかりません")
+    patient.is_active = False
+    await db.commit()
+    await db.refresh(patient)
+    return patient
+
+
+@router.post("/{patient_id}/reactivate", response_model=PatientResponse)
+async def reactivate_patient(patient_id: int, db: AsyncSession = Depends(get_db)):
+    """患者を再有効化"""
+    result = await db.execute(select(Patient).where(Patient.id == patient_id))
+    patient = result.scalar_one_or_none()
+    if not patient:
+        raise HTTPException(status_code=404, detail="患者が見つかりません")
+    patient.is_active = True
+    await db.commit()
+    await db.refresh(patient)
+    return patient
+    patient.is_active = True
+    await db.commit()
+    await db.refresh(patient)
+    return patient
