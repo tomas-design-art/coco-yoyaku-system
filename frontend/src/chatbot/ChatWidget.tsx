@@ -36,7 +36,7 @@ const ChatWidget: React.FC = () => {
                 const sess = await getSession(storedId);
                 if (sess.status === 'active') {
                     setSessionId(sess.session_id);
-                    const restored: Message[] = sess.messages
+                    const restored: Message[] = (sess.messages ?? [])
                         .filter((m) => !('tool_call' in m))
                         .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
                     setMessages(restored);
@@ -50,7 +50,7 @@ const ChatWidget: React.FC = () => {
             const sess = await createSession();
             setSessionId(sess.session_id);
             localStorage.setItem(SESSION_KEY, sess.session_id);
-            const initial: Message[] = sess.messages.map((m) => ({
+            const initial: Message[] = (sess.messages ?? []).map((m) => ({
                 role: m.role as 'user' | 'assistant',
                 content: m.content,
             }));

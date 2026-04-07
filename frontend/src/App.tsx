@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback } from 'react';
 import { BrowserRouter, Routes, Route, Link, useLocation, useNavigate } from 'react-router-dom';
 import { Calendar, Users, Settings, Stethoscope, Menu as MenuIcon, Volume2, VolumeX, Palette, Bot, CalendarDays, CheckCircle, Lock, Unlock, LogOut } from 'lucide-react';
 import TimeTable from './components/TimeTable/TimeTable';
@@ -17,7 +17,6 @@ import AlertPopup from './components/Notification/AlertPopup';
 import NotificationPanel from './components/Notification/NotificationPanel';
 import HotPepperSync from './components/HotPepperSync';
 import PublicReserve from './components/PublicReserve';
-import PinLogin from './components/Auth/PinLogin';
 import AdminLoginModal from './components/Auth/AdminLoginModal';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { useSSE } from './hooks/useSSE';
@@ -361,35 +360,9 @@ function App() {
 
 function AuthGate() {
   const location = useLocation();
-  const { authenticated, loading, justLoggedOut, clearLoggedOut } = useAuth();
   if (location.pathname.startsWith('/reserve')) return <PublicReserve />;
-  if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-100">
-        <div className="text-gray-500">読み込み中...</div>
-      </div>
-    );
-  }
-  if (!authenticated && justLoggedOut) return <LoggedOutScreen onDone={clearLoggedOut} />;
-  if (!authenticated) return <PinLogin />;
+  // PIN認証を無効化: 常にメイン画面を表示
   return <AppContent />;
-}
-
-function LoggedOutScreen({ onDone }: { onDone: () => void }) {
-  useEffect(() => {
-    const timer = setTimeout(onDone, 2000);
-    return () => clearTimeout(timer);
-  }, [onDone]);
-
-  return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-b from-blue-50 to-gray-100">
-      <div className="bg-white rounded-2xl shadow-xl p-10 text-center">
-        <div className="text-5xl mb-4">👋</div>
-        <h1 className="text-xl font-bold text-gray-800 mb-2">ログアウトしました</h1>
-        <p className="text-sm text-gray-500">PIN入力画面に戻ります…</p>
-      </div>
-    </div>
-  );
 }
 
 export default App

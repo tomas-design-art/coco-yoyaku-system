@@ -41,19 +41,21 @@ export default function PublicReserve() {
         (async () => {
             try {
                 const res = await getMenus();
-                const active = res.data.filter((m) => m.is_active);
+                const active = (res.data ?? []).filter((m) => m.is_active);
                 setMenus(active);
 
                 const qMenu = Number(searchParams.get('menu_id'));
                 const qDuration = Number(searchParams.get('duration'));
 
                 if (qMenu && active.some((m) => m.id === qMenu)) {
-                    const menu = active.find((m) => m.id === qMenu)!;
-                    setMenuId(menu.id);
-                    if (menu.is_duration_variable && qDuration) {
-                        setDuration(qDuration);
-                    } else {
-                        setDuration(menu.duration_minutes);
+                    const menu = active.find((m) => m.id === qMenu);
+                    if (menu) {
+                        setMenuId(menu.id);
+                        if (menu.is_duration_variable && qDuration) {
+                            setDuration(qDuration);
+                        } else {
+                            setDuration(menu.duration_minutes);
+                        }
                     }
                 }
             } catch (err: unknown) {
@@ -208,7 +210,7 @@ export default function PublicReserve() {
                         <h2 className="font-semibold text-slate-800 mb-2">その時間は埋まっていました</h2>
                         <p className="text-sm text-slate-600 mb-3">候補から選んで再送できます。</p>
                         <div className="flex flex-wrap gap-2">
-                            {conflict.alternatives.map((iso) => {
+                            {(conflict.alternatives ?? []).map((iso) => {
                                 const v = toLocalDateInput(iso);
                                 return (
                                     <button

@@ -15,11 +15,11 @@ export default function HotPepperSync() {
     setError(null);
     try {
       const res = await api.get<Reservation[]>('/hotpepper/pending-sync');
-      setPendingSync(res.data);
+      setPendingSync(res.data ?? []);
     } catch {
       try {
         const res = await getReservations({});
-        const pending = res.data.filter(
+        const pending = (res.data ?? []).filter(
           (r) => !r.hotpepper_synced && r.channel !== 'HOTPEPPER' &&
             !['CANCELLED', 'REJECTED', 'EXPIRED'].includes(r.status)
         );

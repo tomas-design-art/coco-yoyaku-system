@@ -59,20 +59,20 @@ export default function PractitionerScheduleManager() {
 
     useEffect(() => {
         getPractitioners().then((res) => {
-            const active = res.data.filter((p) => p.is_active);
+            const active = (res.data ?? []).filter((p) => p.is_active);
             setPractitioners(active);
             if (active.length > 0 && !selectedPractitionerId) {
                 setSelectedPractitionerId(active[0].id);
             }
-        });
-        getWeeklySchedules().then((res) => setClinicSchedules(res.data));
+        }).catch(() => setPractitioners([]));
+        getWeeklySchedules().then((res) => setClinicSchedules(res.data ?? [])).catch(() => { });
         getSettings().then((res) => {
-            const s = res.data;
+            const s = res.data ?? [];
             const bhStart = s.find((x) => x.key === 'business_hour_start');
             const bhEnd = s.find((x) => x.key === 'business_hour_end');
             if (bhStart?.value) { setClinicStartTime(bhStart.value); setUtStartTime(bhStart.value); }
             if (bhEnd?.value) { setClinicEndTime(bhEnd.value); setUtEndTime(bhEnd.value); }
-        });
+        }).catch(() => { });
     }, []);
 
     const loadData = useCallback(async () => {
@@ -82,11 +82,11 @@ export default function PractitionerScheduleManager() {
             getScheduleOverrides({ practitioner_id: selectedPractitionerId }),
             getUnavailableTimes({ practitioner_id: selectedPractitionerId }),
         ]);
-        setOverrides(overridesRes.data);
-        setUnavailableTimes(utRes.data);
+        setOverrides(overridesRes.data ?? []);
+        setUnavailableTimes(utRes.data ?? []);
 
         // Build editable defaults (fill missing days with clinic schedule)
-        const existing = defaultsRes.data;
+        const existing = defaultsRes.data ?? [];
         const full = Array.from({ length: 7 }, (_, i) => {
             const found = existing.find((s) => s.day_of_week === i);
             if (found) {
@@ -127,8 +127,8 @@ export default function PractitionerScheduleManager() {
         if (!overrideIsWorking) {
             try {
                 const res = await getAffectedReservations(selectedPractitionerId, overrideDate);
-                if (res.data.length > 0) {
-                    setAffected(res.data);
+                if ((res.data ?? []).length > 0) {
+                    setAffected(res.data ?? []);
                     setShowTransferModal(true);
                     // 先にオーバーライドを登録
                     await createScheduleOverride({

@@ -38,11 +38,12 @@ export default function SystemSettings() {
 
   useEffect(() => {
     getSettings().then((res) => {
-      setSettings(res.data);
+      const data = res.data ?? [];
+      setSettings(data);
       const vals: Record<string, string> = {};
-      res.data.forEach((s) => { vals[s.key] = s.value; });
+      data.forEach((s) => { vals[s.key] = s.value; });
       setEditValues(vals);
-    });
+    }).catch(() => { setSettings([]); });
   }, []);
 
   const handleSave = async (key: string) => {

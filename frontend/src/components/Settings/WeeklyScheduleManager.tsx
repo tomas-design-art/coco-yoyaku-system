@@ -26,23 +26,24 @@ export default function WeeklyScheduleManager() {
 
     useEffect(() => {
         getWeeklySchedules().then((res) => {
-            setSchedules(res.data);
+            const data = res.data ?? [];
+            setSchedules(data);
             const map: Record<number, { is_open: boolean; open_time: string; close_time: string }> = {};
-            res.data.forEach((s) => {
+            data.forEach((s) => {
                 map[s.day_of_week] = { is_open: s.is_open, open_time: s.open_time, close_time: s.close_time };
             });
             setEditMap(map);
-        });
+        }).catch(() => { setSchedules([]); });
         // 祝日設定の読み込み
         getSettings().then((res) => {
             const map: Record<string, string> = {};
-            res.data.forEach((s: Setting) => { map[s.key] = s.value; });
+            (res.data ?? []).forEach((s: Setting) => { map[s.key] = s.value; });
             if (map.holiday_mode) setHolidayMode(map.holiday_mode);
             if (map.holiday_start_time) setHolidayStart(map.holiday_start_time);
             if (map.holiday_end_time) setHolidayEnd(map.holiday_end_time);
-        });
+        }).catch(() => { });
         // 個別日付オーバーライドの読み込み
-        getDateOverrides().then((res) => setOverrides(res.data));
+        getDateOverrides().then((res) => setOverrides(res.data ?? [])).catch(() => setOverrides([]));
     }, []);
 
     const handleChange = (dow: number, field: string, value: string | boolean) => {

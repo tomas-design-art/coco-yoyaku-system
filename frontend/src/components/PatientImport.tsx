@@ -73,12 +73,12 @@ export default function PatientImport({ onClose, onComplete }: Props) {
         try {
             const res = await importExecute(file, mode, mapping, actions);
             setResult(res.data);
-            if (res.data.duplicates.length > 0 && !actions) {
+            if ((res.data.duplicates ?? []).length > 0 && !actions) {
                 // 初回実行で重複あり → 解決ステップへ
                 setPendingDuplicates(res.data.duplicates);
                 // デフォルト: 全行スキップ
                 const defaults: Record<number, RowAction> = {};
-                for (const d of res.data.duplicates) {
+                for (const d of (res.data.duplicates ?? [])) {
                     defaults[d.row] = { row: d.row, action: 'skip' };
                 }
                 setRowActions(defaults);
@@ -281,7 +281,7 @@ export default function PatientImport({ onClose, onComplete }: Props) {
                     {step === 'preview' && previewData && (
                         <div className="space-y-4">
                             <p className="text-sm text-gray-600">
-                                先頭{Math.min(previewData.preview_rows.length, 10)}行のプレビュー
+                                先頭{Math.min((previewData.preview_rows ?? []).length, 10)}行のプレビュー
                                 （モード: {mode === 'split' ? '通常' : 'フルネーム'}）
                             </p>
                             <div className="border rounded overflow-auto">
@@ -297,7 +297,7 @@ export default function PatientImport({ onClose, onComplete }: Props) {
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        {previewData.preview_rows.slice(0, 10).map((row, i) => (
+                                        {(previewData.preview_rows ?? []).slice(0, 10).map((row, i) => (
                                             <tr key={i} className="border-b">
                                                 <td className="px-3 py-1.5 text-gray-400">{i + 1}</td>
                                                 {Object.keys(fieldLabels).map((field) => (
@@ -311,7 +311,7 @@ export default function PatientImport({ onClose, onComplete }: Props) {
                                 </table>
                             </div>
                             <p className="text-xs text-gray-400">
-                                全 {previewData.total_data_rows} 行を取り込みます。重複候補がある場合は確認画面が表示されます。
+                                全 {previewData.total_data_rows ?? 0} 行を取り込みます。重複候補がある場合は確認画面が表示されます。
                             </p>
                         </div>
                     )}
@@ -350,7 +350,7 @@ export default function PatientImport({ onClose, onComplete }: Props) {
                                         {/* 候補一覧 */}
                                         <div className="p-3 space-y-2">
                                             <p className="text-xs text-gray-400 mb-1">既存の候補患者:</p>
-                                            {dup.candidates.map((c) => (
+                                            {(dup.candidates ?? []).map((c) => (
                                                 <div key={c.id} className={`border rounded p-3 text-xs ${action?.patient_id === c.id ? 'border-blue-400 bg-blue-50' : ''}`}>
                                                     <div className="flex items-start justify-between mb-2">
                                                         <div className="space-y-0.5">
@@ -449,7 +449,7 @@ export default function PatientImport({ onClose, onComplete }: Props) {
                                 </div>
                             )}
 
-                            {result.duplicates.length > 0 && (
+                            {(result.duplicates ?? []).length > 0 && (
                                 <div>
                                     <h3 className="text-sm font-medium mb-2 flex items-center gap-1">
                                         <AlertTriangle size={14} className="text-yellow-500" /> 未解決の重複（スキップ扱い）
@@ -467,9 +467,9 @@ export default function PatientImport({ onClose, onComplete }: Props) {
                                                 {result.duplicates.map((d, i) => (
                                                     <tr key={i} className="border-b">
                                                         <td className="px-3 py-1.5">{d.row}</td>
-                                                        <td className="px-3 py-1.5">{d.data.last_name || d.data.full_name || ''} {d.data.first_name || ''}</td>
+                                                        <td className="px-3 py-1.5">{d.data?.last_name || d.data?.full_name || ''} {d.data?.first_name || ''}</td>
                                                         <td className="px-3 py-1.5">
-                                                            {d.candidates.map((c) => `${c.name} (${c.patient_number})`).join(', ')}
+                                                            {(d.candidates ?? []).map((c) => `${c.name} (${c.patient_number})`).join(', ')}
                                                         </td>
                                                     </tr>
                                                 ))}
@@ -479,7 +479,7 @@ export default function PatientImport({ onClose, onComplete }: Props) {
                                 </div>
                             )}
 
-                            {result.errors.length > 0 && (
+                            {(result.errors ?? []).length > 0 && (
                                 <div>
                                     <h3 className="text-sm font-medium mb-2 text-red-600">エラー詳細</h3>
                                     <div className="border border-red-200 rounded max-h-40 overflow-auto">
@@ -491,7 +491,7 @@ export default function PatientImport({ onClose, onComplete }: Props) {
                                                 </tr>
                                             </thead>
                                             <tbody>
-                                                {result.errors.map((e, i) => (
+                                                {(result.errors ?? []).map((e, i) => (
                                                     <tr key={i} className="border-b">
                                                         <td className="px-3 py-1.5">{e.row}</td>
                                                         <td className="px-3 py-1.5">{e.reason}</td>

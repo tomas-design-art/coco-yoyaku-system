@@ -66,18 +66,18 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
 
   useEffect(() => {
     if (isEditing) {
-      getPractitioners().then(res => setPractitioners(res.data.filter(p => p.is_active && p.is_visible)));
-      getPatients({ page: 1, per_page: 500 }).then(res => setPatients(res.data.items || []));
-      getMenus().then(res => setMenus(res.data.filter(m => m.is_active)));
-      getReservationColors().then(res => setReservationColors(res.data));
+      getPractitioners().then(res => setPractitioners((res.data ?? []).filter(p => p.is_active && p.is_visible))).catch(() => setPractitioners([]));
+      getPatients({ page: 1, per_page: 500 }).then(res => setPatients(res.data?.items ?? [])).catch(() => setPatients([]));
+      getMenus().then(res => setMenus((res.data ?? []).filter(m => m.is_active))).catch(() => setMenus([]));
+      getReservationColors().then(res => setReservationColors(res.data ?? [])).catch(() => setReservationColors([]));
       getSettings().then(res => {
-        const settings = res.data;
+        const settings = res.data ?? [];
         const bhStart = settings.find(s => s.key === 'business_hour_start');
         const bhEnd = settings.find(s => s.key === 'business_hour_end');
         const startH = bhStart?.value ? parseInt(bhStart.value.split(':')[0]) : 9;
         const endH = bhEnd?.value ? parseInt(bhEnd.value.split(':')[0]) : 20;
         setTimeOptions(generate5MinOptions(startH, endH));
-      });
+      }).catch(() => setTimeOptions(generate5MinOptions()));
     }
   }, [isEditing]);
 

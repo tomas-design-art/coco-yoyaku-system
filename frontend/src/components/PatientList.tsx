@@ -58,14 +58,20 @@ export default function PatientList() {
   const totalPages = Math.max(1, Math.ceil(total / perPage));
 
   const fetchData = async () => {
-    if (query.length >= 1) {
-      const res = await searchPatients(query);
-      setPatients(res.data);
-      setTotal(res.data.length);
-    } else {
-      const res = await getPatients({ page, per_page: perPage, sort_by: sortBy, sort_order: sortOrder });
-      setPatients(res.data.items);
-      setTotal(res.data.total);
+    try {
+      if (query.length >= 1) {
+        const res = await searchPatients(query);
+        const data = res.data ?? [];
+        setPatients(data);
+        setTotal(data.length);
+      } else {
+        const res = await getPatients({ page, per_page: perPage, sort_by: sortBy, sort_order: sortOrder });
+        setPatients(res.data?.items ?? []);
+        setTotal(res.data?.total ?? 0);
+      }
+    } catch {
+      setPatients([]);
+      setTotal(0);
     }
   };
 
@@ -75,8 +81,8 @@ export default function PatientList() {
   }, [query, page, sortBy, sortOrder, includeInactive]);
 
   useEffect(() => {
-    getMenus().then((res) => setMenus(res.data.filter((m) => m.is_active)));
-    getPractitioners().then((res) => setPractitioners(res.data.filter((p) => p.is_visible)));
+    getMenus().then((res) => setMenus((res.data ?? []).filter((m) => m.is_active))).catch(() => setMenus([]));
+    getPractitioners().then((res) => setPractitioners((res.data ?? []).filter((p) => p.is_visible))).catch(() => setPractitioners([]));
   }, []);
 
   useEffect(() => { setPage(1); }, [sortBy, sortOrder, query]);
@@ -101,8 +107,9 @@ export default function PatientList() {
           phone: form.phone || undefined,
           birth_date: form.birth_date || undefined,
         });
-        setCandidates(res.data);
-        setShowCandidates(res.data.length > 0);
+        const data = res.data ?? [];
+        setCandidates(data);
+        setShowCandidates(data.length > 0);
         setConfirmNew(false);
       } catch {
         setCandidates([]);
@@ -474,6 +481,9 @@ export default function PatientList() {
             </tr>
           </thead>
           <tbody>
+            {patients.length === 0 && (
+              <tr><td colSpan={7} className="px-3 py-8 text-center text-gray-400 text-sm">患者データがありません</td></tr>
+            )}
             {patients.map((p) => (
               <tr key={p.id} className={`border-b hover:bg-gray-50 ${!p.is_active ? 'opacity-40' : ''}`}>
                 <td className="px-3 py-2 text-gray-500 text-xs">{p.patient_number || '-'}</td>

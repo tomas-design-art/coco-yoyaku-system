@@ -16,14 +16,18 @@ export default function PractitionerManager() {
   const [error, setError] = useState<string | null>(null);
 
   const fetchData = async () => {
-    const res = await getPractitioners();
-    setPractitioners(res.data);
+    try {
+      const res = await getPractitioners();
+      setPractitioners(res.data ?? []);
+    } catch {
+      setPractitioners([]);
+    }
   };
 
   const fetchRoles = async () => {
     try {
       const res = await getSettings();
-      const roleSetting = res.data.find((s: { key: string }) => s.key === 'practitioner_roles');
+      const roleSetting = (res.data ?? []).find((s: { key: string }) => s.key === 'practitioner_roles');
       if (roleSetting?.value) {
         const parsed = roleSetting.value.split(',').map((r: string) => r.trim()).filter(Boolean);
         if (parsed.length > 0) {
@@ -133,6 +137,9 @@ export default function PractitionerManager() {
       )}
 
       <div className="space-y-2">
+        {practitioners.length === 0 && (
+          <p className="text-center text-gray-400 text-sm py-8">施術者が登録されていません</p>
+        )}
         {practitioners.map((p) => (
           <div key={p.id} className={`flex items-center justify-between p-3 bg-white rounded border ${!p.is_active ? 'opacity-50' : ''}`}>
             <div className="flex items-center gap-3">

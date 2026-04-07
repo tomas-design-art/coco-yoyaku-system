@@ -54,21 +54,22 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
 
   useEffect(() => {
     if (isOpen) {
-      getPractitioners().then((res) => setPractitioners(res.data.filter((p) => p.is_active && p.is_visible)));
-      getMenus().then((res) => setMenus(res.data.filter((m) => m.is_active)));
+      getPractitioners().then((res) => setPractitioners((res.data ?? []).filter((p) => p.is_active && p.is_visible))).catch(() => setPractitioners([]));
+      getMenus().then((res) => setMenus((res.data ?? []).filter((m) => m.is_active))).catch(() => setMenus([]));
       getReservationColors().then((res) => {
-        setColors(res.data);
-        const def = res.data.find((c) => c.is_default);
+        const data = res.data ?? [];
+        setColors(data);
+        const def = data.find((c) => c.is_default);
         if (def && !colorId) setColorId(def.id);
-      });
+      }).catch(() => setColors([]));
       getSettings().then((res) => {
-        const settings = res.data;
+        const settings = res.data ?? [];
         const bhStart = settings.find((s) => s.key === 'business_hour_start');
         const bhEnd = settings.find((s) => s.key === 'business_hour_end');
         const startH = bhStart?.value ? parseInt(bhStart.value.split(':')[0], 10) : 9;
         const endH = bhEnd?.value ? parseInt(bhEnd.value.split(':')[0], 10) : 20;
         setTimeOptions(generate5MinOptions(startH, endH));
-      });
+      }).catch(() => setTimeOptions(generate5MinOptions()));
     }
   }, [isOpen]);
 
@@ -386,11 +387,11 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
           {bulkResult && (
             <div className={`p-3 rounded text-sm ${bulkResult.created_count > 0 ? 'bg-green-50 border border-green-200 text-green-800' : 'bg-yellow-50 border border-yellow-200 text-yellow-800'}`}>
               <p className="font-medium">{bulkResult.created_count} / {bulkResult.total_requested} 件作成しました</p>
-              {bulkResult.skipped.length > 0 && (
+              {(bulkResult.skipped ?? []).length > 0 && (
                 <details className="mt-1">
                   <summary className="cursor-pointer text-xs">スキップ: {bulkResult.skipped.length}件</summary>
                   <ul className="mt-1 text-xs space-y-0.5">
-                    {bulkResult.skipped.map((s, i) => (
+                    {(bulkResult.skipped ?? []).map((s, i) => (
                       <li key={i}>{s.date}: {s.reason}</li>
                     ))}
                   </ul>

@@ -11,7 +11,7 @@ export default function NotificationPanel({ onClose }: NotificationPanelProps) {
   const [notifications, setNotifications] = useState<Notification[]>([]);
 
   useEffect(() => {
-    getNotifications().then((res) => setNotifications(res.data));
+    getNotifications().then((res) => setNotifications(res.data ?? [])).catch(() => setNotifications([]));
   }, []);
 
   const handleMarkRead = async (id: number) => {

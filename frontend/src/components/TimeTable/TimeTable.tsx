@@ -95,25 +95,26 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
 
   useEffect(() => {
     getPractitioners().then((res) => {
-      setAllPractitioners(res.data);
-      const visible = res.data.filter((p) => p.is_active && p.is_visible);
+      const all = res.data ?? [];
+      setAllPractitioners(all);
+      const visible = all.filter((p) => p.is_active && p.is_visible);
       // 初回: 全員ONにする (既にセット済みならスキップ)
       setEnabledPractitionerIds((prev) => {
         if (prev.size > 0) return prev;
         return new Set(visible.map((p) => p.id));
       });
-    });
-    getReservationColors().then((res) => setColors(res.data));
+    }).catch(() => setAllPractitioners([]));
+    getReservationColors().then((res) => setColors(res.data ?? [])).catch(() => setColors([]));
     // 営業時間設定を取得
     getSettings().then((res) => {
-      const settings = res.data;
+      const settings = res.data ?? [];
       const bhStart = settings.find((s) => s.key === 'business_hour_start');
       const bhEnd = settings.find((s) => s.key === 'business_hour_end');
       if (bhStart?.value) setDayStart(timeToMinutes(bhStart.value));
       if (bhEnd?.value) setDayEnd(timeToMinutes(bhEnd.value));
-    });
+    }).catch(() => { });
     // 院営業スケジュールを取得
-    getWeeklySchedules().then((res) => setWeeklySchedules(res.data)).catch(() => { });
+    getWeeklySchedules().then((res) => setWeeklySchedules(res.data ?? [])).catch(() => { });
   }, [refreshKey]);
 
   const activePractitionerIds = useMemo(
@@ -127,7 +128,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     getReservations({
       start_date: formatDate(startDate),
       end_date: formatDate(endDate),
-    }).then((res) => setReservations(res.data));
+    }).then((res) => setReservations(res.data ?? [])).catch(() => setReservations([]));
 
     // 職員勤務スケジュールステータスを取得
     if (activePractitionerIds) {
@@ -135,14 +136,14 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
         practitioner_ids: activePractitionerIds,
         start_date: formatDate(startDate),
         end_date: formatDate(endDate),
-      }).then((res) => setPractitionerStatuses(res.data)).catch(() => { });
+      }).then((res) => setPractitionerStatuses(res.data ?? [])).catch(() => { });
     }
 
     // 解決済み営業時間（祝日・DateOverride反映）を取得
     getBusinessHoursRange({
       start_date: formatDate(startDate),
       end_date: formatDate(endDate),
-    }).then((res) => setBusinessHours(res.data)).catch(() => { });
+    }).then((res) => setBusinessHours(res.data ?? [])).catch(() => { });
   }, [currentDate, viewMode, weekDates, refreshKey, activePractitionerIds]);
 
   // 施術者トグル
@@ -515,6 +516,9 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
             </div>
 
             {/* Day columns — one per practitioner */}
+            {activePractitioners.length === 0 && (
+              <div className="flex-1 flex items-center justify-center p-12 text-gray-400 text-sm">施術者データがありません</div>
+            )}
             {activePractitioners.map((p, pi) => (
               <div
                 key={`day-${p.id}`}

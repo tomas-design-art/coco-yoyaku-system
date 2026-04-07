@@ -28,12 +28,12 @@ export default function ChatbotSettings() {
     useEffect(() => {
         getSettings().then((res) => {
             const v = { ...DEFAULTS };
-            res.data.forEach((s) => {
+            (res.data ?? []).forEach((s) => {
                 if (s.key in v) v[s.key] = s.value;
             });
             setValues(v);
             setLoaded(true);
-        });
+        }).catch(() => { setLoaded(true); });
     }, []);
 
     const handleSave = async (key: string) => {

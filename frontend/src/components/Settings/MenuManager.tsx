@@ -18,9 +18,14 @@ export default function MenuManager() {
   const [error, setError] = useState<string | null>(null);
 
   const fetchData = async () => {
-    const [menuRes, colorRes] = await Promise.all([getMenus(), getReservationColors()]);
-    setMenus(menuRes.data);
-    setColors(colorRes.data);
+    try {
+      const [menuRes, colorRes] = await Promise.all([getMenus(), getReservationColors()]);
+      setMenus(menuRes.data ?? []);
+      setColors(colorRes.data ?? []);
+    } catch {
+      setMenus([]);
+      setColors([]);
+    }
   };
 
   useEffect(() => { fetchData(); }, []);
@@ -164,6 +169,9 @@ export default function MenuManager() {
       )}
 
       <div className="space-y-2">
+        {menus.length === 0 && (
+          <p className="text-center text-gray-400 text-sm py-8">メニューが登録されていません</p>
+        )}
         {menus.map((m) => (
           <div key={m.id} className={`flex items-center justify-between p-3 bg-white rounded border ${!m.is_active ? 'opacity-50' : ''}`}>
             <div className="flex items-center gap-2">

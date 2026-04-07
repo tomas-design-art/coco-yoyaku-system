@@ -16,7 +16,7 @@ export function useReservations(startDate: Date, endDate: Date) {
         start_date: formatDate(startDate),
         end_date: formatDate(endDate),
       });
-      setReservations(res.data);
+      setReservations(res.data ?? []);
     } catch (err) {
       setError('予約データの取得に失敗しました');
       console.error(err);

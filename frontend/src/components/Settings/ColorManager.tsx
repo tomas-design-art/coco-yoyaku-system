@@ -23,7 +23,7 @@ export default function ColorManager() {
     const [error, setError] = useState<string | null>(null);
 
     const fetchColors = () => {
-        getReservationColors().then((res) => setColors(res.data));
+        getReservationColors().then((res) => setColors(res.data ?? [])).catch(() => setColors([]));
     };
 
     useEffect(() => { fetchColors(); }, []);

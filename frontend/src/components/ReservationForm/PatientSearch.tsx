@@ -36,7 +36,7 @@ export default function PatientSearch({ onSelect, selectedName }: PatientSearchP
       const timer = setTimeout(async () => {
         try {
           const res = await searchPatients(query);
-          setResults(res.data);
+          setResults(res.data ?? []);
           setShowDropdown(true);
         } catch (err) {
           setResults([]);
@@ -68,8 +68,9 @@ export default function PatientSearch({ onSelect, selectedName }: PatientSearchP
           reading: newReading || undefined,
           phone: newPhone || undefined,
         });
-        setCandidates(res.data);
-        setShowCandidates(res.data.length > 0);
+        const data = res.data ?? [];
+        setCandidates(data);
+        setShowCandidates(data.length > 0);
         setConfirmNew(false);
       } catch {
         setCandidates([]);
