@@ -1,5 +1,5 @@
-import type { Reservation, ReservationColor } from '../../types';
-import { STATUS_COLORS, CHANNEL_ICONS } from '../../types';
+import type { Reservation } from '../../types';
+import { CHANNEL_ICONS } from '../../types';
 import { dateToMinutes, DAY_START, SLOT_INTERVAL } from '../../utils/timeUtils';
 
 const SLOT_HEIGHT = 20;

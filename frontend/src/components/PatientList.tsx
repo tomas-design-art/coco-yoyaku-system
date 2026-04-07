@@ -44,7 +44,7 @@ export default function PatientList() {
   const [candidates, setCandidates] = useState<CandidateResponse[]>([]);
   const [showCandidates, setShowCandidates] = useState(false);
   const [confirmNew, setConfirmNew] = useState(false);
-  const [includeInactive, setIncludeInactive] = useState(false);
+  const [includeInactive] = useState(false);
   const [menus, setMenus] = useState<Menu[]>([]);
   const [practitioners, setPractitioners] = useState<Practitioner[]>([]);
 
@@ -144,8 +144,6 @@ export default function PatientList() {
   const firstNameRef = useRef<HTMLInputElement>(null);
   const middleNameRef = useRef<HTMLInputElement>(null);
   const readingRef = useRef<HTMLInputElement>(null);
-  const lastNameKanaRef = useRef<HTMLInputElement>(null);
-  const firstNameKanaRef = useRef<HTMLInputElement>(null);
   const phoneRef = useRef<HTMLInputElement>(null);
   const birthDateRef = useRef<HTMLInputElement>(null);
   const emailRef = useRef<HTMLInputElement>(null);
