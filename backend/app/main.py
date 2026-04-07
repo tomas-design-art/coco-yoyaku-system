@@ -9,6 +9,7 @@ from sqlalchemy import text
 from app.api import practitioners, patients, menus, settings, notifications, sse, reservations, hotpepper, line, auth, reservation_colors, chatbot, weekly_schedules, practitioner_schedules, patient_import, date_overrides, business_hours, web_reserve, public, shadow_logs
 from app.services.hold_expiration import start_hold_expiration_job, stop_hold_expiration_job
 from app.database import async_session
+from app.services.bootstrap import initialize_database
 from app.services.line_alerts import push_developer_sos_alert
 
 FIELD_LABELS = {
@@ -33,6 +34,7 @@ FIELD_LABELS = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
+        await initialize_database()
         async with async_session() as db:
             await db.execute(text("SELECT 1"))
     except Exception as e:
