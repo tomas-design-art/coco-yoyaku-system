@@ -34,11 +34,18 @@ async def update_schedule(
     )
     schedule = result.scalar_one_or_none()
     if not schedule:
-        raise HTTPException(status_code=404, detail="スケジュールが見つかりません")
+        schedule = WeeklySchedule(
+            day_of_week=day_of_week,
+            is_open=data.is_open,
+            open_time=data.open_time,
+            close_time=data.close_time,
+        )
+        db.add(schedule)
+    else:
+        schedule.is_open = data.is_open
+        schedule.open_time = data.open_time
+        schedule.close_time = data.close_time
 
-    schedule.is_open = data.is_open
-    schedule.open_time = data.open_time
-    schedule.close_time = data.close_time
     await db.commit()
     await db.refresh(schedule)
     return schedule

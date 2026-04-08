@@ -5,6 +5,31 @@ import { getWeeklySchedules, updateWeeklySchedule, getSettings, updateSetting, g
 import { extractErrorMessage } from '../../utils/errorUtils';
 
 const DAY_LABELS = ['日曜日', '月曜日', '火曜日', '水曜日', '木曜日', '金曜日', '土曜日'];
+const DISPLAY_DAY_ORDER = [1, 2, 3, 4, 5, 6, 0]; // 月曜始まりで表示
+
+function defaultSchedule(dayOfWeek: number): WeeklySchedule {
+    return {
+        id: -(dayOfWeek + 1),
+        day_of_week: dayOfWeek,
+        is_open: false,
+        open_time: '09:00',
+        close_time: '20:00',
+        updated_at: '',
+    };
+}
+
+function normalizeSchedules(data: WeeklySchedule[]): WeeklySchedule[] {
+    const byDay = new Map(data.map((s) => [s.day_of_week, s]));
+    return DISPLAY_DAY_ORDER.map((day) => byDay.get(day) ?? defaultSchedule(day));
+}
+
+function toEditMap(data: WeeklySchedule[]): Record<number, { is_open: boolean; open_time: string; close_time: string }> {
+    const map: Record<number, { is_open: boolean; open_time: string; close_time: string }> = {};
+    data.forEach((s) => {
+        map[s.day_of_week] = { is_open: s.is_open, open_time: s.open_time, close_time: s.close_time };
+    });
+    return map;
+}
 
 export default function WeeklyScheduleManager() {
     const [schedules, setSchedules] = useState<WeeklySchedule[]>([]);
@@ -26,14 +51,14 @@ export default function WeeklyScheduleManager() {
 
     useEffect(() => {
         getWeeklySchedules().then((res) => {
-            const data = res.data ?? [];
-            setSchedules(data);
-            const map: Record<number, { is_open: boolean; open_time: string; close_time: string }> = {};
-            data.forEach((s) => {
-                map[s.day_of_week] = { is_open: s.is_open, open_time: s.open_time, close_time: s.close_time };
-            });
-            setEditMap(map);
-        }).catch(() => { setSchedules([]); });
+            const normalized = normalizeSchedules(res.data ?? []);
+            setSchedules(normalized);
+            setEditMap(toEditMap(normalized));
+        }).catch(() => {
+            const normalized = normalizeSchedules([]);
+            setSchedules(normalized);
+            setEditMap(toEditMap(normalized));
+        });
         // 祝日設定の読み込み
         getSettings().then((res) => {
             const map: Record<string, string> = {};
@@ -136,7 +161,7 @@ export default function WeeklyScheduleManager() {
             }
             await createDateOverride(payload);
             const res = await getDateOverrides();
-            setOverrides(res.data);
+            setOverrides(res.data ?? []);
             setNewOverride({ date: '', is_open: false, open_time: '09:00', close_time: '13:00', label: '' });
             setSuccess('個別日付設定を追加しました');
             setTimeout(() => setSuccess(null), 2000);
