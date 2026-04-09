@@ -8,7 +8,6 @@ import DragSelect from './DragSelect';
 
 const SLOT_HEIGHT = 20;
 const TIME_COL_WIDTH = 60;
-const PRACTITIONER_MIN_WIDTH = 80;
 const WEEK_PRACTITIONER_MIN_WIDTH = 64;
 const WEEK_MAX_PRACTITIONERS_PER_DAY = 3;
 const HEADER_HEIGHT = 32;
