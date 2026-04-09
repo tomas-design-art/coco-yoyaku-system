@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Plus, Edit2, Trash2, GripVertical, Eye, EyeOff } from 'lucide-react';
 import type { Practitioner } from '../../types';
-import { getPractitioners, createPractitioner, updatePractitioner, deletePractitioner, getSettings } from '../../api/client';
+import { getPractitioners, createPractitioner, updatePractitioner, deletePractitioner, purgePractitioner, getSettings } from '../../api/client';
 import { extractErrorMessage } from '../../utils/errorUtils';
 
 const DEFAULT_ROLES = ['院長', '施術者'];
@@ -13,6 +13,7 @@ export default function PractitionerManager() {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [name, setName] = useState('');
   const [role, setRole] = useState('');
+  const [editingWasInactive, setEditingWasInactive] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const fetchData = async () => {
@@ -50,13 +51,14 @@ export default function PractitionerManager() {
     setError(null);
     try {
       if (editingId) {
-        await updatePractitioner(editingId, { name, role });
+        await updatePractitioner(editingId, { name, role, is_active: editingWasInactive ? true : undefined });
       } else {
         await createPractitioner({ name, role, display_order: practitioners.length });
       }
       setName('');
       setRole(roles[0] || '');
       setEditingId(null);
+      setEditingWasInactive(false);
       setShowForm(false);
       fetchData();
     } catch (err) {
@@ -68,6 +70,7 @@ export default function PractitionerManager() {
     setEditingId(p.id);
     setName(p.name);
     setRole(p.role);
+    setEditingWasInactive(!p.is_active);
     setShowForm(true);
   };
 
@@ -92,12 +95,23 @@ export default function PractitionerManager() {
     }
   };
 
+  const handlePermanentDelete = async (id: number) => {
+    const confirmed = window.confirm('本当に削除しますか？\n削除されたデータは復元できません。');
+    if (!confirmed) return;
+    try {
+      await purgePractitioner(id);
+      fetchData();
+    } catch (err) {
+      setError(extractErrorMessage(err, '施術者の完全削除に失敗しました'));
+    }
+  };
+
   return (
     <div className="max-w-2xl mx-auto p-6">
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold">施術者管理</h1>
         <button
-          onClick={() => { setShowForm(true); setEditingId(null); setName(''); setRole(roles[0] || ''); }}
+          onClick={() => { setShowForm(true); setEditingId(null); setName(''); setRole(roles[0] || ''); setEditingWasInactive(false); }}
           className="flex items-center gap-1 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
         >
           <Plus size={16} /> 追加
@@ -127,9 +141,9 @@ export default function PractitionerManager() {
           </div>
           <div className="flex gap-2">
             <button type="submit" className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600">
-              {editingId ? '更新' : '追加'}
+              {editingId ? (editingWasInactive ? '更新して再有効化' : '更新') : '追加'}
             </button>
-            <button type="button" onClick={() => setShowForm(false)} className="px-4 py-2 border rounded hover:bg-gray-100">
+            <button type="button" onClick={() => { setShowForm(false); setEditingWasInactive(false); }} className="px-4 py-2 border rounded hover:bg-gray-100">
               キャンセル
             </button>
           </div>
@@ -166,6 +180,11 @@ export default function PractitionerManager() {
               </button>
               {p.is_active && (
                 <button onClick={() => handleDelete(p.id)} className="p-1.5 hover:bg-red-50 text-red-500 rounded" title="無効化">
+                  <Trash2 size={14} />
+                </button>
+              )}
+              {!p.is_active && (
+                <button onClick={() => handlePermanentDelete(p.id)} className="p-1.5 hover:bg-red-50 text-red-600 rounded" title="完全削除">
                   <Trash2 size={14} />
                 </button>
               )}

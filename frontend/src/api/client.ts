@@ -54,6 +54,8 @@ export const updatePractitioner = (id: number, data: Partial<Practitioner>) =>
   api.put<Practitioner>(`/practitioners/${id}`, data);
 export const deletePractitioner = (id: number) =>
   api.delete<Practitioner>(`/practitioners/${id}`);
+export const purgePractitioner = (id: number) =>
+  api.post(`/practitioners/${id}/purge`);
 
 // ---- Patients ----
 export const getPatients = (params?: {
