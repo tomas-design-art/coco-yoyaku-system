@@ -61,10 +61,13 @@ export const getPatients = (params?: {
   per_page?: number;
   sort_by?: string;
   sort_order?: string;
+  include_inactive?: boolean;
 }) => api.get<PatientPageResponse>('/patients/', { params });
 export const getPatient = (id: number) => api.get<Patient>(`/patients/${id}`);
 export const searchPatients = (q: string) =>
   api.get<Patient[]>('/patients/search', { params: { q } });
+export const searchPatientsWithInactive = (q: string, includeInactive: boolean) =>
+  api.get<Patient[]>('/patients/search', { params: { q, include_inactive: includeInactive } });
 export const createPatient = (data: Partial<Patient>) =>
   api.post<Patient>('/patients/', data);
 export const updatePatient = (id: number, data: Partial<Patient>) =>
@@ -82,6 +85,8 @@ export const deactivatePatient = (id: number) =>
   api.post<Patient>(`/patients/${id}/deactivate`);
 export const reactivatePatient = (id: number) =>
   api.post<Patient>(`/patients/${id}/reactivate`);
+export const purgePatient = (id: number, reason: string) =>
+  api.post(`/patients/${id}/purge`, { reason });
 export const importPreview = (file: File) => {
   const fd = new FormData();
   fd.append('file', file);
@@ -108,6 +113,7 @@ export const createMenu = (data: Partial<Menu>) => api.post<Menu>('/menus/', dat
 export const updateMenu = (id: number, data: Partial<Menu>) =>
   api.put<Menu>(`/menus/${id}`, data);
 export const deleteMenu = (id: number) => api.delete<Menu>(`/menus/${id}`);
+export const purgeMenu = (id: number) => api.post(`/menus/${id}/purge`);
 
 // ---- Reservations ----
 export const getReservations = (params: {

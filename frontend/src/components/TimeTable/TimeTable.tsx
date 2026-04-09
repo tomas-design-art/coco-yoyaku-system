@@ -9,6 +9,8 @@ import DragSelect from './DragSelect';
 const SLOT_HEIGHT = 20;
 const TIME_COL_WIDTH = 60;
 const PRACTITIONER_MIN_WIDTH = 80;
+const WEEK_PRACTITIONER_MIN_WIDTH = 64;
+const WEEK_MAX_PRACTITIONERS_PER_DAY = 3;
 const HEADER_HEIGHT = 32;
 const WEEK_HEADER_HEIGHT = 52; // date line + practitioner names line
 
@@ -165,7 +167,10 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     if (viewMode !== 'week') return activePractitioners;
     const availableWidth = containerWidth - TIME_COL_WIDTH;
     const dayWidth = availableWidth / 7;
-    const maxPerDay = Math.max(1, Math.floor(dayWidth / PRACTITIONER_MIN_WIDTH));
+    const maxPerDay = Math.min(
+      WEEK_MAX_PRACTITIONERS_PER_DAY,
+      Math.max(1, Math.floor(dayWidth / WEEK_PRACTITIONER_MIN_WIDTH))
+    );
     return activePractitioners.slice(0, maxPerDay);
   }, [viewMode, activePractitioners, containerWidth]);
 
@@ -571,7 +576,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
             {weekDates.map((date, di) => {
               const isToday = formatDate(date) === formatDate(getTodayJST());
               return (
-                <div key={`week-${di}`} className="relative" style={{ flex: 1, minWidth: weekVisiblePractitioners.length * PRACTITIONER_MIN_WIDTH, borderRight: '1.5px solid #1f2937' }}>
+                <div key={`week-${di}`} className="relative" style={{ flex: 1, minWidth: weekVisiblePractitioners.length * WEEK_PRACTITIONER_MIN_WIDTH, borderRight: '1.5px solid #1f2937' }}>
                   {/* Date header */}
                   <div
                     className={`text-center text-xs font-semibold border-b px-1 ${isToday ? 'bg-blue-50 text-blue-700' : 'bg-gray-50 text-gray-700'}`}
@@ -585,7 +590,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                       <div
                         key={p.id}
                         className="flex-1 flex items-center justify-center text-xs text-gray-600 bg-gray-50 last:border-r-0 truncate px-0.5"
-                        style={{ minWidth: PRACTITIONER_MIN_WIDTH, borderRight: '1px dashed #d1d5db' }}
+                        style={{ minWidth: WEEK_PRACTITIONER_MIN_WIDTH, borderRight: '1px dashed #d1d5db' }}
                       >
                         {p.name}
                       </div>
@@ -597,7 +602,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                       <div
                         key={`${di}-${p.id}`}
                         className="relative last:border-r-0"
-                        style={{ flex: 1, minWidth: PRACTITIONER_MIN_WIDTH, borderRight: '1px dashed #d1d5db' }}
+                        style={{ flex: 1, minWidth: WEEK_PRACTITIONER_MIN_WIDTH, borderRight: '1px dashed #d1d5db' }}
                       >
                         {renderColumn(p.id, date, 0)}
                       </div>

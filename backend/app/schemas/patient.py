@@ -200,3 +200,15 @@ class CandidateQuery(BaseModel):
 class CandidateResponse(BaseModel):
     patient: PatientResponse
     match_reasons: list[str]
+
+
+class PatientPurgeRequest(BaseModel):
+    reason: str
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, v: str) -> str:
+        v = v.strip()
+        if len(v) < 2:
+            raise ValueError("削除理由は2文字以上で入力してください")
+        return v

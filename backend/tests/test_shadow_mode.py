@@ -20,6 +20,7 @@ def test_has_reservation_intent_positive():
     assert has_reservation_intent("空きありますか")
     assert has_reservation_intent("キャンセルお願いします")
     assert has_reservation_intent("10時の時間で取りたい")
+    assert has_reservation_intent("来週の件を相談したいです")
 
 
 def test_has_reservation_intent_negative():
@@ -27,6 +28,16 @@ def test_has_reservation_intent_negative():
     assert not has_reservation_intent("ありがとうございます")
     assert not has_reservation_intent("了解しました")
     assert not has_reservation_intent("こんにちは")
+
+
+def test_rule_based_shadow_parse_extracts_intent_date_time():
+    from app.services.shadow_service import _rule_based_shadow_parse
+
+    parsed = _rule_based_shadow_parse("4/12の午後3時半に予約変更したいです")
+    assert parsed["intent"] == "変更"
+    assert parsed["date"] is not None
+    assert parsed["time"] == "15:30"
+    assert parsed["menu"] is None
 
 
 def test_format_admin_notification():

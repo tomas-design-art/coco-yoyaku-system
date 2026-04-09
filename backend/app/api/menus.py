@@ -1,9 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.database import get_db
 from app.models.menu import Menu
+from app.models.patient import Patient
+from app.models.reservation import Reservation
 from app.schemas.menu import MenuCreate, MenuUpdate, MenuResponse
 from app.api.auth import require_admin
 
@@ -52,3 +54,30 @@ async def delete_menu(menu_id: int, db: AsyncSession = Depends(get_db), _auth: d
     await db.commit()
     await db.refresh(menu)
     return menu
+
+
+@router.post("/{menu_id}/purge")
+async def purge_menu(menu_id: int, db: AsyncSession = Depends(get_db), _auth: dict = Depends(require_admin)):
+    """完全削除（2段階目）: 先に論理削除済みのメニューのみ削除可能。"""
+    result = await db.execute(select(Menu).where(Menu.id == menu_id))
+    menu = result.scalar_one_or_none()
+    if not menu:
+        raise HTTPException(status_code=404, detail="メニューが見つかりません")
+    if menu.is_active:
+        raise HTTPException(status_code=400, detail="先にメニューを無効化してください")
+
+    # 参照を切ってから削除（過去予約・患者デフォルト設定の整合性維持）
+    await db.execute(
+        update(Reservation)
+        .where(Reservation.menu_id == menu_id)
+        .values(menu_id=None)
+    )
+    await db.execute(
+        update(Patient)
+        .where(Patient.default_menu_id == menu_id)
+        .values(default_menu_id=None)
+    )
+
+    await db.delete(menu)
+    await db.commit()
+    return {"status": "ok", "deleted_id": menu_id}

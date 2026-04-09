@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Plus, Edit2, Trash2 } from 'lucide-react';
 import type { Menu, ReservationColor } from '../../types';
-import { getMenus, createMenu, updateMenu, deleteMenu, getReservationColors } from '../../api/client';
+import { getMenus, createMenu, updateMenu, deleteMenu, purgeMenu, getReservationColors } from '../../api/client';
 import { extractErrorMessage } from '../../utils/errorUtils';
 
 export default function MenuManager() {
@@ -15,6 +15,7 @@ export default function MenuManager() {
   const [maxDurationMinutes, setMaxDurationMinutes] = useState<number | ''>('');
   const [price, setPrice] = useState<number | ''>('');
   const [selectedColorId, setSelectedColorId] = useState<number | null>(null);
+  const [editingWasInactive, setEditingWasInactive] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const fetchData = async () => {
@@ -43,7 +44,7 @@ export default function MenuManager() {
     };
     try {
       if (editingId) {
-        await updateMenu(editingId, data);
+        await updateMenu(editingId, { ...data, is_active: editingWasInactive ? true : undefined });
       } else {
         await createMenu({ ...data, display_order: menus.length });
       }
@@ -62,6 +63,7 @@ export default function MenuManager() {
     setPrice('');
     setSelectedColorId(null);
     setEditingId(null);
+    setEditingWasInactive(false);
     setShowForm(false);
   };
 
@@ -73,6 +75,7 @@ export default function MenuManager() {
     setMaxDurationMinutes(m.max_duration_minutes || '');
     setPrice(m.price || '');
     setSelectedColorId(m.color_id);
+    setEditingWasInactive(!m.is_active);
     setShowForm(true);
   };
 
@@ -84,6 +87,17 @@ export default function MenuManager() {
       } catch (err) {
         setError(extractErrorMessage(err, 'メニューの無効化に失敗しました'));
       }
+    }
+  };
+
+  const handlePermanentDelete = async (id: number) => {
+    const confirmed = window.confirm('本当に削除しますか？\n削除されたデータは復元できません。');
+    if (!confirmed) return;
+    try {
+      await purgeMenu(id);
+      fetchData();
+    } catch (err) {
+      setError(extractErrorMessage(err, 'メニューの完全削除に失敗しました'));
     }
   };
 
@@ -161,7 +175,7 @@ export default function MenuManager() {
           </div>
           <div className="flex gap-2">
             <button type="submit" className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600">
-              {editingId ? '更新' : '追加'}
+              {editingId ? (editingWasInactive ? '更新して再有効化' : '更新') : '追加'}
             </button>
             <button type="button" onClick={resetForm} className="px-4 py-2 border rounded hover:bg-gray-100">キャンセル</button>
           </div>
@@ -195,6 +209,9 @@ export default function MenuManager() {
               <button onClick={() => handleEdit(m)} className="p-1.5 hover:bg-gray-100 rounded"><Edit2 size={14} /></button>
               {m.is_active && (
                 <button onClick={() => handleDelete(m.id)} className="p-1.5 hover:bg-red-50 text-red-500 rounded"><Trash2 size={14} /></button>
+              )}
+              {!m.is_active && (
+                <button onClick={() => handlePermanentDelete(m.id)} className="p-1.5 hover:bg-red-50 text-red-600 rounded" title="完全削除"><Trash2 size={14} /></button>
               )}
             </div>
           </div>

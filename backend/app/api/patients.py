@@ -1,14 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_, and_
+from sqlalchemy import select, func, or_, and_, update
 from typing import Literal
 import re
 
 from app.database import get_db
 from app.models.patient import Patient
+from app.models.reservation import Reservation
 from app.schemas.patient import (
     PatientCreate, PatientUpdate, PatientResponse, PatientPageResponse,
-    CandidateQuery, CandidateResponse, _normalize_phone, build_name,
+    CandidateQuery, CandidateResponse, PatientPurgeRequest, _normalize_phone, build_name,
 )
 
 router = APIRouter(prefix="/api/patients", tags=["patients"])
@@ -38,14 +39,19 @@ async def _generate_patient_number(db: AsyncSession) -> str:
 
 
 @router.get("/search", response_model=list[PatientResponse])
-async def search_patients(q: str = Query(..., min_length=1), db: AsyncSession = Depends(get_db)):
+async def search_patients(
+    q: str = Query(..., min_length=1),
+    include_inactive: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+):
     """名前・読み方・診察券番号・電話番号で部分一致検索(active only)"""
     normalized_q = _normalize_for_compare(q)
     phone_q = _normalize_phone(q) or q
+    active_filter = True if include_inactive else Patient.is_active == True
     result = await db.execute(
         select(Patient).where(
             and_(
-                Patient.is_active == True,
+                active_filter,
                 or_(
                     Patient.name.ilike(f"%{normalized_q}%"),
                     Patient.last_name.ilike(f"%{normalized_q}%"),
@@ -289,7 +295,32 @@ async def reactivate_patient(patient_id: int, db: AsyncSession = Depends(get_db)
     await db.commit()
     await db.refresh(patient)
     return patient
-    patient.is_active = True
+
+
+@router.post("/{patient_id}/purge")
+async def purge_patient(
+    patient_id: int,
+    data: PatientPurgeRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """完全削除（2段階目）: 非表示化済み患者のみ削除可能。"""
+    result = await db.execute(select(Patient).where(Patient.id == patient_id))
+    patient = result.scalar_one_or_none()
+    if not patient:
+        raise HTTPException(status_code=404, detail="患者が見つかりません")
+    if patient.is_active:
+        raise HTTPException(status_code=400, detail="先に患者を非表示化してください")
+
+    # 理由は必須（監査/運用ルール）
+    if not data.reason.strip():
+        raise HTTPException(status_code=400, detail="削除理由は必須です")
+
+    # 過去予約は保持し、患者参照のみ切る
+    await db.execute(
+        update(Reservation)
+        .where(Reservation.patient_id == patient_id)
+        .values(patient_id=None)
+    )
+    await db.delete(patient)
     await db.commit()
-    await db.refresh(patient)
-    return patient
+    return {"status": "ok", "deleted_id": patient_id}

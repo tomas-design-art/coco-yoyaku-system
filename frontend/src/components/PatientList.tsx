@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
-import { Search, Edit2, ChevronLeft, ChevronRight, EyeOff, Eye } from 'lucide-react';
+import { Search, Edit2, ChevronLeft, ChevronRight, EyeOff, Eye, Trash2 } from 'lucide-react';
 import type { Patient, CandidateResponse, Menu, Practitioner } from '../types';
-import { getPatients, searchPatients, createPatient, updatePatient, findCandidates, deactivatePatient, reactivatePatient, getMenus, getPractitioners } from '../api/client';
+import { getPatients, searchPatientsWithInactive, createPatient, updatePatient, findCandidates, deactivatePatient, reactivatePatient, purgePatient, getMenus, getPractitioners } from '../api/client';
 import { extractErrorMessage } from '../utils/errorUtils';
 
 type SortBy = 'name' | 'patient_number' | 'created_at';
@@ -44,7 +44,7 @@ export default function PatientList() {
   const [candidates, setCandidates] = useState<CandidateResponse[]>([]);
   const [showCandidates, setShowCandidates] = useState(false);
   const [confirmNew, setConfirmNew] = useState(false);
-  const [includeInactive] = useState(false);
+  const includeInactive = true;
   const [menus, setMenus] = useState<Menu[]>([]);
   const [practitioners, setPractitioners] = useState<Practitioner[]>([]);
 
@@ -60,12 +60,12 @@ export default function PatientList() {
   const fetchData = async () => {
     try {
       if (query.length >= 1) {
-        const res = await searchPatients(query);
+        const res = await searchPatientsWithInactive(query, includeInactive);
         const data = res.data ?? [];
         setPatients(data);
         setTotal(data.length);
       } else {
-        const res = await getPatients({ page, per_page: perPage, sort_by: sortBy, sort_order: sortOrder });
+        const res = await getPatients({ page, per_page: perPage, sort_by: sortBy, sort_order: sortOrder, include_inactive: includeInactive });
         setPatients(res.data?.items ?? []);
         setTotal(res.data?.total ?? 0);
       }
@@ -264,6 +264,24 @@ export default function PatientList() {
       fetchData();
     } catch (err) {
       setError(extractErrorMessage(err, '再有効化に失敗しました'));
+    }
+  };
+
+  const handlePermanentDelete = async (id: number) => {
+    const reasonRaw = window.prompt('完全削除の理由を入力してください（必須）');
+    if (reasonRaw == null) return;
+    const reason = reasonRaw.trim();
+    if (!reason) {
+      window.alert('削除理由は必須です。');
+      return;
+    }
+    const confirmed = window.confirm('本当に削除しますか？\n削除されたデータは復元できません。');
+    if (!confirmed) return;
+    try {
+      await purgePatient(id, reason);
+      fetchData();
+    } catch (err) {
+      setError(extractErrorMessage(err, '患者の完全削除に失敗しました'));
     }
   };
 
@@ -499,7 +517,10 @@ export default function PatientList() {
                   {p.is_active ? (
                     <button onClick={() => handleDeactivate(p.id)} className="p-1 hover:bg-gray-100 rounded text-gray-400" title="非表示化"><EyeOff size={14} /></button>
                   ) : (
-                    <button onClick={() => handleReactivate(p.id)} className="p-1 hover:bg-gray-100 rounded text-blue-400" title="再有効化"><Eye size={14} /></button>
+                    <>
+                      <button onClick={() => handleReactivate(p.id)} className="p-1 hover:bg-gray-100 rounded text-blue-400" title="再有効化"><Eye size={14} /></button>
+                      <button onClick={() => handlePermanentDelete(p.id)} className="p-1 hover:bg-red-50 rounded text-red-600" title="完全削除"><Trash2 size={14} /></button>
+                    </>
                   )}
                 </td>
               </tr>
