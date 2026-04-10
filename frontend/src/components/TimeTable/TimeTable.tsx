@@ -46,6 +46,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
   const [practitionerStatuses, setPractitionerStatuses] = useState<PractitionerDayStatus[]>([]);
   const [businessHours, setBusinessHours] = useState<BusinessHoursDay[]>([]);
   const [isDraggingRescheduleTarget, setIsDraggingRescheduleTarget] = useState(false);
+  const rescheduleDragAnchorMinutesRef = useRef(0);
   const gridRef = useRef<HTMLDivElement>(null);
 
   // 営業時間に基づく動的スロット
@@ -314,7 +315,8 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
 
   const getDropStartMinutes = useCallback((clientY: number, rect: DOMRect, headerH: number, durationMin: number) => {
     const relativeY = clientY - rect.top - headerH;
-    const rawMinutes = dayStart + Math.round(relativeY / SLOT_HEIGHT) * SLOT_INTERVAL;
+    const pointerMinutes = dayStart + Math.round(relativeY / SLOT_HEIGHT) * SLOT_INTERVAL;
+    const rawMinutes = pointerMinutes - rescheduleDragAnchorMinutesRef.current;
     const maxStart = Math.max(dayStart, dayEnd - durationMin);
     return Math.min(Math.max(rawMinutes, dayStart), maxStart);
   }, [dayStart, dayEnd]);
@@ -452,9 +454,18 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                 if (!isTarget || !isRescheduling) return;
                 e.dataTransfer.setData('text/plain', `reschedule-${r.id}`);
                 e.dataTransfer.effectAllowed = 'move';
+
+                const blockRect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
+                const anchorPx = Math.max(0, Math.min(e.clientY - blockRect.top, blockRect.height));
+                // Keep the grab position inside the bar so tiny shifts (e.g. +5/+10 min) are easy to control.
+                rescheduleDragAnchorMinutesRef.current = Math.round(anchorPx / SLOT_HEIGHT) * SLOT_INTERVAL;
+
                 setIsDraggingRescheduleTarget(true);
               }}
-              onDragEnd={() => setIsDraggingRescheduleTarget(false)}
+              onDragEnd={() => {
+                setIsDraggingRescheduleTarget(false);
+                rescheduleDragAnchorMinutesRef.current = 0;
+              }}
               onClick={(e) => { e.stopPropagation(); if (!isRescheduling) onReservationClick(r); }}
             >
               <div className="flex items-center gap-0.5 truncate">
