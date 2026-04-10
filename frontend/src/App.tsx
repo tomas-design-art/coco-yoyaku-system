@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import { BrowserRouter, Routes, Route, Link, useLocation, useNavigate } from 'react-router-dom';
 import { Calendar, Users, Settings, Stethoscope, Menu as MenuIcon, Volume2, VolumeX, Palette, Bot, CalendarDays, CheckCircle, Lock, Unlock, LogOut, X } from 'lucide-react';
 import TimeTable from './components/TimeTable/TimeTable';
@@ -24,6 +24,12 @@ import { useNotification } from './hooks/useNotification';
 import { rescheduleReservation } from './api/client';
 import { extractErrorMessage } from './utils/errorUtils';
 import type { Reservation } from './types';
+
+type PendingRescheduleTarget = {
+  practitionerId: number;
+  startMinutes: number;
+  date: Date;
+};
 
 function NavLink({ to, children, locked }: { to: string; children: React.ReactNode; locked?: boolean }) {
   const location = useLocation();
@@ -59,7 +65,8 @@ function AppContent() {
 
   // Reschedule mode state
   const [reschedulingReservation, setReschedulingReservation] = useState<Reservation | null>(null);
-  const [rescheduleConfirm, setRescheduleConfirm] = useState<{ message: string; action: () => Promise<void> } | null>(null);
+  const [pendingRescheduleTarget, setPendingRescheduleTarget] = useState<PendingRescheduleTarget | null>(null);
+  const [isSubmittingReschedule, setIsSubmittingReschedule] = useState(false);
   const [rescheduleSuccess, setRescheduleSuccess] = useState<string | null>(null);
   const [rescheduleError, setRescheduleError] = useState<string | null>(null);
   const [rescheduleDurationOffset, setRescheduleDurationOffset] = useState(0);
@@ -99,58 +106,85 @@ function AppContent() {
   const handleStartReschedule = (reservation: Reservation) => {
     setSelectedReservation(null); // close detail
     setReschedulingReservation(reservation);
+    setPendingRescheduleTarget(null);
+    setRescheduleError(null);
     setRescheduleDurationOffset(0);
   };
 
   // Handle slot click while in reschedule mode
   const handleRescheduleSlotClick = (practitionerId: number, startMinutes: number, date: Date) => {
     if (!reschedulingReservation) return;
+    setRescheduleError(null);
+    setPendingRescheduleTarget({
+      practitionerId,
+      startMinutes,
+      date,
+    });
+  };
+
+  const pendingRescheduleLabel = useMemo(() => {
+    if (!pendingRescheduleTarget || !reschedulingReservation) return null;
+    const baseDurationMin = (new Date(reschedulingReservation.end_time).getTime() - new Date(reschedulingReservation.start_time).getTime()) / 60000;
+    const durationMin = baseDurationMin + rescheduleDurationOffset;
+
+    const startH = Math.floor(pendingRescheduleTarget.startMinutes / 60);
+    const startM = pendingRescheduleTarget.startMinutes % 60;
+    const endMinutes = pendingRescheduleTarget.startMinutes + durationMin;
+    const endH = Math.floor(endMinutes / 60);
+    const endM = endMinutes % 60;
+    const date = pendingRescheduleTarget.date;
+    const displayDate = `${date.getMonth() + 1}/${date.getDate()}`;
+    const startTimeStr = `${String(startH).padStart(2, '0')}:${String(startM).padStart(2, '0')}`;
+    const endTimeStr = `${String(endH).padStart(2, '0')}:${String(endM).padStart(2, '0')}`;
+    const offsetLabel = rescheduleDurationOffset !== 0
+      ? `（時間${rescheduleDurationOffset > 0 ? '+' : ''}${rescheduleDurationOffset}分）`
+      : '';
+    return `${displayDate} ${startTimeStr}〜${endTimeStr}${offsetLabel}`;
+  }, [pendingRescheduleTarget, reschedulingReservation, rescheduleDurationOffset]);
+
+  const confirmPendingReschedule = useCallback(async () => {
+    if (!reschedulingReservation || !pendingRescheduleTarget || isSubmittingReschedule) return;
+
     const r = reschedulingReservation;
     const baseDurationMin = (new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 60000;
     const durationMin = baseDurationMin + rescheduleDurationOffset;
 
-    const startH = Math.floor(startMinutes / 60);
-    const startM = startMinutes % 60;
-    const endMinutes = startMinutes + durationMin;
+    const startH = Math.floor(pendingRescheduleTarget.startMinutes / 60);
+    const startM = pendingRescheduleTarget.startMinutes % 60;
+    const endMinutes = pendingRescheduleTarget.startMinutes + durationMin;
     const endH = Math.floor(endMinutes / 60);
     const endM = endMinutes % 60;
-
+    const date = pendingRescheduleTarget.date;
     const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
     const startTimeStr = `${String(startH).padStart(2, '0')}:${String(startM).padStart(2, '0')}`;
     const endTimeStr = `${String(endH).padStart(2, '0')}:${String(endM).padStart(2, '0')}`;
-    const displayDate = `${date.getMonth() + 1}/${date.getDate()}`;
 
     setRescheduleError(null);
-    const offsetLabel = rescheduleDurationOffset !== 0
-      ? `（時間${rescheduleDurationOffset > 0 ? '+' : ''}${rescheduleDurationOffset}分）`
-      : '';
-    setRescheduleConfirm({
-      message: `予約を ${displayDate} ${startTimeStr}〜${endTimeStr} に変更しますか？${offsetLabel}`,
-      action: async () => {
-        try {
-          await rescheduleReservation(r.id, {
-            new_start_time: `${dateStr}T${startTimeStr}:00+09:00`,
-            new_end_time: `${dateStr}T${endTimeStr}:00+09:00`,
-            new_practitioner_id: practitionerId !== r.practitioner_id ? practitionerId : undefined,
-          });
-          setRescheduleConfirm(null);
-          setReschedulingReservation(null);
-          setRescheduleDurationOffset(0);
-          setRescheduleSuccess('予約を変更しました');
-          refresh();
-          setTimeout(() => setRescheduleSuccess(null), 2000);
-        } catch (err: unknown) {
-          setRescheduleConfirm(null);
-          setRescheduleError(extractErrorMessage(err, '予約変更に失敗しました'));
-        }
-      },
-    });
-  };
+    setIsSubmittingReschedule(true);
+    try {
+      await rescheduleReservation(r.id, {
+        new_start_time: `${dateStr}T${startTimeStr}:00+09:00`,
+        new_end_time: `${dateStr}T${endTimeStr}:00+09:00`,
+        new_practitioner_id: pendingRescheduleTarget.practitionerId !== r.practitioner_id ? pendingRescheduleTarget.practitionerId : undefined,
+      });
+      setReschedulingReservation(null);
+      setPendingRescheduleTarget(null);
+      setRescheduleDurationOffset(0);
+      setRescheduleSuccess('予約を変更しました');
+      refresh();
+      setTimeout(() => setRescheduleSuccess(null), 2000);
+    } catch (err: unknown) {
+      setRescheduleError(extractErrorMessage(err, '予約変更に失敗しました'));
+    } finally {
+      setIsSubmittingReschedule(false);
+    }
+  }, [reschedulingReservation, pendingRescheduleTarget, isSubmittingReschedule, rescheduleDurationOffset]);
 
   const cancelReschedule = () => {
     setReschedulingReservation(null);
-    setRescheduleConfirm(null);
+    setPendingRescheduleTarget(null);
     setRescheduleError(null);
+    setIsSubmittingReschedule(false);
     setRescheduleDurationOffset(0);
   };
 
@@ -243,6 +277,11 @@ function AppContent() {
               reschedulingReservation={reschedulingReservation}
               onRescheduleSlotClick={handleRescheduleSlotClick}
               onCancelReschedule={cancelReschedule}
+              pendingRescheduleTarget={pendingRescheduleTarget}
+              pendingRescheduleLabel={pendingRescheduleLabel}
+              onConfirmReschedule={confirmPendingReschedule}
+              canConfirmReschedule={!!pendingRescheduleTarget && !isSubmittingReschedule}
+              isConfirmingReschedule={isSubmittingReschedule}
               rescheduleDurationOffset={rescheduleDurationOffset}
               onRescheduleDurationChange={(delta) => setRescheduleDurationOffset(prev => prev + delta)}
               isFullscreenMode={isTimeTableFullscreen}
@@ -296,29 +335,6 @@ function AppContent() {
 
       {showNotificationPanel && (
         <NotificationPanel onClose={() => setShowNotificationPanel(false)} />
-      )}
-
-      {/* Reschedule confirmation dialog */}
-      {rescheduleConfirm && (
-        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-[60]">
-          <div className="bg-white rounded-lg shadow-2xl p-6 max-w-sm mx-4">
-            <p className="text-sm font-medium mb-4">{rescheduleConfirm.message}</p>
-            <div className="flex gap-2 justify-end">
-              <button
-                onClick={() => setRescheduleConfirm(null)}
-                className="px-4 py-2 bg-gray-200 text-gray-700 text-sm rounded hover:bg-gray-300"
-              >
-                いいえ
-              </button>
-              <button
-                onClick={rescheduleConfirm.action}
-                className="px-4 py-2 bg-blue-500 text-white text-sm rounded hover:bg-blue-600"
-              >
-                はい
-              </button>
-            </div>
-          </div>
-        </div>
       )}
 
       {/* Reschedule error */}

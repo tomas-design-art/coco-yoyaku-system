@@ -20,6 +20,11 @@ interface TimeTableProps {
   reschedulingReservation?: Reservation | null;
   onRescheduleSlotClick?: (practitionerId: number, startMinutes: number, date: Date) => void;
   onCancelReschedule?: () => void;
+  pendingRescheduleTarget?: { practitionerId: number; startMinutes: number; date: Date } | null;
+  pendingRescheduleLabel?: string | null;
+  onConfirmReschedule?: () => void;
+  canConfirmReschedule?: boolean;
+  isConfirmingReschedule?: boolean;
   rescheduleDurationOffset?: number;
   onRescheduleDurationChange?: (delta: number) => void;
   isFullscreenMode?: boolean;
@@ -27,7 +32,7 @@ interface TimeTableProps {
   fullscreenRightControls?: React.ReactNode;
 }
 
-export default function TimeTable({ onSlotClick, onDragSelect, onReservationClick, refreshKey, reschedulingReservation, onRescheduleSlotClick, onCancelReschedule, rescheduleDurationOffset = 0, onRescheduleDurationChange, isFullscreenMode = false, onToggleFullscreen, fullscreenRightControls }: TimeTableProps) {
+export default function TimeTable({ onSlotClick, onDragSelect, onReservationClick, refreshKey, reschedulingReservation, onRescheduleSlotClick, onCancelReschedule, pendingRescheduleTarget, pendingRescheduleLabel, onConfirmReschedule, canConfirmReschedule = false, isConfirmingReschedule = false, rescheduleDurationOffset = 0, onRescheduleDurationChange, isFullscreenMode = false, onToggleFullscreen, fullscreenRightControls }: TimeTableProps) {
   const [allPractitioners, setAllPractitioners] = useState<Practitioner[]>([]);
   const [reservations, setReservations] = useState<Reservation[]>([]);
   const [colors, setColors] = useState<ReservationColor[]>([]);
@@ -40,6 +45,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
   const [weeklySchedules, setWeeklySchedules] = useState<WeeklySchedule[]>([]);
   const [practitionerStatuses, setPractitionerStatuses] = useState<PractitionerDayStatus[]>([]);
   const [businessHours, setBusinessHours] = useState<BusinessHoursDay[]>([]);
+  const [isDraggingRescheduleTarget, setIsDraggingRescheduleTarget] = useState(false);
   const gridRef = useRef<HTMLDivElement>(null);
 
   // 営業時間に基づく動的スロット
@@ -306,11 +312,55 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
   // ----- レンダリング用ヘルパー -----
   const isRescheduling = !!reschedulingReservation;
 
+  const getDropStartMinutes = useCallback((clientY: number, rect: DOMRect, headerH: number, durationMin: number) => {
+    const relativeY = clientY - rect.top - headerH;
+    const rawMinutes = dayStart + Math.round(relativeY / SLOT_HEIGHT) * SLOT_INTERVAL;
+    const maxStart = Math.max(dayStart, dayEnd - durationMin);
+    return Math.min(Math.max(rawMinutes, dayStart), maxStart);
+  }, [dayStart, dayEnd]);
+
+  const handleRescheduleDrop = useCallback((e: React.DragEvent<HTMLDivElement>, practitionerId: number, date: Date, headerH: number) => {
+    if (!isRescheduling || !onRescheduleSlotClick || !reschedulingReservation) return;
+    e.preventDefault();
+
+    const rect = e.currentTarget.getBoundingClientRect();
+    const durationMin = Math.round((new Date(reschedulingReservation.end_time).getTime() - new Date(reschedulingReservation.start_time).getTime()) / 60000) + rescheduleDurationOffset;
+    const startMinutes = getDropStartMinutes(e.clientY, rect, headerH, durationMin);
+
+    onRescheduleSlotClick(practitionerId, startMinutes, date);
+    setIsDraggingRescheduleTarget(false);
+  }, [isRescheduling, onRescheduleSlotClick, reschedulingReservation, rescheduleDurationOffset, getDropStartMinutes]);
+
   const renderColumn = (practitionerId: number, date: Date, headerH: number) => {
     const dayOff = getPractitionerDayOff(practitionerId, date);
     const unavailableTimes = getUnavailableTimesForColumn(practitionerId, date);
+    const hasPendingTarget = !!pendingRescheduleTarget
+      && pendingRescheduleTarget.practitionerId === practitionerId
+      && formatDate(pendingRescheduleTarget.date) === formatDate(date)
+      && !!reschedulingReservation;
+    const pendingDurationMin = reschedulingReservation
+      ? Math.round((new Date(reschedulingReservation.end_time).getTime() - new Date(reschedulingReservation.start_time).getTime()) / 60000) + rescheduleDurationOffset
+      : 0;
+    const pendingTop = hasPendingTarget
+      ? ((pendingRescheduleTarget!.startMinutes - dayStart) / SLOT_INTERVAL) * SLOT_HEIGHT
+      : 0;
+    const pendingHeight = hasPendingTarget
+      ? (pendingDurationMin / SLOT_INTERVAL) * SLOT_HEIGHT
+      : 0;
+
     return (
-      <>
+      <div
+        className="relative"
+        onDragOver={(e) => {
+          if (dayOff || !isDraggingRescheduleTarget) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'move';
+        }}
+        onDrop={(e) => {
+          if (dayOff) return;
+          handleRescheduleDrop(e, practitionerId, date, headerH);
+        }}
+      >
         {dayOff ? (
           /* 休みの施術者: グレーアウト＋クリック無効 */
           <div
@@ -386,7 +436,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
           return (
             <div
               key={r.id}
-              className={`absolute left-0.5 right-0.5 rounded px-1 text-white overflow-hidden shadow-sm ${isTarget ? 'ring-2 ring-blue-400 animate-pulse pointer-events-auto' : isRescheduling ? '' : 'cursor-pointer hover:opacity-90'}`}
+              className={`absolute left-0.5 right-0.5 rounded px-1 text-white overflow-hidden shadow-sm ${isTarget ? 'ring-2 ring-blue-400 animate-pulse pointer-events-auto cursor-grab active:cursor-grabbing' : isRescheduling ? '' : 'cursor-pointer hover:opacity-90'}`}
               style={{
                 top: top + headerH,
                 height: Math.max(height, SLOT_HEIGHT),
@@ -397,6 +447,14 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                 ...getBlockExtraStyle(r),
                 ...(isRescheduling && !isTarget ? { opacity: 0.6 } : {}),
               }}
+              draggable={isTarget && isRescheduling}
+              onDragStart={(e) => {
+                if (!isTarget || !isRescheduling) return;
+                e.dataTransfer.setData('text/plain', `reschedule-${r.id}`);
+                e.dataTransfer.effectAllowed = 'move';
+                setIsDraggingRescheduleTarget(true);
+              }}
+              onDragEnd={() => setIsDraggingRescheduleTarget(false)}
               onClick={(e) => { e.stopPropagation(); if (!isRescheduling) onReservationClick(r); }}
             >
               <div className="flex items-center gap-0.5 truncate">
@@ -438,6 +496,20 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
             </div>
           );
         })}
+        {hasPendingTarget && (
+          <div
+            className="absolute left-0.5 right-0.5 rounded border-2 border-blue-500 bg-blue-500/20 pointer-events-none"
+            style={{
+              top: pendingTop + headerH,
+              height: Math.max(pendingHeight, SLOT_HEIGHT),
+              zIndex: 9,
+            }}
+          >
+            <div className="absolute top-0 left-0 right-0 text-[10px] font-bold text-blue-700 bg-white/90 px-1 py-0.5">
+              移動先プレビュー
+            </div>
+          </div>
+        )}
         {/* 現在時刻インジケーター */}
         {formatDate(date) === formatDate(getTodayJST()) &&
           nowMinutes >= dayStart && nowMinutes <= dayEnd && (
@@ -452,7 +524,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               <div style={{ height: 2, backgroundColor: '#EF4444', marginLeft: 8 }} />
             </div>
           )}
-      </>
+      </div>
     );
   };
 
@@ -474,14 +546,28 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                 </span>
               )}
             </span>
-            <span className="text-blue-500">→ 空き枠をクリックして変更先を選択</span>
+            <span className="text-blue-500">→ クリック または ドラッグ&ドロップで変更先を選択</span>
+            {pendingRescheduleLabel && (
+              <span className="font-semibold text-blue-700 bg-white/80 px-2 py-0.5 rounded border border-blue-200">
+                候補: {pendingRescheduleLabel}
+              </span>
+            )}
           </div>
-          <button
-            onClick={onCancelReschedule}
-            className="px-3 py-1 text-sm bg-gray-200 text-gray-700 rounded hover:bg-gray-300 shrink-0"
-          >
-            キャンセル
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={onConfirmReschedule}
+              disabled={!canConfirmReschedule}
+              className="px-3 py-1 text-sm bg-green-600 text-white rounded hover:bg-green-700 disabled:bg-green-300 disabled:cursor-not-allowed"
+            >
+              {isConfirmingReschedule ? '確定中...' : 'この位置で確定'}
+            </button>
+            <button
+              onClick={onCancelReschedule}
+              className="px-3 py-1 text-sm bg-gray-200 text-gray-700 rounded hover:bg-gray-300"
+            >
+              キャンセル
+            </button>
+          </div>
         </div>
       )}
 
