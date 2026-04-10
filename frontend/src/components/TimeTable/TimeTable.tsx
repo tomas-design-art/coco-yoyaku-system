@@ -382,8 +382,9 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               top: headerH,
               bottom: 0,
               zIndex: 4,
-              background: 'repeating-linear-gradient(45deg, transparent, transparent 6px, rgba(156,163,175,0.2) 6px, rgba(156,163,175,0.2) 8px)',
-              backgroundColor: 'rgba(209,213,219,0.4)',
+              // Same base tone as "営業時間外" and distinguish by hatch pattern.
+              background: 'repeating-linear-gradient(45deg, rgba(209,213,219,0.12), rgba(209,213,219,0.12) 6px, rgba(156,163,175,0.28) 6px, rgba(156,163,175,0.28) 9px)',
+              backgroundColor: 'rgba(209,213,219,0.45)',
             }}
             title={dayOff.reason ? `休み: ${dayOff.reason}` : '休み'}
           >
@@ -427,12 +428,12 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                 top,
                 height: Math.max(height, SLOT_HEIGHT),
                 zIndex: 4,
-                background: 'repeating-linear-gradient(45deg, transparent, transparent 4px, rgba(251,191,36,0.15) 4px, rgba(251,191,36,0.15) 6px)',
-                backgroundColor: 'rgba(251,191,36,0.18)',
+                background: 'repeating-linear-gradient(45deg, rgba(209,213,219,0.12), rgba(209,213,219,0.12) 4px, rgba(156,163,175,0.26) 4px, rgba(156,163,175,0.26) 6px)',
+                backgroundColor: 'rgba(209,213,219,0.45)',
               }}
               title={ut.reason || '時間帯休み'}
             >
-              <span className="text-amber-600 font-bold text-xs bg-white/80 px-1 py-0.5 rounded shadow-sm truncate" style={{ fontSize: 9 }}>
+              <span className="text-gray-600 font-bold text-xs bg-white/85 px-1 py-0.5 rounded shadow-sm truncate" style={{ fontSize: 9 }}>
                 {ut.reason || '休み'}
               </span>
             </div>
