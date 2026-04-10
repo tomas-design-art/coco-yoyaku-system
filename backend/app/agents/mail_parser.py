@@ -114,13 +114,13 @@ def parse_hotpepper_mail(raw_email: str) -> dict:
         raise ValueError("来店日時が取得できません")
 
     # ── 所要時間 ──
-    duration_minutes = _parse_duration(raw_email)
+    duration_minutes, duration_extracted = _parse_duration(raw_email)
 
     # ── end_time ──
     end_time = start_time + timedelta(minutes=duration_minutes)
 
     # ── 指名スタッフ ──
-    practitioner_name = _parse_practitioner(sections.get("指名スタッフ", ""))
+    practitioner_name, practitioner_preference_known = _parse_practitioner(sections.get("指名スタッフ"))
 
     # ── メニュー ──
     menu_name = _parse_menu(sections.get("メニュー", ""))
@@ -144,7 +144,9 @@ def parse_hotpepper_mail(raw_email: str) -> dict:
         "start_time": start_time,
         "end_time": end_time,
         "duration_minutes": duration_minutes,
+        "duration_extracted": duration_extracted,
         "practitioner_name": practitioner_name,
+        "practitioner_preference_known": practitioner_preference_known,
         "menu_name": menu_name,
         "amount": amount,
         "coupon_name": coupon_name,
@@ -180,23 +182,26 @@ def _parse_visit_datetime(section_val: str, raw: str) -> Optional[datetime]:
     return None
 
 
-def _parse_duration(raw: str) -> int:
-    """所要時間をメール全文から抽出。デフォルト60分"""
+def _parse_duration(raw: str) -> tuple[int, bool]:
+    """所要時間をメール全文から抽出。見つからない場合はデフォルト60分。"""
     m = re.search(r'所要時間[^\d]*?(\d+)\s*時間', raw)
     if m:
-        return int(m.group(1)) * 60
+        return int(m.group(1)) * 60, True
     m = re.search(r'所要時間[^\d]*?(\d+)\s*分', raw)
     if m:
-        return int(m.group(1))
-    return 60  # デフォルト
+        return int(m.group(1)), True
+    return 60, False  # デフォルト
 
 
-def _parse_practitioner(section_val: str) -> Optional[str]:
-    """指名スタッフ。「指名なし」は None"""
+def _parse_practitioner(section_val: Optional[str]) -> tuple[Optional[str], bool]:
+    """指名スタッフを抽出。戻り値は (name, is_preference_known)。"""
+    if section_val is None:
+        # HotPepperメールでは「指名スタッフ」欄が空欄/未記載=希望なしのケースがある
+        return None, True
     val = section_val.strip()
     if not val or val == "指名なし":
-        return None
-    return val
+        return None, True
+    return val, True
 
 
 def _parse_menu(section_val: str) -> Optional[str]:
@@ -326,3 +331,53 @@ async def _ai_parse(email_body: str) -> dict:
                 return json.loads(json_match.group())
 
     raise Exception("AI API key not configured")
+
+
+async def ai_review_hotpepper_required(email_body: str, parsed: dict | None = None) -> dict:
+    """AIで必須項目の取得可否を判定し、必要に応じて抽出値を返す。"""
+    from app.config import settings
+
+    if not settings.gemini_api_key:
+        raise Exception("AI API key not configured")
+
+    import httpx
+
+    model = settings.gemini_model
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={settings.gemini_api_key}"
+
+    parsed_json = json.dumps(parsed or {}, ensure_ascii=False, default=str)
+    prompt = (
+        "あなたは予約メールの監査AIです。以下のメール本文と既存パース結果を見て、"
+        "必須項目の取得可否を判定してください。必須項目は\n"
+        "1) patient_name\n2) reservation_date(YYYY-MM-DD)\n3) reservation_time(HH:MM)\n"
+        "4) duration_minutes(整数)\n5) practitioner_preference_known(真偽: 指名希望情報が読み取れたか)\n"
+        "です。\n"
+        "JSONのみ返答してください。\n"
+        "形式: {\"ok\": bool, \"missing\": [string], \"fields\": {"
+        "\"patient_name\": string|null, \"reservation_date\": string|null, \"reservation_time\": string|null,"
+        "\"duration_minutes\": number|null, \"practitioner_name\": string|null,"
+        "\"practitioner_preference_known\": bool|null}}\n\n"
+        f"既存パース結果:\n{parsed_json}\n\n"
+        f"メール本文:\n{email_body}\n"
+    )
+
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 700},
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(url, json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+    text = data["candidates"][0]["content"]["parts"][0]["text"]
+    json_match = re.search(r'\{.*\}', text, re.DOTALL)
+    if not json_match:
+        raise ValueError("AIレスポンスからJSONを抽出できませんでした")
+    return json.loads(json_match.group())

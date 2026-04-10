@@ -171,8 +171,11 @@ async def test_shadow_no_intent_logs_only():
     mock_db.add = MagicMock()
     mock_db.flush = AsyncMock()
 
+    mock_state = {"mode": "idle", "draft": {}, "request_id": None}
+
     with patch("app.services.shadow_service.analyze_with_llm", new_callable=AsyncMock) as mock_llm, \
-         patch("app.services.shadow_service.notify_admin_shadow", new_callable=AsyncMock) as mock_notify:
+         patch("app.services.shadow_service.notify_admin_shadow", new_callable=AsyncMock) as mock_notify, \
+         patch("app.services.shadow_service.get_user_state", new_callable=AsyncMock, return_value=mock_state):
 
         from app.services.shadow_service import handle_shadow_message
         await handle_shadow_message(
@@ -192,7 +195,7 @@ async def test_shadow_no_intent_logs_only():
 
 @pytest.mark.asyncio
 async def test_shadow_with_intent_analyzes_and_notifies():
-    """予約意図ありのメッセージはLLM解析 + 管理者通知 + ログ保存"""
+    """予約意図ありのメッセージはLLM解析 + ドラフト蓄積 + 管理者通知"""
     from app.services.shadow_service import _DEBOUNCE_BUFFER
     _DEBOUNCE_BUFFER.clear()
 
@@ -203,14 +206,37 @@ async def test_shadow_with_intent_analyzes_and_notifies():
     analysis = {
         "intent": "予約希望",
         "name": "鈴木",
-        "menu": "骨盤矯正",
+        "menu": None,
         "date": "2026-04-07",
         "time": "14:00",
+        "duration_minutes": 60,
         "confidence": "high",
     }
 
+    # 初回state: idle → shadow_drafting
+    mock_state_idle = {"mode": "idle", "draft": {}, "request_id": None}
+    # ドラフト完了後state
+    mock_state_complete = {
+        "mode": "shadow_drafting",
+        "draft": {
+            "customer_name": "鈴木",
+            "date": "2026-04-07",
+            "time": "14:00",
+            "duration_minutes": 60,
+        },
+        "request_id": None,
+    }
+
     with patch("app.services.shadow_service.analyze_with_llm", new_callable=AsyncMock, return_value=analysis) as mock_llm, \
-         patch("app.services.shadow_service.notify_admin_shadow", new_callable=AsyncMock, return_value=True) as mock_notify:
+         patch("app.services.shadow_service.notify_admin_shadow", new_callable=AsyncMock, return_value=True), \
+         patch("app.services.shadow_service.get_user_state", new_callable=AsyncMock, side_effect=[
+             mock_state_idle, mock_state_complete, mock_state_complete, mock_state_complete,
+         ]), \
+         patch("app.services.shadow_service.set_user_mode", new_callable=AsyncMock), \
+         patch("app.services.shadow_service.merge_user_draft", new_callable=AsyncMock), \
+         patch("app.services.shadow_service._find_line_patient", new_callable=AsyncMock, return_value=None), \
+         patch("app.services.shadow_service._get_patient_default_preset", new_callable=AsyncMock, return_value=None), \
+         patch("app.services.shadow_service._shadow_check_and_notify", new_callable=AsyncMock) as mock_check:
 
         from app.services.shadow_service import handle_shadow_message
         await handle_shadow_message(
@@ -221,5 +247,5 @@ async def test_shadow_with_intent_analyzes_and_notifies():
         )
 
         mock_llm.assert_awaited_once()
-        mock_notify.assert_awaited_once()
-        mock_db.add.assert_called()
+        # ドラフト完了 → 空き確認+通知
+        mock_check.assert_awaited_once()

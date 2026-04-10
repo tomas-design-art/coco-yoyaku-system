@@ -41,6 +41,7 @@ from app.services.line_state import (
     update_request,
 )
 from app.services.notification_service import create_notification
+from app.services.patient_match import create_new_patient, find_name_candidates, find_or_create_patient, match_identity_token
 from app.services.reservation_service import create_reservation
 from app.services.schedule_service import is_practitioner_working
 from app.services.shadow_service import handle_shadow_message
@@ -129,6 +130,23 @@ def _build_duration_quick_reply_items(min_minutes: int, max_minutes: int, max_it
     return items
 
 
+def _build_yes_no_new_quick_reply_items() -> list[dict]:
+    return [
+        {
+            "type": "action",
+            "action": {"type": "message", "label": "はい", "text": "はい"},
+        },
+        {
+            "type": "action",
+            "action": {"type": "message", "label": "いいえ", "text": "いいえ"},
+        },
+        {
+            "type": "action",
+            "action": {"type": "message", "label": "新規登録", "text": "新規登録"},
+        },
+    ]
+
+
 def _extract_duration_minutes(text: str) -> int | None:
     m = re.search(r"(\d{2,3})\s*分", text)
     if m:
@@ -172,19 +190,21 @@ async def _get_patient_default_preset(db: AsyncSession, patient: Patient | None)
     """患者のデフォルト設定からいつものプリセットを返す。
     default_menu_id が設定されていれば返す。preferred_practitioner_id は任意。
     """
-    if not patient or not patient.default_menu_id:
+    default_menu_id = getattr(patient, "default_menu_id", None) if patient else None
+    if not patient or not default_menu_id:
         return None
     menu = (
-        await db.execute(select(Menu).where(Menu.id == patient.default_menu_id, Menu.is_active == True))
+        await db.execute(select(Menu).where(Menu.id == default_menu_id, Menu.is_active == True))
     ).scalar_one_or_none()
     if not menu:
         return None
-    duration = patient.default_duration or menu.duration_minutes
+    duration = getattr(patient, "default_duration", None) or menu.duration_minutes
     practitioner_id = None
     practitioner_name = None
-    if patient.preferred_practitioner_id:
+    preferred_practitioner_id = getattr(patient, "preferred_practitioner_id", None)
+    if preferred_practitioner_id:
         practitioner = (
-            await db.execute(select(Practitioner).where(Practitioner.id == patient.preferred_practitioner_id))
+            await db.execute(select(Practitioner).where(Practitioner.id == preferred_practitioner_id))
         ).scalar_one_or_none()
         if practitioner:
             practitioner_id = practitioner.id
@@ -380,19 +400,7 @@ async def _suggest_alternatives(
 
 
 async def _find_or_create_line_patient(db: AsyncSession, user_id: str, name: str | None) -> Patient:
-    existing = (
-        await db.execute(select(Patient).where(Patient.line_id == user_id).limit(1))
-    ).scalar_one_or_none()
-    if existing:
-        if name and existing.name in {None, "", "不明"}:
-            existing.name = name
-            await db.flush()
-        return existing
-
-    patient = Patient(name=name or "LINE患者", line_id=user_id)
-    db.add(patient)
-    await db.flush()
-    return patient
+    return await find_or_create_patient(db, name=name, line_id=user_id)
 
 
 async def _find_line_patient(db: AsyncSession, user_id: str) -> Patient | None:
@@ -402,30 +410,11 @@ async def _find_line_patient(db: AsyncSession, user_id: str) -> Patient | None:
 
 
 async def _register_line_patient(db: AsyncSession, user_id: str, full_name: str) -> Patient:
-    existing = await _find_line_patient(db, user_id)
-    if existing:
-        updated = False
-        if existing.name in {None, "", "不明", "LINE患者"}:
-            existing.name = full_name
-            updated = True
-        if not existing.patient_number:
-            existing.patient_number = await _generate_patient_number_line(db)
-            updated = True
-        if updated:
-            await db.flush()
-        return existing
+    return await find_or_create_patient(db, name=full_name, line_id=user_id)
 
-    patient_number = await _generate_patient_number_line(db)
 
-    patient = Patient(
-        name=full_name,
-        line_id=user_id,
-        patient_number=patient_number,
-        notes="LINE初回登録",
-    )
-    db.add(patient)
-    await db.flush()
-    return patient
+async def _register_line_patient_as_new(db: AsyncSession, user_id: str, full_name: str) -> Patient:
+    return await create_new_patient(db, name=full_name, line_id=user_id)
 
 
 async def _generate_patient_number_line(db: AsyncSession) -> str:
@@ -447,6 +436,11 @@ def _compose_alternatives_text(alternatives: list[dict]) -> str:
         lines.append(f"{i}. {a['label']}")
     lines.append("ご希望の番号を返信してください。")
     return "\n".join(lines)
+
+
+def _format_date_with_weekday_jp(d: date) -> str:
+    weekday = ["月", "火", "水", "木", "金", "土", "日"][d.weekday()]
+    return f"{d.month}/{d.day}({weekday})"
 
 
 async def _handle_text_message(event: dict, db: AsyncSession):
@@ -487,7 +481,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     latest_reservation = await _get_latest_reservation_for_line_user(db, user_id)
     merged: dict | None = None
 
-    if not line_patient and current_mode != "awaiting_name":
+    if not line_patient and current_mode not in {"awaiting_name", "awaiting_existing_confirmation", "awaiting_identity_token"}:
         await set_user_mode(db, user_id, "awaiting_name", user_state.get("request_id"))
         await create_notification(db, "line_name_registration", f"LINE初回名前登録待ち: {user_id}")
         if reply_token:
@@ -504,6 +498,26 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 await reply_to_line(reply_token, "確認のため、フルネーム（姓・名）をもう一度お願いします。")
             return
 
+        candidates = await find_name_candidates(db, full_name, limit=5)
+        if candidates:
+            await merge_user_draft(
+                db,
+                user_id,
+                {
+                    "line_input_name": full_name,
+                    "line_candidate_ids": [p.id for p in candidates],
+                },
+            )
+            await set_user_mode(db, user_id, "awaiting_existing_confirmation", user_state.get("request_id"))
+            if reply_token:
+                await reply_text_with_quick_reply(
+                    reply_token,
+                    "以前当院をご利用したことがありますか？\n"
+                    "ある場合は、登録済み情報（電話番号または生年月日）でご本人確認します。",
+                    _build_yes_no_new_quick_reply_items(),
+                )
+            return
+
         line_patient = await _register_line_patient(db, user_id, full_name)
         await merge_user_draft(db, user_id, {"customer_name": line_patient.name})
         await set_user_mode(db, user_id, "waiting_menu", user_state.get("request_id"))
@@ -514,6 +528,115 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 reply_token,
                 f"{line_patient.name}様、登録ありがとうございます。続けてご希望メニューを選択してください。",
                 quick_items,
+            )
+        return
+
+    if current_mode == "awaiting_existing_confirmation" and not line_patient:
+        entered_name = prev_draft.get("line_input_name") or extract_full_name(text, profile_name=display_name) or ""
+        normalized_text = text.strip()
+
+        if normalized_text == "はい":
+            await set_user_mode(db, user_id, "awaiting_identity_token", user_state.get("request_id"))
+            if reply_token:
+                await reply_text_with_quick_reply(
+                    reply_token,
+                    "ご本人確認のため、登録済みの電話番号または生年月日（YYYY-MM-DD）を入力してください。\n"
+                    "分からない場合は「新規登録」を選んでください。",
+                    [
+                        {
+                            "type": "action",
+                            "action": {"type": "message", "label": "新規登録", "text": "新規登録"},
+                        }
+                    ],
+                )
+            return
+
+        if normalized_text in {"いいえ", "新規登録"}:
+            line_patient = await _register_line_patient_as_new(db, user_id, entered_name)
+            await merge_user_draft(db, user_id, {"customer_name": line_patient.name})
+            await set_user_mode(db, user_id, "waiting_menu", user_state.get("request_id"))
+            await create_notification(db, "line_name_registered", f"LINE新規登録: {line_patient.name}")
+            if reply_token:
+                quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
+                await reply_text_with_quick_reply(
+                    reply_token,
+                    f"{line_patient.name}様、新規登録ありがとうございます。続けてご希望メニューを選択してください。",
+                    quick_items,
+                )
+            return
+
+        if reply_token:
+            await reply_text_with_quick_reply(
+                reply_token,
+                "「はい」または「いいえ」を選択してください。",
+                _build_yes_no_new_quick_reply_items(),
+            )
+        return
+
+    if current_mode == "awaiting_identity_token" and not line_patient:
+        token = text.strip()
+        entered_name = prev_draft.get("line_input_name") or ""
+        candidate_ids = prev_draft.get("line_candidate_ids") or []
+
+        if token == "新規登録":
+            line_patient = await _register_line_patient_as_new(db, user_id, entered_name)
+            await merge_user_draft(db, user_id, {"customer_name": line_patient.name})
+            await set_user_mode(db, user_id, "waiting_menu", user_state.get("request_id"))
+            await create_notification(db, "line_name_registered", f"LINE新規登録(本人選択): {line_patient.name}")
+            if reply_token:
+                quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
+                await reply_text_with_quick_reply(
+                    reply_token,
+                    f"{line_patient.name}様、新規登録として受け付けました。続けてご希望メニューを選択してください。",
+                    quick_items,
+                )
+            return
+
+        if not isinstance(candidate_ids, list) or not candidate_ids:
+            await set_user_mode(db, user_id, "awaiting_name", user_state.get("request_id"))
+            if reply_token:
+                await reply_to_line(reply_token, "確認情報が見つからないため、もう一度お名前の入力をお願いします。")
+            return
+
+        result = await db.execute(select(Patient).where(Patient.id.in_(candidate_ids)))
+        candidates = result.scalars().all()
+        matched = [p for p in candidates if match_identity_token(p, token)]
+
+        if len(matched) == 1:
+            line_patient = matched[0]
+            updated = False
+            if not line_patient.line_id:
+                line_patient.line_id = user_id
+                updated = True
+            if entered_name and line_patient.name in {None, "", "不明", "LINE患者"}:
+                line_patient.name = entered_name
+                updated = True
+            if updated:
+                await db.flush()
+
+            await merge_user_draft(db, user_id, {"customer_name": line_patient.name})
+            await set_user_mode(db, user_id, "waiting_menu", user_state.get("request_id"))
+            await create_notification(db, "line_identity_verified", f"LINE既存患者紐づけ: patient_id={line_patient.id}")
+            if reply_token:
+                quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
+                await reply_text_with_quick_reply(
+                    reply_token,
+                    "ご本人確認ができました。以前の患者情報にLINEを紐づけました。続けてご希望メニューを選択してください。",
+                    quick_items,
+                )
+            return
+
+        if reply_token:
+            await reply_text_with_quick_reply(
+                reply_token,
+                "一致する情報が確認できませんでした。登録済みの電話番号または生年月日（YYYY-MM-DD）を入力してください。\n"
+                "分からない場合は「新規登録」を選べます。",
+                [
+                    {
+                        "type": "action",
+                        "action": {"type": "message", "label": "新規登録", "text": "新規登録"},
+                    }
+                ],
             )
         return
 
@@ -863,6 +986,188 @@ async def _handle_postback(event: dict, db: AsyncSession):
         await set_user_mode(db, user_id, "manual", rid)
         if reply_token:
             await reply_to_line(reply_token, "この患者は手動返信モードに切り替えました。")
+
+    # ── シャドーモード: 管理者承認 ──
+    elif action == "shadow_approve":
+        if not req.get("available"):
+            if reply_token:
+                await reply_to_line(reply_token, "希望枠は満席のため確定できません。代替案を選択してください。")
+            return
+
+        patient = await _find_or_create_line_patient(db, user_id, req.get("customer_name"))
+        start_dt = datetime.fromisoformat(req["start_time_iso"])
+        end_dt = datetime.fromisoformat(req["end_time_iso"])
+
+        duration_minutes = int(req.get("duration_minutes") or ((end_dt - start_dt).total_seconds() // 60))
+        date_label = _format_date_with_weekday_jp(start_dt.date())
+        time_label = start_dt.strftime("%H:%M")
+
+        try:
+            reservation = await create_reservation(
+                db,
+                ReservationCreate(
+                    patient_id=patient.id,
+                    practitioner_id=int(req["practitioner_id"]),
+                    menu_id=req.get("menu_id"),
+                    start_time=start_dt,
+                    end_time=end_dt,
+                    channel="LINE",
+                    notes=f"LINE シャドーモード確定 (RID:{rid})",
+                ),
+            )
+        except HTTPException as e:
+            detail = e.detail if isinstance(e.detail, str) else str(e.detail)
+            admin_fail_text = (
+                f"予約枠を登録できませんでしたので、手動で対応お願いします。"
+                f"{date_label} {time_label}〜{duration_minutes}分です。"
+                f" 理由: {detail}"
+            )
+            await push_message(settings.line_admin_user_id, admin_fail_text)
+            if reply_token:
+                await reply_to_line(reply_token, admin_fail_text)
+            await update_request(db, rid, line_user_id=user_id, status="manual_reply")
+            await set_user_mode(db, user_id, "manual", rid)
+            return
+        except Exception as e:
+            admin_fail_text = (
+                f"予約枠を登録できませんでしたので、手動で対応お願いします。"
+                f"{date_label} {time_label}〜{duration_minutes}分です。"
+                f" 理由: {str(e)}"
+            )
+            await push_message(settings.line_admin_user_id, admin_fail_text)
+            if reply_token:
+                await reply_to_line(reply_token, admin_fail_text)
+            await update_request(db, rid, line_user_id=user_id, status="manual_reply")
+            await set_user_mode(db, user_id, "manual", rid)
+            return
+
+        # 予約ボード登録後に患者へ通知（ボード先行）
+        reservation_status = reservation.get("status")
+        await update_request(db, rid, line_user_id=user_id, status=("confirmed" if reservation_status == "CONFIRMED" else "pending"), reservation_id=reservation.get("id"))
+        await set_user_mode(db, user_id, "idle", rid)
+
+        if reservation_status == "CONFIRMED":
+            await push_message(
+                user_id,
+                f"ご予約を確定しました。\n{start_dt.strftime('%Y/%m/%d %H:%M')}〜{end_dt.strftime('%H:%M')}\nご来院をお待ちしております。",
+            )
+            admin_ok_text = f"予約システムに登録し予約完了しました。{date_label} {time_label}〜{duration_minutes}分です。"
+        else:
+            await push_message(
+                user_id,
+                f"ご予約リクエストを受け付けました。\n{start_dt.strftime('%Y/%m/%d %H:%M')}〜{end_dt.strftime('%H:%M')}\n最終確認後にご案内します。",
+            )
+            admin_ok_text = (
+                f"予約システムには登録しましたが、ステータスは{reservation_status}です。"
+                f" {date_label} {time_label}〜{duration_minutes}分。最終確認をお願いします。"
+            )
+
+        await push_message(settings.line_admin_user_id, admin_ok_text)
+        if reply_token:
+            await reply_to_line(reply_token, admin_ok_text)
+
+    elif action == "shadow_alt":
+        alt_raw = (q.get("alt") or ["0"])[0]
+        try:
+            alt_index = int(alt_raw) - 1
+        except (TypeError, ValueError):
+            if reply_token:
+                await reply_to_line(reply_token, "代案番号の形式が不正です。1〜3を選択してください。")
+            return
+        alternatives = req.get("alternatives") or []
+        if alt_index < 0 or alt_index >= len(alternatives):
+            if reply_token:
+                await reply_to_line(reply_token, "選択された代案が見つかりません。")
+            return
+
+        alt = alternatives[alt_index]
+        patient = await _find_or_create_line_patient(db, user_id, req.get("customer_name"))
+
+        # 代案の日時で予約作成
+        alt_date = date.fromisoformat(alt["date"])
+        alt_start_str = alt.get("start") or alt.get("start_time", "")
+        alt_end_str = alt.get("end") or alt.get("end_time", "")
+        hh_s, mm_s = map(int, alt_start_str.split(":"))
+        hh_e, mm_e = map(int, alt_end_str.split(":"))
+        alt_start_dt = datetime.combine(alt_date, time(hh_s, mm_s), tzinfo=JST)
+        alt_end_dt = datetime.combine(alt_date, time(hh_e, mm_e), tzinfo=JST)
+
+        alt_duration_minutes = int((alt_end_dt - alt_start_dt).total_seconds() // 60)
+        alt_date_label = _format_date_with_weekday_jp(alt_start_dt.date())
+        alt_time_label = alt_start_dt.strftime("%H:%M")
+
+        try:
+            reservation = await create_reservation(
+                db,
+                ReservationCreate(
+                    patient_id=patient.id,
+                    practitioner_id=int(alt["practitioner_id"]),
+                    menu_id=req.get("menu_id"),
+                    start_time=alt_start_dt,
+                    end_time=alt_end_dt,
+                    channel="LINE",
+                    notes=f"LINE シャドーモード代案{alt_index + 1} (RID:{rid})",
+                ),
+            )
+        except HTTPException as e:
+            detail = e.detail if isinstance(e.detail, str) else str(e.detail)
+            admin_fail_text = (
+                f"予約枠を登録できませんでしたので、手動で対応お願いします。"
+                f"{alt_date_label} {alt_time_label}〜{alt_duration_minutes}分です。"
+                f" 理由: {detail}"
+            )
+            await push_message(settings.line_admin_user_id, admin_fail_text)
+            if reply_token:
+                await reply_to_line(reply_token, admin_fail_text)
+            await update_request(db, rid, line_user_id=user_id, status="manual_reply")
+            await set_user_mode(db, user_id, "manual", rid)
+            return
+        except Exception as e:
+            admin_fail_text = (
+                f"予約枠を登録できませんでしたので、手動で対応お願いします。"
+                f"{alt_date_label} {alt_time_label}〜{alt_duration_minutes}分です。"
+                f" 理由: {str(e)}"
+            )
+            await push_message(settings.line_admin_user_id, admin_fail_text)
+            if reply_token:
+                await reply_to_line(reply_token, admin_fail_text)
+            await update_request(db, rid, line_user_id=user_id, status="manual_reply")
+            await set_user_mode(db, user_id, "manual", rid)
+            return
+
+        # 予約ボード登録後に患者へ通知（ボード先行）
+        reservation_status = reservation.get("status")
+        await update_request(db, rid, line_user_id=user_id, status=("confirmed_alt" if reservation_status == "CONFIRMED" else "pending_alt"), reservation_id=reservation.get("id"))
+        await set_user_mode(db, user_id, "idle", rid)
+
+        if reservation_status == "CONFIRMED":
+            await push_message(
+                user_id,
+                f"ご予約を確定しました。\n{alt_start_dt.strftime('%Y/%m/%d %H:%M')}〜{alt_end_dt.strftime('%H:%M')}\nご来院をお待ちしております。",
+            )
+            admin_ok_text = (
+                f"予約システムに登録し予約完了しました。"
+                f"{alt_date_label} {alt_time_label}〜{alt_duration_minutes}分です。"
+            )
+        else:
+            await push_message(
+                user_id,
+                f"ご予約リクエストを受け付けました。\n{alt_start_dt.strftime('%Y/%m/%d %H:%M')}〜{alt_end_dt.strftime('%H:%M')}\n最終確認後にご案内します。",
+            )
+            admin_ok_text = (
+                f"予約システムには登録しましたが、ステータスは{reservation_status}です。"
+                f" {alt_date_label} {alt_time_label}〜{alt_duration_minutes}分。最終確認をお願いします。"
+            )
+
+        await push_message(settings.line_admin_user_id, admin_ok_text)
+        if reply_token:
+            await reply_to_line(reply_token, admin_ok_text)
+
+    elif action == "shadow_manual":
+        await update_request(db, rid, line_user_id=user_id, status="manual_reply")
+        await set_user_mode(db, user_id, "manual", rid)
+        if reply_token:
+            await reply_to_line(reply_token, "手動対応に切り替えました。患者へ直接ご連絡ください。")
 
 
 @router.post("/webhook")

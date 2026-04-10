@@ -235,26 +235,9 @@ async def tool_create_reservation(
     if not chosen_practitioner:
         return {"success": False, "error": "指定の日時に空いている施術者がいません"}
 
-    # 患者を検索 or 作成
-    patient_result = await db.execute(
-        select(Patient).where(Patient.phone == phone)
-    )
-    patient = patient_result.scalar_one_or_none()
-    if not patient:
-        # 姓名分割: スペースで分割、なければ全体を姓として扱う
-        parts = patient_name.strip().split(None, 1)
-        last_name = parts[0] if parts else patient_name
-        first_name = parts[1] if len(parts) > 1 else ""
-        # 自動採番
-        from app.api.patients import _generate_patient_number
-        patient_number = await _generate_patient_number(db)
-        patient = Patient(
-            name=patient_name, last_name=last_name, first_name=first_name,
-            phone=phone, patient_number=patient_number,
-            registration_mode="split",
-        )
-        db.add(patient)
-        await db.flush()
+    # 患者を検索 or 作成（電話番号正規化 + 名前クロスマッチ）
+    from app.services.patient_match import find_or_create_patient
+    patient = await find_or_create_patient(db, name=patient_name, phone=phone)
 
     # 予約作成（自動CONFIRMED）
     reservation = Reservation(

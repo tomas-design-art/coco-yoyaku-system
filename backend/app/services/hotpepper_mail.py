@@ -5,22 +5,26 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.menu import Menu
 from app.models.patient import Patient
 from app.models.practitioner import Practitioner
+from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
 from app.models.reservation import Reservation
 from app.models.setting import Setting
 from app.services.notification_service import create_notification
-from app.agents.mail_parser import parse_hotpepper_mail
+from app.agents.mail_parser import ai_review_hotpepper_required, parse_hotpepper_mail
+from app.services.conflict_detector import check_conflict
 from app.services.imap_adapter import IMAPAdapter, IMAPFetchedMail
+from app.services.schedule_service import is_practitioner_working
 from app.database import async_session
+from app.utils.datetime_jst import JST
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +276,30 @@ async def process_hotpepper_email(db: AsyncSession, email_body: str) -> dict:
             f"パース成功: event={parsed['event_type']}, "
             f"予約番号={parsed['reservation_number']}, 患者名={parsed['patient_name']}"
         )
+
+        # 必須項目監査（ルールベース）
+        missing = _validate_required_for_reflection(parsed)
+
+        # AI監査 + 必要時補完
+        try:
+            ai_result = await ai_review_hotpepper_required(email_body, parsed)
+            parsed = _apply_ai_patch(parsed, ai_result)
+            missing = _validate_required_for_reflection(parsed)
+        except Exception as ai_err:
+            logger.warning("HotPepper AI監査はスキップ/失敗: %s", ai_err)
+
+        if missing:
+            msg = "ホットペッパー予約者のシステム反映がされていません。予約情報が取得できませんでした"
+            jp_missing = _missing_fields_to_japanese(missing)
+            await create_notification(db, "hotpepper_parse_failed", f"{msg}（不足: {', '.join(jp_missing)}）")
+            try:
+                from app.services.line_alerts import push_admin_hotpepper_failure
+
+                await push_admin_hotpepper_failure(f"{msg}（不足: {', '.join(jp_missing)}）", email_body)
+            except Exception as notify_err:
+                logger.error("HotPepper parse failure LINE通知に失敗: %s", notify_err)
+            await db.commit()
+            return {"status": "error", "reason": "required_fields_missing", "missing": missing}
     except ValueError as e:
         logger.error(f"パース失敗: {e}")
         try:
@@ -293,6 +321,71 @@ async def process_hotpepper_email(db: AsyncSession, email_body: str) -> dict:
         return await _handle_created(db, parsed)
 
 
+def _validate_required_for_reflection(parsed: dict) -> list[str]:
+    missing: list[str] = []
+    if not parsed.get("patient_name"):
+        missing.append("name")
+    if not parsed.get("start_time"):
+        missing.append("reservation_datetime")
+    duration = parsed.get("duration_minutes")
+    if not isinstance(duration, int) or duration <= 0:
+        missing.append("duration_minutes")
+    if parsed.get("duration_extracted") is False:
+        missing.append("duration_minutes")
+    if parsed.get("practitioner_preference_known") is not True:
+        missing.append("practitioner_preference")
+    return sorted(set(missing))
+
+
+def _missing_fields_to_japanese(missing: list[str]) -> list[str]:
+    labels = {
+        "name": "名前",
+        "reservation_datetime": "予約日時",
+        "duration_minutes": "施術時間",
+        "practitioner_preference": "担当者希望",
+    }
+    return [labels.get(k, k) for k in missing]
+
+
+def _apply_ai_patch(parsed: dict, ai_result: dict) -> dict:
+    fields = ai_result.get("fields") if isinstance(ai_result, dict) else None
+    if not isinstance(fields, dict):
+        return parsed
+
+    out = dict(parsed)
+    if not out.get("patient_name") and fields.get("patient_name"):
+        out["patient_name"] = str(fields.get("patient_name")).strip()
+
+    if (not out.get("start_time")) and fields.get("reservation_date") and fields.get("reservation_time"):
+        try:
+            out["start_time"] = datetime.strptime(
+                f"{fields['reservation_date']} {fields['reservation_time']}",
+                "%Y-%m-%d %H:%M",
+            ).replace(tzinfo=JST)
+        except Exception:
+            pass
+
+    duration = fields.get("duration_minutes")
+    if isinstance(duration, (int, float)) and int(duration) > 0:
+        out["duration_minutes"] = int(duration)
+        out["duration_extracted"] = True
+
+    if "practitioner_preference_known" in fields and fields.get("practitioner_preference_known") is not None:
+        out["practitioner_preference_known"] = bool(fields.get("practitioner_preference_known"))
+
+    if not out.get("practitioner_name") and fields.get("practitioner_name"):
+        out["practitioner_name"] = str(fields.get("practitioner_name")).strip()
+
+    # start_time が補完された場合のみ end_time を再計算
+    if out.get("start_time") and isinstance(out.get("duration_minutes"), int):
+        try:
+            out["end_time"] = out["start_time"] + timedelta(minutes=int(out["duration_minutes"]))
+        except Exception:
+            pass
+
+    return out
+
+
 async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
     """新規予約の登録"""
     # ── 重複チェック ──
@@ -305,7 +398,12 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
 
     patient = await _find_or_create_patient(db, parsed["patient_name"])
     menu_id, menu_note = await _match_menu(db, parsed.get("menu_name"))
-    practitioner_id, prac_note = await _assign_practitioner(db, parsed.get("practitioner_name"))
+    practitioner_id, prac_note = await _assign_practitioner(
+        db,
+        parsed.get("practitioner_name"),
+        parsed["start_time"],
+        parsed["end_time"],
+    )
 
     notes = _build_notes(parsed, menu_note, prac_note)
 
@@ -405,7 +503,12 @@ async def _handle_changed(db: AsyncSession, parsed: dict) -> dict:
     if menu_id:
         reservation.menu_id = menu_id
 
-    practitioner_id, prac_note = await _assign_practitioner(db, parsed.get("practitioner_name"))
+    practitioner_id, prac_note = await _assign_practitioner(
+        db,
+        parsed.get("practitioner_name"),
+        parsed["start_time"],
+        parsed["end_time"],
+    )
     reservation.practitioner_id = practitioner_id
 
     notes = _build_notes(parsed, menu_note, prac_note, prefix="HotPepper変更予約")
@@ -453,19 +556,9 @@ def _build_notes(parsed: dict, menu_note: str | None, prac_note: str | None,
 
 
 async def _find_or_create_patient(db: AsyncSession, name: str) -> Patient:
-    """患者を名前で検索。見つからなければ新規作成。"""
-    result = await db.execute(
-        select(Patient).where(Patient.name == name)
-    )
-    patient = result.scalar_one_or_none()
-    if patient:
-        return patient
-
-    logger.info(f"患者新規作成: {name}")
-    patient = Patient(name=name)
-    db.add(patient)
-    await db.flush()
-    return patient
+    """患者を名前で検索（チャネル横断マッチング）。見つからなければ新規作成。"""
+    from app.services.patient_match import find_or_create_patient
+    return await find_or_create_patient(db, name=name)
 
 
 async def _match_menu(db: AsyncSession, menu_name: Optional[str]) -> tuple[Optional[int], Optional[str]]:
@@ -495,8 +588,57 @@ async def _match_menu(db: AsyncSession, menu_name: Optional[str]) -> tuple[Optio
     return None, f"HPメニュー名: {menu_name}"
 
 
-async def _assign_practitioner(db: AsyncSession, name: Optional[str]) -> tuple[int, Optional[str]]:
-    """施術者を名前で検索。指名なし or 見つからない場合はデフォルト施術者を割り当て。
+async def _is_practitioner_available(
+    db: AsyncSession,
+    practitioner_id: int,
+    start_time: datetime,
+    end_time: datetime,
+) -> bool:
+    target_date = start_time.date()
+    working, _, _ = await is_practitioner_working(db, practitioner_id, target_date)
+    if not working:
+        return False
+
+    # 時間帯休み
+    uts = (
+        await db.execute(
+            select(PractitionerUnavailableTime).where(
+                and_(
+                    PractitionerUnavailableTime.practitioner_id == practitioner_id,
+                    PractitionerUnavailableTime.date == target_date,
+                )
+            )
+        )
+    ).scalars().all()
+    s_min = start_time.hour * 60 + start_time.minute
+    e_min = end_time.hour * 60 + end_time.minute
+    for ut in uts:
+        sh, sm = map(int, ut.start_time.split(":"))
+        eh, em = map(int, ut.end_time.split(":"))
+        ut_s = sh * 60 + sm
+        ut_e = eh * 60 + em
+        if s_min < ut_e and e_min > ut_s:
+            return False
+
+    conflicts = await check_conflict(db, practitioner_id, start_time, end_time)
+    return len(conflicts) == 0
+
+
+def _priority_of_role(role: str | None) -> int:
+    if role == "施術者":
+        return 0
+    if role == "院長":
+        return 1
+    return 9
+
+
+async def _assign_practitioner(
+    db: AsyncSession,
+    name: Optional[str],
+    start_time: datetime,
+    end_time: datetime,
+) -> tuple[int, Optional[str]]:
+    """施術者を割当。希望なし時は 施術者→院長 の優先で空きに割当。
     Returns: (practitioner_id, 注記 or None)
     """
     note = None
@@ -507,16 +649,29 @@ async def _assign_practitioner(db: AsyncSession, name: Optional[str]) -> tuple[i
         )
         prac = result.scalar_one_or_none()
         if prac:
-            return prac.id, None
-        note = f"指名「{name}」が見つからずデフォルト割当"
+            if await _is_practitioner_available(db, prac.id, start_time, end_time):
+                return prac.id, None
+            note = f"指名「{name}」は空きがないため優先順位割当に変更"
+        else:
+            note = f"指名「{name}」が見つからずデフォルト割当"
         logger.warning(note)
 
-    # デフォルト: display_order 最小のアクティブ施術者
+    # 希望なし時の優先順位: 施術者 → 院長（その中で display_order昇順）
     result = await db.execute(
-        select(Practitioner).where(Practitioner.is_active == True).order_by(Practitioner.display_order).limit(1)
+        select(Practitioner).where(Practitioner.is_active == True).order_by(Practitioner.display_order, Practitioner.id)
     )
-    prac = result.scalar_one_or_none()
-    if prac:
-        return prac.id, note
+    practitioners = result.scalars().all()
+
+    preferred_order = sorted(practitioners, key=lambda p: (_priority_of_role(p.role), p.display_order, p.id))
+    for p in preferred_order:
+        if await _is_practitioner_available(db, p.id, start_time, end_time):
+            if not name and p.role == "院長":
+                note = (note + " / " if note else "") + "施術者枠が埋まっているため院長に割当"
+            return p.id, note
+
+    # 全員埋まり時は優先順位の先頭へ（空き判定失敗時の最終フォールバック）
+    if preferred_order:
+        note = (note + " / " if note else "") + "全員の空き判定が取れず優先順位先頭へ割当"
+        return preferred_order[0].id, note
 
     raise ValueError("アクティブな施術者が登録されていません")

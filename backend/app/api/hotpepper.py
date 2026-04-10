@@ -1,19 +1,28 @@
 """HotPepper関連API"""
 import logging
+import json
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from app.config import settings as app_settings
 from app.database import get_db
 from app.models.reservation import Reservation
+from app.models.setting import Setting
 from app.services.reservation_service import build_reservation_response
+from app.services.hold_expiration import scheduler
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/hotpepper", tags=["hotpepper"])
+
+
+async def _get_setting(db: AsyncSession, key: str, default: str = "") -> str:
+    row = (await db.execute(select(Setting).where(Setting.key == key))).scalar_one_or_none()
+    return row.value if row else default
 
 
 class ParseEmailRequest(BaseModel):
@@ -102,3 +111,44 @@ async def trigger_poll(db: AsyncSession = Depends(get_db)):
     except Exception as e:
         logger.exception("HotPepper poll trigger failed: %s", e)
         raise HTTPException(status_code=500, detail=f"ポーリングに失敗しました: {str(e)}")
+
+
+@router.get("/runtime-status")
+async def runtime_status(db: AsyncSession = Depends(get_db)):
+    """HotPepperメール連携の稼働状態を返す（運用確認用）。"""
+    provider = (app_settings.mail_provider or "").lower()
+    provider_ok = provider in {"imap", "icloud", "icloud_imap", "icloud-imap"}
+    credentials_ok = bool(app_settings.icloud_email and app_settings.icloud_app_password)
+    sender_filters = [x.strip() for x in (app_settings.hotpepper_sender_filters or "").split(",") if x.strip()]
+
+    poll_job = scheduler.get_job("hotpepper_mail_poll")
+    scheduler_running = bool(scheduler.running)
+    poll_job_registered = poll_job is not None
+    next_run_at = str(poll_job.next_run_time) if poll_job and poll_job.next_run_time else None
+
+    processed_hashes = await _get_setting(db, "hotpepper_processed_mid_hashes", "")
+    failed_counts_raw = await _get_setting(db, "hotpepper_failed_mid_counts", "")
+
+    processed_count = len([x for x in processed_hashes.split(",") if x]) if processed_hashes else 0
+    failed_count = 0
+    try:
+        failed_count = len(json.loads(failed_counts_raw)) if failed_counts_raw else 0
+    except Exception:
+        failed_count = -1
+
+    return {
+        "mail_provider": app_settings.mail_provider,
+        "provider_ok": provider_ok,
+        "credentials_ok": credentials_ok,
+        "imap_host": app_settings.imap_host,
+        "imap_port": app_settings.imap_port,
+        "imap_mailbox": app_settings.imap_mailbox,
+        "sender_filters": sender_filters,
+        "poll_interval_minutes": app_settings.hotpepper_poll_interval_minutes,
+        "scheduler_running": scheduler_running,
+        "poll_job_registered": poll_job_registered,
+        "poll_job_next_run_at": next_run_at,
+        "processed_mid_hash_count": processed_count,
+        "failed_mid_tracked_count": failed_count,
+        "ready": provider_ok and credentials_ok and scheduler_running and poll_job_registered,
+    }
