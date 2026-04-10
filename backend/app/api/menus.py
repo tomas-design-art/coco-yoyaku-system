@@ -40,7 +40,7 @@ async def create_menu(data: MenuCreate, db: AsyncSession = Depends(get_db), _aut
 @router.put("/{menu_id}", response_model=MenuResponse)
 async def update_menu(menu_id: int, data: MenuUpdate, db: AsyncSession = Depends(get_db), _auth: dict = Depends(require_admin)):
     result = await db.execute(select(Menu).where(Menu.id == menu_id))
-    menu = result.scalar_one_or_none()
+    menu = result.unique().scalar_one_or_none()
     if not menu:
         raise HTTPException(status_code=404, detail="メニューが見つかりません")
     update_data = data.model_dump(exclude_unset=True)
@@ -66,7 +66,7 @@ async def update_menu(menu_id: int, data: MenuUpdate, db: AsyncSession = Depends
 async def delete_menu(menu_id: int, db: AsyncSession = Depends(get_db), _auth: dict = Depends(require_admin)):
     """論理削除（is_active=False）"""
     result = await db.execute(select(Menu).where(Menu.id == menu_id))
-    menu = result.scalar_one_or_none()
+    menu = result.unique().scalar_one_or_none()
     if not menu:
         raise HTTPException(status_code=404, detail="メニューが見つかりません")
     menu.is_active = False
@@ -79,7 +79,7 @@ async def delete_menu(menu_id: int, db: AsyncSession = Depends(get_db), _auth: d
 async def purge_menu(menu_id: int, db: AsyncSession = Depends(get_db), _auth: dict = Depends(require_admin)):
     """完全削除（2段階目）: 先に論理削除済みのメニューのみ削除可能。"""
     result = await db.execute(select(Menu).where(Menu.id == menu_id))
-    menu = result.scalar_one_or_none()
+    menu = result.unique().scalar_one_or_none()
     if not menu:
         raise HTTPException(status_code=404, detail="メニューが見つかりません")
     if menu.is_active:
