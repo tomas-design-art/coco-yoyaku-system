@@ -12,6 +12,7 @@ const HEADER_HEIGHT = 32;
 const WEEK_HEADER_HEIGHT = 52; // date line + practitioner names line
 const BLOCKED_HATCH_BG = 'repeating-linear-gradient(45deg, rgba(156,163,175,0.18) 0px, rgba(156,163,175,0.18) 2px, transparent 2px, transparent 9px)';
 const BLOCKED_BASE_BG = 'rgba(209,213,219,0.5)';
+const BUSINESS_BLOCK_BG = '#e5e7eb';
 
 interface TimeTableProps {
   onSlotClick: (practitionerId: number, startMinutes: number, date: Date) => void;
@@ -278,7 +279,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
       return (
         <div
           className="absolute inset-0 flex items-center justify-center pointer-events-none"
-          style={{ top: headerH, bottom: 0, backgroundColor: 'rgba(209,213,219,0.5)', zIndex: 3 }}
+          style={{ top: headerH, bottom: 0, backgroundColor: BUSINESS_BLOCK_BG, zIndex: 12 }}
         >
           <span className="font-bold text-sm bg-white/85 px-2 py-1 rounded text-gray-600">{displayLabel}</span>
         </div>
@@ -297,7 +298,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     // 祝日/オーバーライドでの時短営業ラベル
     if (label && isOpen) {
       overlays.push(
-        <div key="label" className="absolute left-0 right-0 text-center pointer-events-none" style={{ top: headerH - 2, zIndex: 5 }}>
+        <div key="label" className="absolute left-0 right-0 text-center pointer-events-none" style={{ top: headerH - 2, zIndex: 13 }}>
           <span className="text-xs text-orange-600 bg-orange-50/90 px-1 rounded">{label}</span>
         </div>
       );
@@ -311,7 +312,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
         <div
           key="before"
           className="absolute left-0 right-0 flex items-center justify-center pointer-events-none"
-          style={{ top: topPx, height: heightPx, backgroundColor: 'rgba(209,213,219,0.45)', zIndex: 3 }}
+          style={{ top: topPx, height: heightPx, backgroundColor: BUSINESS_BLOCK_BG, zIndex: 12 }}
         >
           <span className="text-gray-400 text-xs bg-white/70 px-1 rounded">営業時間外</span>
         </div>
@@ -326,7 +327,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
         <div
           key="after"
           className="absolute left-0 right-0 flex items-center justify-center pointer-events-none"
-          style={{ top: topPx, height: heightPx, backgroundColor: 'rgba(209,213,219,0.45)', zIndex: 3 }}
+          style={{ top: topPx, height: heightPx, backgroundColor: BUSINESS_BLOCK_BG, zIndex: 12 }}
         >
           <span className="text-gray-400 text-xs bg-white/70 px-1 rounded">営業時間外</span>
         </div>
