@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete as sa_delete
 
 from app.database import get_db
-from app.models.menu import Menu
+from app.models.menu import Menu, MenuPriceTier
 from app.models.patient import Patient
 from app.models.reservation import Reservation
 from app.schemas.menu import MenuCreate, MenuUpdate, MenuResponse
@@ -17,12 +17,20 @@ async def list_menus(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Menu).order_by(Menu.display_order, Menu.id)
     )
-    return result.scalars().all()
+    return result.scalars().unique().all()
 
 
 @router.post("/", response_model=MenuResponse, status_code=201)
 async def create_menu(data: MenuCreate, db: AsyncSession = Depends(get_db), _auth: dict = Depends(require_admin)):
-    menu = Menu(**data.model_dump())
+    tier_data = data.price_tiers
+    menu_dict = data.model_dump(exclude={"price_tiers"})
+    menu = Menu(**menu_dict)
+    for i, t in enumerate(tier_data):
+        menu.price_tiers.append(MenuPriceTier(
+            duration_minutes=t.duration_minutes,
+            price=t.price,
+            display_order=t.display_order if t.display_order else i,
+        ))
     db.add(menu)
     await db.commit()
     await db.refresh(menu)
@@ -36,8 +44,19 @@ async def update_menu(menu_id: int, data: MenuUpdate, db: AsyncSession = Depends
     if not menu:
         raise HTTPException(status_code=404, detail="メニューが見つかりません")
     update_data = data.model_dump(exclude_unset=True)
+    tiers_input = update_data.pop("price_tiers", None)
     for key, value in update_data.items():
         setattr(menu, key, value)
+    if tiers_input is not None:
+        # Replace all tiers
+        await db.execute(sa_delete(MenuPriceTier).where(MenuPriceTier.menu_id == menu_id))
+        for i, t in enumerate(tiers_input):
+            db.add(MenuPriceTier(
+                menu_id=menu_id,
+                duration_minutes=t["duration_minutes"],
+                price=t.get("price"),
+                display_order=t.get("display_order", i),
+            ))
     await db.commit()
     await db.refresh(menu)
     return menu

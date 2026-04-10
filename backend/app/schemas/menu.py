@@ -10,6 +10,20 @@ class ColorBrief(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class PriceTierIn(BaseModel):
+    duration_minutes: int
+    price: Optional[int] = None
+    display_order: int = 0
+
+
+class PriceTierOut(BaseModel):
+    id: int
+    duration_minutes: int
+    price: Optional[int] = None
+    display_order: int
+    model_config = {"from_attributes": True}
+
+
 class MenuCreate(BaseModel):
     name: str
     duration_minutes: int
@@ -19,6 +33,7 @@ class MenuCreate(BaseModel):
     color_id: Optional[int] = None
     is_active: bool = True
     display_order: int = 0
+    price_tiers: list[PriceTierIn] = []
 
 
 class MenuUpdate(BaseModel):
@@ -30,6 +45,7 @@ class MenuUpdate(BaseModel):
     color_id: Optional[int] = None
     is_active: Optional[bool] = None
     display_order: Optional[int] = None
+    price_tiers: Optional[list[PriceTierIn]] = None
 
 
 class MenuResponse(BaseModel):
@@ -43,6 +59,7 @@ class MenuResponse(BaseModel):
     color: Optional[ColorBrief] = None
     is_active: bool
     display_order: int
+    price_tiers: list[PriceTierOut] = []
     created_at: datetime
     updated_at: datetime
 

@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app.database import Base
 from app.models.practitioner import Practitioner
 from app.models.patient import Patient
-from app.models.menu import Menu
+from app.models.menu import Menu, MenuPriceTier
 from app.models.reservation import Reservation
 from app.models.setting import Setting
 from app.models.notification_log import NotificationLog

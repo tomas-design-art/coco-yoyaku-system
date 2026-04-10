@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { X, CheckCircle, XCircle, ArrowRightLeft, Clock, Pencil } from 'lucide-react';
 import type { Reservation, Practitioner, Patient, Menu } from '../types';
 import { STATUS_COLORS, CHANNEL_ICONS, CHANNEL_LABELS } from '../types';
@@ -54,6 +54,7 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
   const [editPatientId, setEditPatientId] = useState<number | null>(r.patient?.id ?? null);
   const [editPractitionerId, setEditPractitionerId] = useState(r.practitioner_id);
   const [editMenuId, setEditMenuId] = useState<number | null>(r.menu?.id ?? null);
+  const [editSelectedDuration, setEditSelectedDuration] = useState<number | null>(null);
   const [editDate, setEditDate] = useState(startDt.toISOString().split('T')[0]);
   const [editStartTime, setEditStartTime] = useState(
     `${String(startDt.getHours()).padStart(2, '0')}:${String(startDt.getMinutes()).padStart(2, '0')}`
@@ -83,7 +84,28 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
 
   // Compute edit end time from menu duration
   const selectedMenu = menus.find(m => m.id === editMenuId);
-  const editDuration = selectedMenu ? selectedMenu.duration_minutes : durationMin;
+
+  const editDurationOptions = useMemo(() => {
+    if (!selectedMenu) return [];
+    const opts: { duration: number; price: number | null }[] = [];
+    opts.push({ duration: selectedMenu.duration_minutes, price: selectedMenu.price });
+    if (selectedMenu.price_tiers?.length) {
+      for (const t of selectedMenu.price_tiers) {
+        opts.push({ duration: t.duration_minutes, price: t.price });
+      }
+    }
+    if (selectedMenu.is_duration_variable && selectedMenu.max_duration_minutes) {
+      for (let d = selectedMenu.duration_minutes + 10; d <= selectedMenu.max_duration_minutes; d += 10) {
+        if (!opts.some(o => o.duration === d)) {
+          opts.push({ duration: d, price: null });
+        }
+      }
+    }
+    opts.sort((a, b) => a.duration - b.duration);
+    return opts;
+  }, [selectedMenu]);
+
+  const editDuration = editSelectedDuration ?? (selectedMenu ? selectedMenu.duration_minutes : durationMin);
   const computeEndTime = () => {
     const [h, m] = editStartTime.split(':').map(Number);
     const endMin = h * 60 + m + editDuration;
@@ -224,7 +246,10 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
                 <label className="text-xs text-gray-500">メニュー</label>
                 <select
                   value={editMenuId ?? ''}
-                  onChange={(e) => setEditMenuId(e.target.value ? Number(e.target.value) : null)}
+                  onChange={(e) => {
+                    setEditMenuId(e.target.value ? Number(e.target.value) : null);
+                    setEditSelectedDuration(null);
+                  }}
                   className="w-full border rounded px-2 py-1 text-sm"
                 >
                   <option value="">なし</option>
@@ -232,6 +257,29 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
                     <option key={m.id} value={m.id}>{m.name} ({m.duration_minutes}分)</option>
                   ))}
                 </select>
+                {editMenuId && editDurationOptions.length > 1 && (
+                  <div className="mt-1.5">
+                    <label className="block text-xs text-gray-400 mb-1">施術時間を選択</label>
+                    <div className="flex flex-wrap gap-1">
+                      {editDurationOptions.map((opt) => {
+                        const isActive = (editSelectedDuration ?? selectedMenu?.duration_minutes) === opt.duration;
+                        return (
+                          <button
+                            key={opt.duration}
+                            type="button"
+                            onClick={() => setEditSelectedDuration(opt.duration)}
+                            className={`px-2 py-1 rounded text-xs border transition-colors ${isActive
+                                ? 'bg-blue-500 text-white border-blue-500'
+                                : 'bg-white text-gray-700 border-gray-300 hover:border-blue-400'
+                              }`}
+                          >
+                            {opt.duration}分{opt.price != null && opt.price > 0 ? ` ¥${opt.price.toLocaleString()}` : ''}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Color */}

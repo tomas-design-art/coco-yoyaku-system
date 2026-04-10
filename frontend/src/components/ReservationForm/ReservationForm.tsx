@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { X } from 'lucide-react';
 import type { Menu, Practitioner, ReservationCreate, Channel, ReservationColor, Patient, BulkReservationResult } from '../../types';
 import { getMenus, getPractitioners, createReservation, bulkCreateReservations, getReservationColors, getSettings } from '../../api/client';
@@ -34,6 +34,7 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
   const [patientName, setPatientName] = useState('');
   const [practitionerId, setPractitionerId] = useState<number>(0);
   const [menuId, setMenuId] = useState<number | null>(null);
+  const [selectedDuration, setSelectedDuration] = useState<number | null>(null);
   const [colorId, setColorId] = useState<number | null>(null);
   const [date, setDate] = useState('');
   const [startTime, setStartTime] = useState('09:00');
@@ -85,21 +86,45 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
     }
   }, [initialData]);
 
-  // Auto-calculate end time when menu changes + auto-set color from menu tag
-  useEffect(() => {
-    if (menuId) {
-      const menu = menus.find((m) => m.id === menuId);
-      if (menu) {
-        const [h, m] = startTime.split(':').map(Number);
-        const totalMin = h * 60 + m + menu.duration_minutes;
-        setEndTime(minutesToTime(totalMin));
-        // Auto-set color from menu's tag
-        if (menu.color_id) {
-          setColorId(menu.color_id);
+  // Build available duration options for the selected menu
+  const selectedMenu = useMemo(() => menuId ? menus.find(m => m.id === menuId) ?? null : null, [menuId, menus]);
+
+  const durationOptions = useMemo(() => {
+    if (!selectedMenu) return [];
+    const opts: { duration: number; price: number | null }[] = [];
+    // Base duration (1段目)
+    opts.push({ duration: selectedMenu.duration_minutes, price: selectedMenu.price });
+    // Price tiers (追加段)
+    if (selectedMenu.price_tiers?.length) {
+      for (const t of selectedMenu.price_tiers) {
+        opts.push({ duration: t.duration_minutes, price: t.price });
+      }
+    }
+    // Variable duration: generate 10-min steps between base and max
+    if (selectedMenu.is_duration_variable && selectedMenu.max_duration_minutes) {
+      for (let d = selectedMenu.duration_minutes + 10; d <= selectedMenu.max_duration_minutes; d += 10) {
+        if (!opts.some(o => o.duration === d)) {
+          opts.push({ duration: d, price: null });
         }
       }
     }
-  }, [menuId, startTime, menus]);
+    // Sort and deduplicate
+    opts.sort((a, b) => a.duration - b.duration);
+    return opts;
+  }, [selectedMenu]);
+
+  // Auto-calculate end time when menu/duration changes + auto-set color from menu tag
+  useEffect(() => {
+    if (menuId && selectedMenu) {
+      const dur = selectedDuration ?? selectedMenu.duration_minutes;
+      const [h, m] = startTime.split(':').map(Number);
+      const totalMin = h * 60 + m + dur;
+      setEndTime(minutesToTime(totalMin));
+      if (selectedMenu.color_id) {
+        setColorId(selectedMenu.color_id);
+      }
+    }
+  }, [menuId, selectedDuration, startTime, selectedMenu]);
 
   // 患者選択時にデフォルトメニュー・時間を自動適用
   const handlePatientSelect = (patient: Patient) => {
@@ -165,6 +190,7 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
         setPatientId(null);
         setPatientName('');
         setMenuId(null);
+        setSelectedDuration(null);
         setNotes('');
         setRepeatEnabled(false);
         setBulkResult(null);
@@ -221,16 +247,47 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
             <label className="block text-sm font-medium text-gray-700 mb-1">メニュー</label>
             <select
               value={menuId || ''}
-              onChange={(e) => setMenuId(e.target.value ? Number(e.target.value) : null)}
+              onChange={(e) => {
+                const id = e.target.value ? Number(e.target.value) : null;
+                setMenuId(id);
+                setSelectedDuration(null);
+              }}
               className="w-full border rounded px-3 py-2 text-sm"
             >
               <option value="">未選択</option>
-              {menus.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.name} ({m.duration_minutes}分){m.price ? ` ¥${m.price.toLocaleString()}` : ''}
-                </option>
-              ))}
+              {menus.map((m) => {
+                const dur = selectedDuration && m.id === menuId ? selectedDuration : m.duration_minutes;
+                return (
+                  <option key={m.id} value={m.id}>
+                    {m.name} ({dur}分){m.price ? ` ¥${m.price.toLocaleString()}` : ''}
+                  </option>
+                );
+              })}
             </select>
+            {/* Duration picker - shown when menu has multiple duration options */}
+            {menuId && durationOptions.length > 1 && (
+              <div className="mt-2">
+                <label className="block text-xs text-gray-500 mb-1">施術時間を選択</label>
+                <div className="flex flex-wrap gap-1.5">
+                  {durationOptions.map((opt) => {
+                    const isActive = (selectedDuration ?? selectedMenu?.duration_minutes) === opt.duration;
+                    return (
+                      <button
+                        key={opt.duration}
+                        type="button"
+                        onClick={() => setSelectedDuration(opt.duration)}
+                        className={`px-3 py-1.5 rounded text-sm border transition-colors ${isActive
+                            ? 'bg-blue-500 text-white border-blue-500'
+                            : 'bg-white text-gray-700 border-gray-300 hover:border-blue-400'
+                          }`}
+                      >
+                        {opt.duration}分{opt.price != null && opt.price > 0 ? ` ¥${opt.price.toLocaleString()}` : ''}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Date & Time */}

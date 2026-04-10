@@ -87,6 +87,13 @@ export interface PatientBrief {
   patient_number: string | null;
 }
 
+export interface MenuPriceTier {
+  id?: number;
+  duration_minutes: number;
+  price: number | null;
+  display_order: number;
+}
+
 export interface Menu {
   id: number;
   name: string;
@@ -98,6 +105,7 @@ export interface Menu {
   color: ColorBrief | null;
   is_active: boolean;
   display_order: number;
+  price_tiers: MenuPriceTier[];
   created_at: string;
   updated_at: string;
 }

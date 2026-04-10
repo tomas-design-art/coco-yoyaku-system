@@ -1,8 +1,13 @@
 import { useState, useEffect } from 'react';
-import { Plus, Edit2, Trash2 } from 'lucide-react';
-import type { Menu, ReservationColor } from '../../types';
+import { Plus, Edit2, Trash2, X } from 'lucide-react';
+import type { Menu, ReservationColor, MenuPriceTier } from '../../types';
 import { getMenus, createMenu, updateMenu, deleteMenu, purgeMenu, getReservationColors } from '../../api/client';
 import { extractErrorMessage } from '../../utils/errorUtils';
+
+interface TierDraft {
+  duration_minutes: number | '';
+  price: number | '';
+}
 
 export default function MenuManager() {
   const [menus, setMenus] = useState<Menu[]>([]);
@@ -17,6 +22,7 @@ export default function MenuManager() {
   const [selectedColorId, setSelectedColorId] = useState<number | null>(null);
   const [editingWasInactive, setEditingWasInactive] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [priceTiers, setPriceTiers] = useState<TierDraft[]>([]);
 
   const fetchData = async () => {
     try {
@@ -34,13 +40,21 @@ export default function MenuManager() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
-    const data = {
+    const tiersPayload = priceTiers
+      .filter(t => t.duration_minutes !== '')
+      .map((t, i) => ({
+        duration_minutes: Number(t.duration_minutes),
+        price: t.price !== '' ? Number(t.price) : null,
+        display_order: i,
+      }));
+    const data: Record<string, unknown> = {
       name,
       duration_minutes: durationMinutes,
       is_duration_variable: isDurationVariable,
       max_duration_minutes: isDurationVariable ? (maxDurationMinutes || durationMinutes) : undefined,
       price: price || undefined,
       color_id: selectedColorId,
+      price_tiers: tiersPayload,
     };
     try {
       if (editingId) {
@@ -64,6 +78,7 @@ export default function MenuManager() {
     setSelectedColorId(null);
     setEditingId(null);
     setEditingWasInactive(false);
+    setPriceTiers([]);
     setShowForm(false);
   };
 
@@ -76,6 +91,10 @@ export default function MenuManager() {
     setPrice(m.price || '');
     setSelectedColorId(m.color_id);
     setEditingWasInactive(!m.is_active);
+    setPriceTiers((m.price_tiers ?? []).map((t: MenuPriceTier) => ({
+      duration_minutes: t.duration_minutes,
+      price: t.price ?? '',
+    })));
     setShowForm(true);
   };
 
@@ -99,6 +118,30 @@ export default function MenuManager() {
     } catch (err) {
       setError(extractErrorMessage(err, 'メニューの完全削除に失敗しました'));
     }
+  };
+
+  const addTier = () => {
+    setPriceTiers(prev => [...prev, { duration_minutes: '', price: '' }]);
+  };
+
+  const updateTier = (index: number, field: keyof TierDraft, value: number | '') => {
+    setPriceTiers(prev => prev.map((t, i) => i === index ? { ...t, [field]: value } : t));
+  };
+
+  const removeTier = (index: number) => {
+    setPriceTiers(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const formatTierSummary = (m: Menu) => {
+    const tiers = m.price_tiers ?? [];
+    if (tiers.length === 0) return null;
+    const allDurations = [
+      { d: m.duration_minutes, p: m.price },
+      ...tiers.map(t => ({ d: t.duration_minutes, p: t.price })),
+    ];
+    return allDurations.map(({ d, p }) =>
+      `${d}分${p != null && p > 0 ? ` ¥${p.toLocaleString()}` : ''}`
+    ).join('、');
   };
 
   return (
@@ -132,6 +175,33 @@ export default function MenuManager() {
                 min={0} className="w-full border rounded px-3 py-2" />
             </div>
           </div>
+
+          {/* 追加施術時間 tiers */}
+          {priceTiers.map((tier, idx) => (
+            <div key={idx} className="grid grid-cols-[1fr_1fr_auto] gap-3 items-end pl-4 border-l-2 border-blue-200">
+              <div>
+                <label className="block text-sm font-medium mb-1">施術時間（分）</label>
+                <input type="number" value={tier.duration_minutes}
+                  onChange={(e) => updateTier(idx, 'duration_minutes', e.target.value ? Number(e.target.value) : '')}
+                  min={5} step={5} className="w-full border rounded px-3 py-2" required />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">料金（円）</label>
+                <input type="number" value={tier.price}
+                  onChange={(e) => updateTier(idx, 'price', e.target.value ? Number(e.target.value) : '')}
+                  min={0} className="w-full border rounded px-3 py-2" />
+              </div>
+              <button type="button" onClick={() => removeTier(idx)}
+                className="p-2 text-red-400 hover:text-red-600 hover:bg-red-50 rounded">
+                <X size={16} />
+              </button>
+            </div>
+          ))}
+          <button type="button" onClick={addTier}
+            className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800 pl-4">
+            <Plus size={14} /> 施術時間を追加
+          </button>
+
           <div className="space-y-2">
             <label className="inline-flex items-center gap-2 text-sm">
               <input
@@ -187,33 +257,40 @@ export default function MenuManager() {
           <p className="text-center text-gray-400 text-sm py-8">メニューが登録されていません</p>
         )}
         {menus.map((m) => (
-          <div key={m.id} className={`flex items-center justify-between p-3 bg-white rounded border ${!m.is_active ? 'opacity-50' : ''}`}>
-            <div className="flex items-center gap-2">
-              {m.color && (
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs" style={{ backgroundColor: m.color.color_code + '22', color: m.color.color_code }}>
-                  <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: m.color.color_code }} />
-                  {m.color.name}
-                </span>
-              )}
-              <span className="font-medium">{m.name}</span>
-              <span className="text-sm text-gray-500">{m.duration_minutes}分</span>
-              {m.is_duration_variable && (
-                <span className="text-xs text-cyan-700 bg-cyan-50 px-2 py-0.5 rounded">
-                  可変 {m.duration_minutes}-{m.max_duration_minutes || m.duration_minutes}分
-                </span>
-              )}
-              {m.price != null && m.price > 0 && <span className="text-sm text-gray-500">¥{m.price.toLocaleString()}</span>}
-              {!m.is_active && <span className="text-xs bg-gray-200 px-2 py-0.5 rounded">無効</span>}
+          <div key={m.id} className={`p-3 bg-white rounded border ${!m.is_active ? 'opacity-50' : ''}`}>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 flex-wrap">
+                {m.color && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs" style={{ backgroundColor: m.color.color_code + '22', color: m.color.color_code }}>
+                    <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: m.color.color_code }} />
+                    {m.color.name}
+                  </span>
+                )}
+                <span className="font-medium">{m.name}</span>
+                <span className="text-sm text-gray-500">{m.duration_minutes}分</span>
+                {m.is_duration_variable && (
+                  <span className="text-xs text-cyan-700 bg-cyan-50 px-2 py-0.5 rounded">
+                    可変 {m.duration_minutes}-{m.max_duration_minutes || m.duration_minutes}分
+                  </span>
+                )}
+                {m.price != null && m.price > 0 && <span className="text-sm text-gray-500">¥{m.price.toLocaleString()}</span>}
+                {!m.is_active && <span className="text-xs bg-gray-200 px-2 py-0.5 rounded">無効</span>}
+              </div>
+              <div className="flex gap-1 shrink-0">
+                <button onClick={() => handleEdit(m)} className="p-1.5 hover:bg-gray-100 rounded"><Edit2 size={14} /></button>
+                {m.is_active && (
+                  <button onClick={() => handleDelete(m.id)} className="p-1.5 hover:bg-red-50 text-red-500 rounded"><Trash2 size={14} /></button>
+                )}
+                {!m.is_active && (
+                  <button onClick={() => handlePermanentDelete(m.id)} className="p-1.5 hover:bg-red-50 text-red-600 rounded" title="完全削除"><Trash2 size={14} /></button>
+                )}
+              </div>
             </div>
-            <div className="flex gap-1">
-              <button onClick={() => handleEdit(m)} className="p-1.5 hover:bg-gray-100 rounded"><Edit2 size={14} /></button>
-              {m.is_active && (
-                <button onClick={() => handleDelete(m.id)} className="p-1.5 hover:bg-red-50 text-red-500 rounded"><Trash2 size={14} /></button>
-              )}
-              {!m.is_active && (
-                <button onClick={() => handlePermanentDelete(m.id)} className="p-1.5 hover:bg-red-50 text-red-600 rounded" title="完全削除"><Trash2 size={14} /></button>
-              )}
-            </div>
+            {(m.price_tiers ?? []).length > 0 && (
+              <div className="mt-1.5 pl-4 text-xs text-gray-500">
+                {formatTierSummary(m)}
+              </div>
+            )}
           </div>
         ))}
       </div>
