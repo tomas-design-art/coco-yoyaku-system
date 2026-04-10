@@ -243,7 +243,7 @@ export default function PatientList() {
     setCandidates([]);
     setShowCandidates(false);
     setConfirmNew(false);
-    setShowDefaultSettings(Boolean(p.default_menu_id || p.default_duration || p.preferred_practitioner_id));
+    setShowDefaultSettings(false);
   };
 
   const handleSelectCandidate = (p: Patient) => {

@@ -543,12 +543,15 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     <div className="flex flex-col h-full">
       {/* Reschedule mode banner */}
       {isRescheduling && reschedulingReservation && (
-        <div className="flex items-center justify-between px-4 py-2 bg-blue-50 border-b border-blue-200">
-          <div className="flex items-center gap-2 text-blue-800 text-sm flex-wrap">
-            <span className="text-lg">📅</span>
-            <span className="font-semibold">予約変更中:</span>
-            <span>{reschedulingReservation.patient?.name || '飛び込み'}</span>
-            <span className="text-blue-600">
+        <div className="flex flex-wrap sm:flex-nowrap items-start sm:items-center gap-2 px-2 sm:px-4 py-2 bg-blue-50 border-b border-blue-200">
+          <div
+            className="min-w-0 flex-1 flex items-center gap-1.5 sm:gap-2 text-blue-800 flex-wrap sm:flex-nowrap"
+            style={{ fontSize: 'clamp(11px, 1.2vw, 14px)' }}
+          >
+            <span className="text-base sm:text-lg leading-none">📅</span>
+            <span className="font-semibold whitespace-nowrap">予約変更中:</span>
+            <span className="font-medium whitespace-nowrap">{reschedulingReservation.patient?.name || '飛び込み'}</span>
+            <span className="text-blue-600 whitespace-nowrap">
               {reschedulingReservation.menu?.name || ''}
               ({Math.round((new Date(reschedulingReservation.end_time).getTime() - new Date(reschedulingReservation.start_time).getTime()) / 60000) + rescheduleDurationOffset}分)
               {rescheduleDurationOffset !== 0 && (
@@ -557,24 +560,24 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                 </span>
               )}
             </span>
-            <span className="text-blue-500">→ クリック または ドラッグ&ドロップで変更先を選択</span>
+            <span className="text-blue-500 whitespace-nowrap">→ クリック または ドラッグ&ドロップで変更先を選択</span>
             {pendingRescheduleLabel && (
-              <span className="font-semibold text-blue-700 bg-white/80 px-2 py-0.5 rounded border border-blue-200">
+              <span className="font-semibold text-blue-700 bg-white/80 px-2 py-0.5 rounded border border-blue-200 whitespace-nowrap">
                 候補: {pendingRescheduleLabel}
               </span>
             )}
           </div>
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="w-full sm:w-auto sm:ml-auto flex items-center justify-end gap-2 shrink-0">
             <button
               onClick={onConfirmReschedule}
               disabled={!canConfirmReschedule}
-              className="px-3 py-1 text-sm bg-green-600 text-white rounded hover:bg-green-700 disabled:bg-green-300 disabled:cursor-not-allowed"
+              className="px-3 py-1 text-xs sm:text-sm bg-green-600 text-white rounded hover:bg-green-700 disabled:bg-green-300 disabled:cursor-not-allowed whitespace-nowrap"
             >
-              {isConfirmingReschedule ? '確定中...' : 'この位置で確定'}
+              {isConfirmingReschedule ? '確定中...' : '変更確定'}
             </button>
             <button
               onClick={onCancelReschedule}
-              className="px-3 py-1 text-sm bg-gray-200 text-gray-700 rounded hover:bg-gray-300"
+              className="px-3 py-1 text-xs sm:text-sm bg-gray-200 text-gray-700 rounded hover:bg-gray-300 whitespace-nowrap"
             >
               キャンセル
             </button>

@@ -104,9 +104,14 @@ function AppContent() {
 
   // Start reschedule mode from ReservationDetail
   const handleStartReschedule = (reservation: Reservation) => {
+    const currentStart = new Date(reservation.start_time);
     setSelectedReservation(null); // close detail
     setReschedulingReservation(reservation);
-    setPendingRescheduleTarget(null);
+    setPendingRescheduleTarget({
+      practitionerId: reservation.practitioner_id,
+      startMinutes: currentStart.getHours() * 60 + currentStart.getMinutes(),
+      date: currentStart,
+    });
     setRescheduleError(null);
     setRescheduleDurationOffset(0);
   };
