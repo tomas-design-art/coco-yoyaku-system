@@ -62,6 +62,7 @@ function AppContent() {
   const [rescheduleConfirm, setRescheduleConfirm] = useState<{ message: string; action: () => Promise<void> } | null>(null);
   const [rescheduleSuccess, setRescheduleSuccess] = useState<string | null>(null);
   const [rescheduleError, setRescheduleError] = useState<string | null>(null);
+  const [rescheduleDurationOffset, setRescheduleDurationOffset] = useState(0);
   const [isTimeTableFullscreen, setIsTimeTableFullscreen] = useState(false);
 
   const { toasts, unreadCount, audioInitialized, enableAudio, addToast, removeToast, clearUnread } = useNotification();
@@ -98,13 +99,15 @@ function AppContent() {
   const handleStartReschedule = (reservation: Reservation) => {
     setSelectedReservation(null); // close detail
     setReschedulingReservation(reservation);
+    setRescheduleDurationOffset(0);
   };
 
   // Handle slot click while in reschedule mode
   const handleRescheduleSlotClick = (practitionerId: number, startMinutes: number, date: Date) => {
     if (!reschedulingReservation) return;
     const r = reschedulingReservation;
-    const durationMin = (new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 60000;
+    const baseDurationMin = (new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 60000;
+    const durationMin = baseDurationMin + rescheduleDurationOffset;
 
     const startH = Math.floor(startMinutes / 60);
     const startM = startMinutes % 60;
@@ -118,8 +121,11 @@ function AppContent() {
     const displayDate = `${date.getMonth() + 1}/${date.getDate()}`;
 
     setRescheduleError(null);
+    const offsetLabel = rescheduleDurationOffset !== 0
+      ? `（時間${rescheduleDurationOffset > 0 ? '+' : ''}${rescheduleDurationOffset}分）`
+      : '';
     setRescheduleConfirm({
-      message: `予約を ${displayDate} ${startTimeStr}〜${endTimeStr} に変更しますか？`,
+      message: `予約を ${displayDate} ${startTimeStr}〜${endTimeStr} に変更しますか？${offsetLabel}`,
       action: async () => {
         try {
           await rescheduleReservation(r.id, {
@@ -129,6 +135,7 @@ function AppContent() {
           });
           setRescheduleConfirm(null);
           setReschedulingReservation(null);
+          setRescheduleDurationOffset(0);
           setRescheduleSuccess('予約を変更しました');
           refresh();
           setTimeout(() => setRescheduleSuccess(null), 2000);
@@ -144,6 +151,7 @@ function AppContent() {
     setReschedulingReservation(null);
     setRescheduleConfirm(null);
     setRescheduleError(null);
+    setRescheduleDurationOffset(0);
   };
 
   useEffect(() => {
@@ -235,6 +243,8 @@ function AppContent() {
               reschedulingReservation={reschedulingReservation}
               onRescheduleSlotClick={handleRescheduleSlotClick}
               onCancelReschedule={cancelReschedule}
+              rescheduleDurationOffset={rescheduleDurationOffset}
+              onRescheduleDurationChange={(delta) => setRescheduleDurationOffset(prev => prev + delta)}
               isFullscreenMode={isTimeTableFullscreen}
               onToggleFullscreen={() => setIsTimeTableFullscreen((prev) => !prev)}
               fullscreenRightControls={isTimeTableFullscreen ? (

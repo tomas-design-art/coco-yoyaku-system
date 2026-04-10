@@ -20,12 +20,14 @@ interface TimeTableProps {
   reschedulingReservation?: Reservation | null;
   onRescheduleSlotClick?: (practitionerId: number, startMinutes: number, date: Date) => void;
   onCancelReschedule?: () => void;
+  rescheduleDurationOffset?: number;
+  onRescheduleDurationChange?: (delta: number) => void;
   isFullscreenMode?: boolean;
   onToggleFullscreen?: () => void;
   fullscreenRightControls?: React.ReactNode;
 }
 
-export default function TimeTable({ onSlotClick, onDragSelect, onReservationClick, refreshKey, reschedulingReservation, onRescheduleSlotClick, onCancelReschedule, isFullscreenMode = false, onToggleFullscreen, fullscreenRightControls }: TimeTableProps) {
+export default function TimeTable({ onSlotClick, onDragSelect, onReservationClick, refreshKey, reschedulingReservation, onRescheduleSlotClick, onCancelReschedule, rescheduleDurationOffset = 0, onRescheduleDurationChange, isFullscreenMode = false, onToggleFullscreen, fullscreenRightControls }: TimeTableProps) {
   const [allPractitioners, setAllPractitioners] = useState<Practitioner[]>([]);
   const [reservations, setReservations] = useState<Reservation[]>([]);
   const [colors, setColors] = useState<ReservationColor[]>([]);
@@ -377,17 +379,19 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
           const startMin = dateToMinutes(r.start_time);
           const endMin = dateToMinutes(r.end_time);
           const top = ((startMin - dayStart) / SLOT_INTERVAL) * SLOT_HEIGHT;
-          const height = ((endMin - startMin) / SLOT_INTERVAL) * SLOT_HEIGHT;
           const isTarget = isRescheduling && reschedulingReservation?.id === r.id;
+          const adjustedEndMin = isTarget ? endMin + rescheduleDurationOffset : endMin;
+          const height = ((adjustedEndMin - startMin) / SLOT_INTERVAL) * SLOT_HEIGHT;
+          const originalDuration = Math.round((new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 60000);
           return (
             <div
               key={r.id}
-              className={`absolute left-0.5 right-0.5 rounded px-1 text-white overflow-hidden shadow-sm ${isTarget ? 'ring-2 ring-blue-400 animate-pulse pointer-events-none' : isRescheduling ? '' : 'cursor-pointer hover:opacity-90'}`}
+              className={`absolute left-0.5 right-0.5 rounded px-1 text-white overflow-hidden shadow-sm ${isTarget ? 'ring-2 ring-blue-400 animate-pulse pointer-events-auto' : isRescheduling ? '' : 'cursor-pointer hover:opacity-90'}`}
               style={{
                 top: top + headerH,
                 height: Math.max(height, SLOT_HEIGHT),
                 backgroundColor: getBlockColor(r),
-                zIndex: isTarget ? 1 : 2,
+                zIndex: isTarget ? 8 : 2,
                 fontSize: 10,
                 lineHeight: '14px',
                 ...getBlockExtraStyle(r),
@@ -401,6 +405,35 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               </div>
               {height >= SLOT_HEIGHT * 2 && (
                 <div className="truncate opacity-90">{r.menu?.name || ''}</div>
+              )}
+              {/* ⊖ / ⊕ duration adjust buttons on the target bar */}
+              {isTarget && onRescheduleDurationChange && (
+                <div
+                  className="absolute bottom-1 left-1/2 -translate-x-1/2 flex items-center gap-1"
+                  style={{ zIndex: 10 }}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); onRescheduleDurationChange(-10); }}
+                    disabled={originalDuration + rescheduleDurationOffset <= 10}
+                    className="w-7 h-7 flex items-center justify-center rounded-full bg-white/90 text-red-600 font-bold text-lg shadow border border-red-300 hover:bg-red-50 disabled:opacity-30 disabled:cursor-not-allowed active:scale-90 transition-transform"
+                    title="-10分"
+                  >
+                    ⊖
+                  </button>
+                  <span className="text-[10px] font-bold text-white bg-black/40 px-1.5 py-0.5 rounded">
+                    {originalDuration + rescheduleDurationOffset}分
+                  </span>
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); onRescheduleDurationChange(+10); }}
+                    className="w-7 h-7 flex items-center justify-center rounded-full bg-white/90 text-green-600 font-bold text-lg shadow border border-green-300 hover:bg-green-50 active:scale-90 transition-transform"
+                    title="+10分"
+                  >
+                    ⊕
+                  </button>
+                </div>
               )}
             </div>
           );
@@ -428,19 +461,24 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
       {/* Reschedule mode banner */}
       {isRescheduling && reschedulingReservation && (
         <div className="flex items-center justify-between px-4 py-2 bg-blue-50 border-b border-blue-200">
-          <div className="flex items-center gap-2 text-blue-800 text-sm">
+          <div className="flex items-center gap-2 text-blue-800 text-sm flex-wrap">
             <span className="text-lg">📅</span>
             <span className="font-semibold">予約変更中:</span>
             <span>{reschedulingReservation.patient?.name || '飛び込み'}</span>
             <span className="text-blue-600">
               {reschedulingReservation.menu?.name || ''}
-              ({Math.round((new Date(reschedulingReservation.end_time).getTime() - new Date(reschedulingReservation.start_time).getTime()) / 60000)}分)
+              ({Math.round((new Date(reschedulingReservation.end_time).getTime() - new Date(reschedulingReservation.start_time).getTime()) / 60000) + rescheduleDurationOffset}分)
+              {rescheduleDurationOffset !== 0 && (
+                <span className={`ml-1 font-bold ${rescheduleDurationOffset > 0 ? 'text-green-600' : 'text-red-600'}`}>
+                  {rescheduleDurationOffset > 0 ? '+' : ''}{rescheduleDurationOffset}分
+                </span>
+              )}
             </span>
             <span className="text-blue-500">→ 空き枠をクリックして変更先を選択</span>
           </div>
           <button
             onClick={onCancelReschedule}
-            className="px-3 py-1 text-sm bg-gray-200 text-gray-700 rounded hover:bg-gray-300"
+            className="px-3 py-1 text-sm bg-gray-200 text-gray-700 rounded hover:bg-gray-300 shrink-0"
           >
             キャンセル
           </button>
