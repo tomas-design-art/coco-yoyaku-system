@@ -183,6 +183,11 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
   const headerLabel = viewMode === 'day'
     ? `${currentDate.getFullYear()}年${currentDate.getMonth() + 1}月${currentDate.getDate()}日(${WEEKDAY_LABELS[currentDate.getDay()]})`
     : `${weekDates[0].getMonth() + 1}/${weekDates[0].getDate()} 〜 ${weekDates[6].getMonth() + 1}/${weekDates[6].getDate()}`;
+  const compactHeaderLabel = viewMode === 'day'
+    ? `${currentDate.getMonth() + 1}/${currentDate.getDate()}`
+    : (weekDates[0].getMonth() === weekDates[6].getMonth()
+      ? `${weekDates[0].getMonth() + 1}/${weekDates[0].getDate()}-${weekDates[6].getDate()}`
+      : `${weekDates[0].getMonth() + 1}/${weekDates[0].getDate()}-${weekDates[6].getMonth() + 1}/${weekDates[6].getDate()}`);
 
   // 日表示の施術者列最大幅
   const dayColMaxWidth = activePractitioners.length === 1 ? 600 : activePractitioners.length === 2 ? 400 : undefined;
@@ -440,39 +445,44 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
       )}
 
       {/* Header: navigation + view toggle + practitioner toggles — single row */}
-      <div className="flex items-center px-4 py-2 bg-white border-b gap-2 min-h-[44px]">
-        <div className="flex items-center gap-2 shrink-0">
-          <button onClick={goPrev} className="p-1 hover:bg-gray-100 rounded"><ChevronLeft size={20} /></button>
-          <span className="font-semibold text-lg min-w-[200px] text-center">{headerLabel}</span>
-          <button onClick={goNext} className="p-1 hover:bg-gray-100 rounded"><ChevronRight size={20} /></button>
-          <button onClick={goToday} className="ml-2 px-3 py-1 text-sm bg-blue-500 text-white rounded hover:bg-blue-600">今日</button>
+      <div className="flex flex-col md:flex-row md:items-center px-2 md:px-4 py-1.5 md:py-2 bg-white border-b gap-1.5 md:gap-2 min-h-[40px] md:min-h-[44px]">
+        <div className="flex items-center justify-between md:justify-start gap-1 md:gap-2 shrink-0 min-w-0">
+          <button onClick={goPrev} className="p-1 hover:bg-gray-100 rounded"><ChevronLeft size={18} /></button>
+          <span className="font-semibold text-xs sm:text-sm md:text-lg min-w-[92px] sm:min-w-[130px] md:min-w-[200px] text-center truncate leading-none">
+            <span className="sm:hidden">{compactHeaderLabel}</span>
+            <span className="hidden sm:inline">{headerLabel}</span>
+          </span>
+          <button onClick={goNext} className="p-1 hover:bg-gray-100 rounded"><ChevronRight size={18} /></button>
+          <button onClick={goToday} className="ml-1 md:ml-2 px-2 md:px-3 py-1 text-xs md:text-sm bg-blue-500 text-white rounded hover:bg-blue-600">今日</button>
         </div>
-        <div className="flex-1" />
-        <div className="flex items-center gap-1 shrink-0 overflow-x-auto">
+        <div className="hidden md:flex flex-1" />
+        <div className="flex items-center gap-1 shrink-0 flex-wrap md:flex-nowrap">
+          <button onClick={() => setViewMode('day')} className={`px-2 md:px-3 py-1 text-xs md:text-sm rounded whitespace-nowrap ${viewMode === 'day' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}>日</button>
+          <button onClick={() => setViewMode('week')} className={`px-2 md:px-3 py-1 text-xs md:text-sm rounded whitespace-nowrap ${viewMode === 'week' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}>週</button>
           {visiblePractitioners.map((p) => {
             const on = enabledPractitionerIds.has(p.id);
             return (
               <button
                 key={p.id}
                 onClick={() => togglePractitioner(p.id)}
-                className={`px-2.5 py-1 text-xs rounded-full border transition-colors whitespace-nowrap ${on
+                className={`px-1.5 sm:px-2 py-1 text-[10px] sm:text-[11px] md:text-xs rounded-full border transition-colors whitespace-nowrap ${on
                   ? 'bg-blue-500 text-white border-blue-500'
                   : 'bg-white text-gray-500 border-gray-300 hover:border-gray-400'
                   }`}
+                title={p.name}
               >
-                {p.name} {on ? '✓' : ''}
+                <span className="sm:hidden">{p.name.slice(0, 2)}</span>
+                <span className="hidden sm:inline">{p.name}</span>
               </button>
             );
           })}
-          <button onClick={() => setViewMode('day')} className={`ml-2 px-3 py-1 text-sm rounded whitespace-nowrap ${viewMode === 'day' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}>日</button>
-          <button onClick={() => setViewMode('week')} className={`px-3 py-1 text-sm rounded whitespace-nowrap ${viewMode === 'week' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}>週</button>
-          {onToggleFullscreen && (
+          {onToggleFullscreen && !isFullscreenMode && (
             <button
               onClick={onToggleFullscreen}
-              className={`ml-2 px-3 py-1 text-sm rounded whitespace-nowrap ${isFullscreenMode ? 'bg-gray-700 text-white hover:bg-gray-800' : 'bg-indigo-500 text-white hover:bg-indigo-600'}`}
-              title={isFullscreenMode ? '全画面表示を終了' : 'タイムテーブル全画面表示'}
+              className="px-2 md:px-3 py-1 text-xs md:text-sm rounded whitespace-nowrap bg-indigo-500 text-white hover:bg-indigo-600"
+              title="タイムテーブル全画面表示"
             >
-              {isFullscreenMode ? '全画面終了' : 'タイムテーブル全画面表示'}
+              全画面
             </button>
           )}
           {fullscreenRightControls}
@@ -483,9 +493,12 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
       <div className="flex-1 overflow-auto" ref={gridRef}>
         {viewMode === 'day' ? (
           /* ===== DAY VIEW ===== */
-          <div className="flex">
+          <div className="flex min-w-max">
             {/* Time labels */}
-            <div className="sticky left-0 z-20 bg-white" style={{ minWidth: TIME_COL_WIDTH, borderRight: '1.5px solid #374151' }}>
+            <div
+              className="sticky left-0 z-40 bg-white shrink-0"
+              style={{ width: TIME_COL_WIDTH, minWidth: TIME_COL_WIDTH, borderRight: '1.5px solid #374151' }}
+            >
               <div style={{ height: HEADER_HEIGHT }} className="sticky top-0 z-30 border-b bg-gray-50" />
               {slots.map((slot) => {
                 const nextMin = slot.minutes + SLOT_INTERVAL;
@@ -536,9 +549,12 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
           </div>
         ) : (
           /* ===== WEEK VIEW ===== */
-          <div className="flex">
+          <div className="flex min-w-max">
             {/* Time labels */}
-            <div className="sticky left-0 z-20 bg-white" style={{ minWidth: TIME_COL_WIDTH, borderRight: '1.5px solid #374151' }}>
+            <div
+              className="sticky left-0 z-40 bg-white shrink-0"
+              style={{ width: TIME_COL_WIDTH, minWidth: TIME_COL_WIDTH, borderRight: '1.5px solid #374151' }}
+            >
               <div style={{ height: WEEK_HEADER_HEIGHT }} className="sticky top-0 z-30 border-b bg-gray-50" />
               {slots.map((slot) => {
                 const nextMin = slot.minutes + SLOT_INTERVAL;

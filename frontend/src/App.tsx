@@ -245,11 +245,10 @@ function AppContent() {
                   />
                   <button
                     onClick={() => setIsTimeTableFullscreen(false)}
-                    className="inline-flex items-center gap-1 px-3 py-1 text-sm bg-gray-200 text-gray-700 rounded hover:bg-gray-300 whitespace-nowrap"
+                    className="p-1.5 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded"
                     title="全画面表示を終了"
                   >
-                    <X size={14} />
-                    戻る
+                    <X size={16} />
                   </button>
                 </>
               ) : null}
