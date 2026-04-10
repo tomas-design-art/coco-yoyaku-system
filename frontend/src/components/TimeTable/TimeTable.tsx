@@ -10,7 +10,8 @@ const SLOT_HEIGHT = 20;
 const TIME_COL_WIDTH = 60;
 const HEADER_HEIGHT = 32;
 const WEEK_HEADER_HEIGHT = 52; // date line + practitioner names line
-const BLOCKED_HATCH_BG = 'repeating-linear-gradient(45deg, #d1d5db 0px, #d1d5db 6px, #b9c0ca 6px, #b9c0ca 10px)';
+const BLOCKED_HATCH_BG = 'repeating-linear-gradient(45deg, rgba(156,163,175,0.18) 0px, rgba(156,163,175,0.18) 2px, transparent 2px, transparent 9px)';
+const BLOCKED_BASE_BG = 'rgba(209,213,219,0.5)';
 
 interface TimeTableProps {
   onSlotClick: (practitionerId: number, startMinutes: number, date: Date) => void;
@@ -432,6 +433,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     return (
       <div
         className="relative"
+        style={{ minHeight: slots.length * SLOT_HEIGHT + headerH }}
         onDragOver={(e) => {
           if (dayOff || !isDraggingRescheduleTarget) return;
           e.preventDefault();
@@ -451,6 +453,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               bottom: 0,
               zIndex: 4,
               background: BLOCKED_HATCH_BG,
+              backgroundColor: BLOCKED_BASE_BG,
             }}
             title={dayOff.reason ? `休み: ${dayOff.reason}` : '休み'}
           >
@@ -495,6 +498,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                 height: Math.max(height, SLOT_HEIGHT),
                 zIndex: 4,
                 background: BLOCKED_HATCH_BG,
+                backgroundColor: BLOCKED_BASE_BG,
               }}
               title={`${ut.reason || '枠オサエ'}（クリックで変更/取消）`}
               onClick={(e) => {
