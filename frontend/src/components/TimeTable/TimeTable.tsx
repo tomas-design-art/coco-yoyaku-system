@@ -3,13 +3,14 @@ import { ChevronLeft, ChevronRight } from 'lucide-react';
 import type { Practitioner, Reservation, ReservationColor, WeeklySchedule, PractitionerDayStatus, BusinessHoursDay } from '../../types';
 import { CHANNEL_ICONS } from '../../types';
 import { generateTimeSlots, dateToMinutes, DAY_START, DAY_END, SLOT_INTERVAL, formatDate, getWeekDates, WEEKDAY_LABELS, getTodayJST, getNowJSTMinutes, timeToMinutes } from '../../utils/timeUtils';
-import { getPractitioners, getReservations, getReservationColors, getSettings, getWeeklySchedules, getScheduleStatus, getBusinessHoursRange } from '../../api/client';
+import { getPractitioners, getReservations, getReservationColors, getSettings, getWeeklySchedules, getScheduleStatus, getBusinessHoursRange, createUnavailableTime, deleteUnavailableTime } from '../../api/client';
 import DragSelect from './DragSelect';
 
 const SLOT_HEIGHT = 20;
 const TIME_COL_WIDTH = 60;
 const HEADER_HEIGHT = 32;
 const WEEK_HEADER_HEIGHT = 52; // date line + practitioner names line
+const BLOCKED_HATCH_BG = 'repeating-linear-gradient(45deg, #d1d5db 0px, #d1d5db 6px, #b9c0ca 6px, #b9c0ca 10px)';
 
 interface TimeTableProps {
   onSlotClick: (practitionerId: number, startMinutes: number, date: Date) => void;
@@ -123,6 +124,25 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     [activePractitioners]
   );
 
+  const reloadPractitionerStatuses = useCallback(async () => {
+    if (!activePractitionerIds) {
+      setPractitionerStatuses([]);
+      return;
+    }
+    const startDate = viewMode === 'day' ? currentDate : weekDates[0];
+    const endDate = viewMode === 'day' ? currentDate : weekDates[6];
+    try {
+      const res = await getScheduleStatus({
+        practitioner_ids: activePractitionerIds,
+        start_date: formatDate(startDate),
+        end_date: formatDate(endDate),
+      });
+      setPractitionerStatuses(res.data ?? []);
+    } catch {
+      // no-op
+    }
+  }, [activePractitionerIds, viewMode, currentDate, weekDates]);
+
   useEffect(() => {
     const startDate = viewMode === 'day' ? currentDate : weekDates[0];
     const endDate = viewMode === 'day' ? currentDate : weekDates[6];
@@ -132,20 +152,14 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     }).then((res) => setReservations(res.data ?? [])).catch(() => setReservations([]));
 
     // 職員勤務スケジュールステータスを取得
-    if (activePractitionerIds) {
-      getScheduleStatus({
-        practitioner_ids: activePractitionerIds,
-        start_date: formatDate(startDate),
-        end_date: formatDate(endDate),
-      }).then((res) => setPractitionerStatuses(res.data ?? [])).catch(() => { });
-    }
+    reloadPractitionerStatuses();
 
     // 解決済み営業時間（祝日・DateOverride反映）を取得
     getBusinessHoursRange({
       start_date: formatDate(startDate),
       end_date: formatDate(endDate),
     }).then((res) => setBusinessHours(res.data ?? [])).catch(() => { });
-  }, [currentDate, viewMode, weekDates, refreshKey, activePractitionerIds]);
+  }, [currentDate, viewMode, weekDates, refreshKey, activePractitionerIds, reloadPractitionerStatuses]);
 
   // 施術者トグル
   const togglePractitioner = (id: number) => {
@@ -263,9 +277,9 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
       return (
         <div
           className="absolute inset-0 flex items-center justify-center pointer-events-none"
-          style={{ top: headerH, bottom: 0, backgroundColor: source === 'holiday' ? 'rgba(239,68,68,0.12)' : 'rgba(209,213,219,0.5)', zIndex: 3 }}
+          style={{ top: headerH, bottom: 0, backgroundColor: 'rgba(209,213,219,0.5)', zIndex: 3 }}
         >
-          <span className={`font-bold text-sm bg-white/80 px-2 py-1 rounded ${source === 'holiday' ? 'text-red-500' : 'text-gray-500'}`}>{displayLabel}</span>
+          <span className="font-bold text-sm bg-white/85 px-2 py-1 rounded text-gray-600">{displayLabel}</span>
         </div>
       );
     }
@@ -344,6 +358,60 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     setIsDraggingRescheduleTarget(false);
   }, [isRescheduling, onRescheduleSlotClick, reschedulingReservation, rescheduleDurationOffset, getDropStartMinutes]);
 
+  const handleUnavailableTimeClick = useCallback(async (
+    ut: { id: number; start_time: string; end_time: string; reason: string | null },
+    practitionerId: number,
+    date: Date,
+  ) => {
+    const action = window.prompt('枠オサエ操作: 「変更」または「取消」を入力してください', '取消');
+    if (!action) return;
+
+    if (action === '取消') {
+      if (!window.confirm(`枠オサエを取消しますか？\n${ut.start_time}〜${ut.end_time}`)) return;
+      try {
+        await deleteUnavailableTime(ut.id);
+        await reloadPractitionerStatuses();
+      } catch {
+        window.alert('枠オサエの取消に失敗しました');
+      }
+      return;
+    }
+
+    if (action === '変更') {
+      const nextStart = window.prompt('変更後の開始時刻を入力（HH:MM）', ut.start_time);
+      if (!nextStart) return;
+      const nextEnd = window.prompt('変更後の終了時刻を入力（HH:MM）', ut.end_time);
+      if (!nextEnd) return;
+
+      const timeRe = /^([01]\d|2[0-3]):([0-5]\d)$/;
+      if (!timeRe.test(nextStart) || !timeRe.test(nextEnd)) {
+        window.alert('時刻形式が不正です。HH:MM で入力してください');
+        return;
+      }
+      if (nextStart >= nextEnd) {
+        window.alert('終了時刻は開始時刻より後にしてください');
+        return;
+      }
+
+      try {
+        await createUnavailableTime({
+          practitioner_id: practitionerId,
+          date: formatDate(date),
+          start_time: nextStart,
+          end_time: nextEnd,
+          reason: ut.reason || '枠オサエ',
+        });
+        await deleteUnavailableTime(ut.id);
+        await reloadPractitionerStatuses();
+      } catch {
+        window.alert('枠オサエの変更に失敗しました');
+      }
+      return;
+    }
+
+    window.alert('「変更」または「取消」を入力してください');
+  }, [reloadPractitionerStatuses]);
+
   const renderColumn = (practitionerId: number, date: Date, headerH: number) => {
     const dayOff = getPractitionerDayOff(practitionerId, date);
     const unavailableTimes = getUnavailableTimesForColumn(practitionerId, date);
@@ -382,9 +450,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               top: headerH,
               bottom: 0,
               zIndex: 4,
-              // Same base tone as "営業時間外" and distinguish by hatch pattern.
-              background: 'repeating-linear-gradient(45deg, rgba(209,213,219,0.12), rgba(209,213,219,0.12) 6px, rgba(156,163,175,0.28) 6px, rgba(156,163,175,0.28) 9px)',
-              backgroundColor: 'rgba(209,213,219,0.45)',
+              background: BLOCKED_HATCH_BG,
             }}
             title={dayOff.reason ? `休み: ${dayOff.reason}` : '休み'}
           >
@@ -423,15 +489,18 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
           return (
             <div
               key={`ut-${ut.id}`}
-              className="absolute left-0 right-0 flex items-center justify-center pointer-events-none"
+              className="absolute left-0 right-0 flex items-center justify-center cursor-pointer"
               style={{
                 top,
                 height: Math.max(height, SLOT_HEIGHT),
                 zIndex: 4,
-                background: 'repeating-linear-gradient(45deg, rgba(209,213,219,0.12), rgba(209,213,219,0.12) 4px, rgba(156,163,175,0.26) 4px, rgba(156,163,175,0.26) 6px)',
-                backgroundColor: 'rgba(209,213,219,0.45)',
+                background: BLOCKED_HATCH_BG,
               }}
-              title={ut.reason || '時間帯休み'}
+              title={`${ut.reason || '枠オサエ'}（クリックで変更/取消）`}
+              onClick={(e) => {
+                e.stopPropagation();
+                void handleUnavailableTimeClick(ut, practitionerId, date);
+              }}
             >
               <span className="text-gray-600 font-bold text-xs bg-white/85 px-1 py-0.5 rounded shadow-sm truncate" style={{ fontSize: 9 }}>
                 {ut.reason || '休み'}
