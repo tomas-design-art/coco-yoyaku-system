@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { X } from 'lucide-react';
 import type { Menu, Practitioner, ReservationCreate, Channel, ReservationColor, Patient, BulkReservationResult } from '../../types';
-import { getMenus, getPractitioners, createReservation, bulkCreateReservations, getReservationColors, getSettings } from '../../api/client';
+import { getMenus, getPractitioners, createReservation, bulkCreateReservations, getReservationColors, getSettings, createUnavailableTime, createScheduleOverride } from '../../api/client';
 import { generate5MinOptions, minutesToTime } from '../../utils/timeUtils';
 import { extractErrorMessage } from '../../utils/errorUtils';
 import PatientSearch from './PatientSearch';
@@ -15,6 +15,7 @@ interface ReservationFormProps {
     date?: Date;
     startMinutes?: number;
     endMinutes?: number;
+    isSingleClick?: boolean;
   };
 }
 
@@ -52,6 +53,16 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
   const [repeatEndDate, setRepeatEndDate] = useState('');
   const [repeatCount, setRepeatCount] = useState(4);
   const [bulkResult, setBulkResult] = useState<BulkReservationResult | null>(null);
+
+  const resetFormState = () => {
+    setPatientId(null);
+    setPatientName('');
+    setMenuId(null);
+    setSelectedDuration(null);
+    setNotes('');
+    setRepeatEnabled(false);
+    setBulkResult(null);
+  };
 
   useEffect(() => {
     if (isOpen) {
@@ -186,17 +197,52 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
         await createReservation(data);
         onSuccess();
         onClose();
-        // Reset form
-        setPatientId(null);
-        setPatientName('');
-        setMenuId(null);
-        setSelectedDuration(null);
-        setNotes('');
-        setRepeatEnabled(false);
-        setBulkResult(null);
+        resetFormState();
       }
     } catch (err: unknown) {
       setError(extractErrorMessage(err, '予約の登録に失敗しました'));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleImmediateBlock = async () => {
+    if (!practitionerId || !date || submitting) return;
+
+    const practitioner = practitioners.find((p) => p.id === practitionerId);
+    const practitionerName = practitioner?.name || '担当者';
+
+    setError(null);
+    setSubmitting(true);
+    try {
+      if (initialData?.isSingleClick) {
+        const blockAllToday = window.confirm(`本日の担当${practitionerName}の予約枠を全て止めますか？\nOK: 一括ブロック / キャンセル: 選択枠のみブロック`);
+        if (blockAllToday) {
+          await createScheduleOverride({
+            practitioner_id: practitionerId,
+            date,
+            is_working: false,
+            reason: '枠オサエ（即時一括停止）',
+          });
+          onSuccess();
+          onClose();
+          resetFormState();
+          return;
+        }
+      }
+
+      await createUnavailableTime({
+        practitioner_id: practitionerId,
+        date,
+        start_time: startTime,
+        end_time: endTime,
+        reason: '枠オサエ',
+      });
+      onSuccess();
+      onClose();
+      resetFormState();
+    } catch (err: unknown) {
+      setError(extractErrorMessage(err, '枠オサエの登録に失敗しました'));
     } finally {
       setSubmitting(false);
     }
@@ -208,7 +254,18 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
       <div className="bg-white rounded-lg shadow-xl w-full max-w-md mx-4 max-h-[90vh] flex flex-col">
         <div className="flex items-center justify-between p-4 border-b">
-          <h2 className="text-lg font-semibold">新規予約登録</h2>
+          <div className="flex items-center gap-3 min-w-0">
+            <h2 className="text-lg font-semibold whitespace-nowrap">新規予約登録</h2>
+            <button
+              type="button"
+              onClick={handleImmediateBlock}
+              disabled={submitting || !practitionerId || !date}
+              className="px-3 py-1.5 text-xs sm:text-sm font-semibold rounded bg-amber-500 text-white hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
+              title="この枠を即時ブロック"
+            >
+              枠オサエ
+            </button>
+          </div>
           <button onClick={() => { onClose(); setBulkResult(null); }} className="p-1 hover:bg-gray-100 rounded"><X size={20} /></button>
         </div>
 
@@ -277,8 +334,8 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
                         type="button"
                         onClick={() => setSelectedDuration(opt.duration)}
                         className={`px-3 py-1.5 rounded text-sm border transition-colors ${isActive
-                            ? 'bg-blue-500 text-white border-blue-500'
-                            : 'bg-white text-gray-700 border-gray-300 hover:border-blue-400'
+                          ? 'bg-blue-500 text-white border-blue-500'
+                          : 'bg-white text-gray-700 border-gray-300 hover:border-blue-400'
                           }`}
                       >
                         {opt.duration}分{opt.price != null && opt.price > 0 ? ` ¥${opt.price.toLocaleString()}` : ''}

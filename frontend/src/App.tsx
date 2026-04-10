@@ -57,6 +57,7 @@ function AppContent() {
     date?: Date;
     startMinutes?: number;
     endMinutes?: number;
+    isSingleClick?: boolean;
   }>({});
 
   // Admin login modal state
@@ -93,12 +94,12 @@ function AppContent() {
   const refresh = () => setRefreshKey((k) => k + 1);
 
   const handleSlotClick = (practitionerId: number, startMinutes: number, date: Date) => {
-    setFormInitialData({ practitionerId, date, startMinutes, endMinutes: startMinutes + 30 });
+    setFormInitialData({ practitionerId, date, startMinutes, endMinutes: startMinutes + 30, isSingleClick: true });
     setShowReservationForm(true);
   };
 
   const handleDragSelect = (practitionerId: number, startMinutes: number, endMinutes: number, date: Date) => {
-    setFormInitialData({ practitionerId, date, startMinutes, endMinutes });
+    setFormInitialData({ practitionerId, date, startMinutes, endMinutes, isSingleClick: false });
     setShowReservationForm(true);
   };
 
