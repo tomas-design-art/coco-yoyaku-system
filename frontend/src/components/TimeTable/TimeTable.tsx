@@ -8,7 +8,6 @@ import DragSelect from './DragSelect';
 
 const SLOT_HEIGHT = 20;
 const TIME_COL_WIDTH = 60;
-const WEEK_PRACTITIONER_MIN_WIDTH = 64;
 const HEADER_HEIGHT = 32;
 const WEEK_HEADER_HEIGHT = 52; // date line + practitioner names line
 
@@ -164,6 +163,18 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
 
   // 週表示でも全アクティブ施術者を表示（横スクロールで対応）
   const weekVisiblePractitioners = activePractitioners;
+
+  // 施術者人数が増えるほど列の最小幅を段階的に狭め、週表示の横スクロール量を抑える
+  const weekPractitionerMinWidth = useMemo(() => {
+    const count = Math.max(weekVisiblePractitioners.length, 1);
+    if (count <= 2) return 64;
+    if (count === 3) return 60;
+    if (count === 4) return 56;
+    if (count === 5) return 52;
+    if (count === 6) return 48;
+    if (count === 7) return 46;
+    return 44;
+  }, [weekVisiblePractitioners.length]);
 
   const goToday = () => setCurrentDate(getTodayJST());
   const goPrev = () => {
@@ -438,12 +449,12 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
           return (
             <div
               key={r.id}
-              className={`absolute left-0.5 right-0.5 rounded px-1 text-white overflow-hidden shadow-sm ${isTarget ? 'ring-2 ring-blue-400 animate-pulse pointer-events-auto cursor-grab active:cursor-grabbing' : isRescheduling ? '' : 'cursor-pointer hover:opacity-90'}`}
+              className={`absolute left-0.5 right-0.5 rounded px-1 text-white shadow-sm ${isTarget ? 'ring-2 ring-blue-400 animate-pulse pointer-events-auto cursor-grab active:cursor-grabbing overflow-visible' : 'overflow-hidden'} ${isRescheduling ? '' : 'cursor-pointer hover:opacity-90'}`}
               style={{
                 top: top + headerH,
                 height: Math.max(height, SLOT_HEIGHT),
                 backgroundColor: getBlockColor(r),
-                zIndex: isTarget ? 8 : 2,
+                zIndex: isTarget ? 30 : 2,
                 fontSize: 10,
                 lineHeight: '14px',
                 ...getBlockExtraStyle(r),
@@ -479,7 +490,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               {isTarget && onRescheduleDurationChange && (
                 <div
                   className="absolute bottom-1 left-1/2 -translate-x-1/2 flex items-center gap-1"
-                  style={{ zIndex: 10 }}
+                  style={{ zIndex: 40 }}
                   onClick={(e) => e.stopPropagation()}
                 >
                   <button
@@ -728,7 +739,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
             {weekDates.map((date, di) => {
               const isToday = formatDate(date) === formatDate(getTodayJST());
               return (
-                <div key={`week-${di}`} className="relative" style={{ flex: 1, minWidth: weekVisiblePractitioners.length * WEEK_PRACTITIONER_MIN_WIDTH, borderRight: '1.5px solid #1f2937' }}>
+                <div key={`week-${di}`} className="relative" style={{ flex: 1, minWidth: weekVisiblePractitioners.length * weekPractitionerMinWidth, borderRight: '1.5px solid #1f2937' }}>
                   {/* Date + Practitioner headers — sticky top */}
                   <div className={`sticky top-0 z-[15] ${isToday ? 'bg-blue-50' : 'bg-gray-50'}`} style={{ height: WEEK_HEADER_HEIGHT }}>
                     {/* Date header */}
@@ -744,7 +755,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                         <div
                           key={p.id}
                           className={`flex-1 flex items-center justify-center text-xs text-gray-600 last:border-r-0 truncate px-0.5 ${isToday ? 'bg-blue-50' : 'bg-gray-50'}`}
-                          style={{ minWidth: WEEK_PRACTITIONER_MIN_WIDTH, borderRight: '1px dashed #d1d5db' }}
+                          style={{ minWidth: weekPractitionerMinWidth, borderRight: '1px dashed #d1d5db' }}
                         >
                           {p.name}
                         </div>
@@ -757,7 +768,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                       <div
                         key={`${di}-${p.id}`}
                         className="relative last:border-r-0"
-                        style={{ flex: 1, minWidth: WEEK_PRACTITIONER_MIN_WIDTH, borderRight: '1px dashed #d1d5db' }}
+                        style={{ flex: 1, minWidth: weekPractitionerMinWidth, borderRight: '1px dashed #d1d5db' }}
                       >
                         {renderColumn(p.id, date, 0)}
                       </div>
