@@ -183,6 +183,9 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
   const headerLabel = viewMode === 'day'
     ? `${currentDate.getFullYear()}年${currentDate.getMonth() + 1}月${currentDate.getDate()}日(${WEEKDAY_LABELS[currentDate.getDay()]})`
     : `${weekDates[0].getMonth() + 1}/${weekDates[0].getDate()} 〜 ${weekDates[6].getMonth() + 1}/${weekDates[6].getDate()}`;
+  const mediumHeaderLabel = viewMode === 'day'
+    ? `${currentDate.getMonth() + 1}/${currentDate.getDate()}(${WEEKDAY_LABELS[currentDate.getDay()]})`
+    : `${weekDates[0].getMonth() + 1}/${weekDates[0].getDate()}-${weekDates[6].getMonth() + 1}/${weekDates[6].getDate()}`;
   const compactHeaderLabel = viewMode === 'day'
     ? `${currentDate.getMonth() + 1}/${currentDate.getDate()}`
     : (weekDates[0].getMonth() === weekDates[6].getMonth()
@@ -445,18 +448,19 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
       )}
 
       {/* Header: navigation + view toggle + practitioner toggles — single row */}
-      <div className="flex flex-col md:flex-row md:items-center px-2 md:px-4 py-1.5 md:py-2 bg-white border-b gap-1.5 md:gap-2 min-h-[40px] md:min-h-[44px]">
-        <div className="flex items-center justify-between md:justify-start gap-1 md:gap-2 shrink-0 min-w-0">
+      <div className="flex items-center flex-nowrap max-[430px]:flex-wrap px-2 md:px-3 py-1.5 md:py-2 bg-white border-b gap-1 min-h-[40px] md:min-h-[44px]">
+        <div className="flex items-center gap-0.5 sm:gap-1 shrink-0 min-w-0">
           <button onClick={goPrev} className="p-1 hover:bg-gray-100 rounded"><ChevronLeft size={18} /></button>
-          <span className="font-semibold text-xs sm:text-sm md:text-lg min-w-[92px] sm:min-w-[130px] md:min-w-[200px] text-center truncate leading-none">
-            <span className="sm:hidden">{compactHeaderLabel}</span>
-            <span className="hidden sm:inline">{headerLabel}</span>
+          <span className="font-semibold text-xs sm:text-sm lg:text-lg text-center leading-none px-0.5 sm:px-1 whitespace-nowrap">
+            <span className="max-[430px]:hidden lg:hidden">{mediumHeaderLabel}</span>
+            <span className="hidden lg:inline">{headerLabel}</span>
+            <span className="hidden max-[430px]:inline">{compactHeaderLabel}</span>
           </span>
           <button onClick={goNext} className="p-1 hover:bg-gray-100 rounded"><ChevronRight size={18} /></button>
           <button onClick={goToday} className="ml-1 md:ml-2 px-2 md:px-3 py-1 text-xs md:text-sm bg-blue-500 text-white rounded hover:bg-blue-600">今日</button>
         </div>
-        <div className="hidden md:flex flex-1" />
-        <div className="flex items-center gap-1 shrink-0 flex-wrap md:flex-nowrap">
+        <div className="flex-1 min-w-0" />
+        <div className="flex items-center gap-1 shrink-0 flex-nowrap max-[430px]:flex-wrap max-[430px]:w-full">
           <button onClick={() => setViewMode('day')} className={`px-2 md:px-3 py-1 text-xs md:text-sm rounded whitespace-nowrap ${viewMode === 'day' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}>日</button>
           <button onClick={() => setViewMode('week')} className={`px-2 md:px-3 py-1 text-xs md:text-sm rounded whitespace-nowrap ${viewMode === 'week' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}>週</button>
           {visiblePractitioners.map((p) => {
