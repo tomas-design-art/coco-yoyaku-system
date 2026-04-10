@@ -1,6 +1,6 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Link, useLocation, useNavigate } from 'react-router-dom';
-import { Calendar, Users, Settings, Stethoscope, Menu as MenuIcon, Volume2, VolumeX, Palette, Bot, CalendarDays, CheckCircle, Lock, Unlock, LogOut } from 'lucide-react';
+import { Calendar, Users, Settings, Stethoscope, Menu as MenuIcon, Volume2, VolumeX, Palette, Bot, CalendarDays, CheckCircle, Lock, Unlock, LogOut, X } from 'lucide-react';
 import TimeTable from './components/TimeTable/TimeTable';
 import ReservationForm from './components/ReservationForm/ReservationForm';
 import ReservationDetail from './components/ReservationDetail';
@@ -39,6 +39,7 @@ function NavLink({ to, children, locked }: { to: string; children: React.ReactNo
 function AppContent() {
   const { role, adminLogout, logout } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const isAdmin = role === 'admin';
 
   const [showReservationForm, setShowReservationForm] = useState(false);
@@ -61,6 +62,7 @@ function AppContent() {
   const [rescheduleConfirm, setRescheduleConfirm] = useState<{ message: string; action: () => Promise<void> } | null>(null);
   const [rescheduleSuccess, setRescheduleSuccess] = useState<string | null>(null);
   const [rescheduleError, setRescheduleError] = useState<string | null>(null);
+  const [isTimeTableFullscreen, setIsTimeTableFullscreen] = useState(false);
 
   const { toasts, unreadCount, audioInitialized, enableAudio, addToast, removeToast, clearUnread } = useNotification();
 
@@ -144,72 +146,82 @@ function AppContent() {
     setRescheduleError(null);
   };
 
+  useEffect(() => {
+    if (location.pathname !== '/' && isTimeTableFullscreen) {
+      setIsTimeTableFullscreen(false);
+    }
+  }, [location.pathname, isTimeTableFullscreen]);
+
+  const showAppHeader = !(location.pathname === '/' && isTimeTableFullscreen);
+
   return (
     <div className="flex flex-col h-screen">
       {/* Header */}
-      <header className="bg-white shadow-sm border-b z-20">
-        <div className="flex items-center justify-between px-4 py-2">
-          <div className="flex items-center gap-4">
-            <h1 className="text-lg font-bold text-gray-900">🦴 予約管理</h1>
-            <nav className="flex items-center gap-1">
-              <NavLink to="/"><Calendar size={16} className="inline mr-1" />タイムテーブル</NavLink>
-              <NavLink to="/patients"><Users size={16} className="inline mr-1" />患者</NavLink>
-              <AdminNavLink to="/settings/practitioners" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
-                <Stethoscope size={16} className="inline mr-1" />施術者
-              </AdminNavLink>
-              <AdminNavLink to="/settings/menus" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
-                <MenuIcon size={16} className="inline mr-1" />メニュー
-              </AdminNavLink>
-              <AdminNavLink to="/settings/colors" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
-                <Palette size={16} className="inline mr-1" />色設定
-              </AdminNavLink>
-              <AdminNavLink to="/settings/chatbot" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
-                <Bot size={16} className="inline mr-1" />チャットボット
-              </AdminNavLink>
-              <AdminNavLink to="/settings/schedule" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
-                <CalendarDays size={16} className="inline mr-1" />院営業スケジュール
-              </AdminNavLink>
-              <NavLink to="/settings/practitioner-schedules"><CalendarDays size={16} className="inline mr-1" />職員勤務スケジュール</NavLink>
-              <AdminNavLink to="/settings" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
-                <Settings size={16} className="inline mr-1" />設定
-              </AdminNavLink>
-              <NavLink to="/hotpepper">🔥 HP同期</NavLink>
-            </nav>
+      {showAppHeader && (
+        <header className="bg-white shadow-sm border-b z-20">
+          <div className="flex items-center justify-between px-4 py-2">
+            <div className="flex items-center gap-4">
+              <h1 className="text-lg font-bold text-gray-900">🦴 予約管理</h1>
+              <nav className="flex items-center gap-1">
+                <NavLink to="/"><Calendar size={16} className="inline mr-1" />タイムテーブル</NavLink>
+                <NavLink to="/patients"><Users size={16} className="inline mr-1" />患者</NavLink>
+                <AdminNavLink to="/settings/practitioners" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
+                  <Stethoscope size={16} className="inline mr-1" />施術者
+                </AdminNavLink>
+                <AdminNavLink to="/settings/menus" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
+                  <MenuIcon size={16} className="inline mr-1" />メニュー
+                </AdminNavLink>
+                <AdminNavLink to="/settings/colors" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
+                  <Palette size={16} className="inline mr-1" />色設定
+                </AdminNavLink>
+                <AdminNavLink to="/settings/chatbot" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
+                  <Bot size={16} className="inline mr-1" />チャットボット
+                </AdminNavLink>
+                <AdminNavLink to="/settings/schedule" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
+                  <CalendarDays size={16} className="inline mr-1" />院営業スケジュール
+                </AdminNavLink>
+                <NavLink to="/settings/practitioner-schedules"><CalendarDays size={16} className="inline mr-1" />職員勤務スケジュール</NavLink>
+                <AdminNavLink to="/settings" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
+                  <Settings size={16} className="inline mr-1" />設定
+                </AdminNavLink>
+                <NavLink to="/hotpepper">🔥 HP同期</NavLink>
+              </nav>
+            </div>
+            <div className="flex items-center gap-2">
+              {isAdmin && (
+                <div className="flex items-center gap-1 text-sm text-green-700 bg-green-50 px-2 py-1 rounded">
+                  <Unlock size={14} />
+                  <span>管理者</span>
+                  <button
+                    onClick={adminLogout}
+                    className="ml-1 text-xs text-green-600 hover:text-green-800 underline"
+                  >
+                    戻る
+                  </button>
+                </div>
+              )}
+              <button
+                onClick={enableAudio}
+                className={`p-2 rounded-full ${audioInitialized ? 'text-green-500' : 'text-gray-400 hover:text-gray-600'}`}
+                title={audioInitialized ? '通知音ON' : 'クリックして通知音を有効化'}
+              >
+                {audioInitialized ? <Volume2 size={18} /> : <VolumeX size={18} />}
+              </button>
+              <NotificationBell
+                unreadCount={unreadCount}
+                onClick={() => { setShowNotificationPanel(!showNotificationPanel); clearUnread(); }}
+              />
+              <button
+                onClick={() => { logout(); }}
+                className="p-2 rounded-full text-gray-400 hover:text-red-500"
+                title="ログアウト"
+              >
+                <LogOut size={18} />
+              </button>
+            </div>
           </div>
-          <div className="flex items-center gap-2">
-            {isAdmin && (
-              <div className="flex items-center gap-1 text-sm text-green-700 bg-green-50 px-2 py-1 rounded">
-                <Unlock size={14} />
-                <span>管理者</span>
-                <button
-                  onClick={adminLogout}
-                  className="ml-1 text-xs text-green-600 hover:text-green-800 underline"
-                >
-                  戻る
-                </button>
-              </div>
-            )}
-            <button
-              onClick={enableAudio}
-              className={`p-2 rounded-full ${audioInitialized ? 'text-green-500' : 'text-gray-400 hover:text-gray-600'}`}
-              title={audioInitialized ? '通知音ON' : 'クリックして通知音を有効化'}
-            >
-              {audioInitialized ? <Volume2 size={18} /> : <VolumeX size={18} />}
-            </button>
-            <NotificationBell
-              unreadCount={unreadCount}
-              onClick={() => { setShowNotificationPanel(!showNotificationPanel); clearUnread(); }}
-            />
-            <button
-              onClick={() => { logout(); }}
-              className="p-2 rounded-full text-gray-400 hover:text-red-500"
-              title="ログアウト"
-            >
-              <LogOut size={18} />
-            </button>
-          </div>
-        </div>
-      </header>
+        </header>
+      )}
 
       {/* Main */}
       <main className="flex-1 overflow-auto bg-gray-50">
@@ -223,6 +235,24 @@ function AppContent() {
               reschedulingReservation={reschedulingReservation}
               onRescheduleSlotClick={handleRescheduleSlotClick}
               onCancelReschedule={cancelReschedule}
+              isFullscreenMode={isTimeTableFullscreen}
+              onToggleFullscreen={() => setIsTimeTableFullscreen((prev) => !prev)}
+              fullscreenRightControls={isTimeTableFullscreen ? (
+                <>
+                  <NotificationBell
+                    unreadCount={unreadCount}
+                    onClick={() => { setShowNotificationPanel(!showNotificationPanel); clearUnread(); }}
+                  />
+                  <button
+                    onClick={() => setIsTimeTableFullscreen(false)}
+                    className="inline-flex items-center gap-1 px-3 py-1 text-sm bg-gray-200 text-gray-700 rounded hover:bg-gray-300 whitespace-nowrap"
+                    title="全画面表示を終了"
+                  >
+                    <X size={14} />
+                    戻る
+                  </button>
+                </>
+              ) : null}
             />
           } />
           <Route path="/patients" element={<PatientList />} />

@@ -47,6 +47,7 @@ export default function PatientList() {
   const includeInactive = true;
   const [menus, setMenus] = useState<Menu[]>([]);
   const [practitioners, setPractitioners] = useState<Practitioner[]>([]);
+  const [showDefaultSettings, setShowDefaultSettings] = useState(false);
 
   const lastNameRef = useRef<HTMLInputElement>(null);
 
@@ -242,6 +243,7 @@ export default function PatientList() {
     setCandidates([]);
     setShowCandidates(false);
     setConfirmNew(false);
+    setShowDefaultSettings(Boolean(p.default_menu_id || p.default_duration || p.preferred_practitioner_id));
   };
 
   const handleSelectCandidate = (p: Patient) => {
@@ -291,7 +293,15 @@ export default function PatientList() {
         <h1 className="text-2xl font-bold">患者管理</h1>
         <div className="flex gap-2">
           <button
-            onClick={() => { setShowForm(true); setEditingId(null); setForm({ ...emptyForm }); setCandidates([]); setShowCandidates(false); setConfirmNew(false); }}
+            onClick={() => {
+              setShowForm(true);
+              setEditingId(null);
+              setForm({ ...emptyForm });
+              setCandidates([]);
+              setShowCandidates(false);
+              setConfirmNew(false);
+              setShowDefaultSettings(false);
+            }}
             className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
           >
             + 新規登録
@@ -386,51 +396,63 @@ export default function PatientList() {
             <textarea ref={notesRef} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} className="w-full border rounded px-3 py-2" rows={2} />
           </div>
 
-          {/* デフォルト予約設定 */}
+          {/* デフォルト予約設定（任意オプション） */}
           <div className="border-t pt-3 mt-3">
-            <p className="text-sm font-medium mb-2 text-gray-700">予約デフォルト設定</p>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-xs text-gray-500 mb-1">デフォルトメニュー</label>
-                <select
-                  value={form.default_menu_id || ''}
-                  onChange={(e) => setForm({ ...form, default_menu_id: e.target.value ? Number(e.target.value) : null })}
-                  className="w-full border rounded px-2 py-1.5 text-sm"
-                >
-                  <option value="">未設定</option>
-                  {menus.map((m) => (
-                    <option key={m.id} value={m.id}>{m.name} ({m.duration_minutes}分)</option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs text-gray-500 mb-1">デフォルト時間（分）</label>
-                <input
-                  type="number"
-                  min={5}
-                  max={300}
-                  step={5}
-                  value={form.default_duration || ''}
-                  onChange={(e) => setForm({ ...form, default_duration: e.target.value ? Number(e.target.value) : null })}
-                  className="w-full border rounded px-2 py-1.5 text-sm"
-                  placeholder="例: 60"
-                />
-              </div>
-              <div className="col-span-2">
-                <label className="block text-xs text-gray-500 mb-1">担当施術者（いつもの）</label>
-                <select
-                  value={form.preferred_practitioner_id || ''}
-                  onChange={(e) => setForm({ ...form, preferred_practitioner_id: e.target.value ? Number(e.target.value) : null })}
-                  className="w-full border rounded px-2 py-1.5 text-sm"
-                >
-                  <option value="">未設定（指名なし）</option>
-                  {practitioners.map((p) => (
-                    <option key={p.id} value={p.id}>{p.name}</option>
-                  ))}
-                </select>
-              </div>
-            </div>
-            <p className="text-xs text-gray-400 mt-1">※予約作成時に自動で反映されます。担当者を設定するとLINEで「いつもの」が使えます。</p>
+            <button
+              type="button"
+              onClick={() => setShowDefaultSettings((prev) => !prev)}
+              className="w-full flex items-center justify-between px-2 py-2 rounded border bg-white hover:bg-gray-50"
+            >
+              <span className="text-sm font-medium text-gray-700">予約デフォルト設定 <span className="text-xs text-gray-400">（任意オプション）</span></span>
+              <span className="text-sm text-gray-500">{showDefaultSettings ? '▲' : '▼'}</span>
+            </button>
+
+            {showDefaultSettings && (
+              <>
+                <div className="grid grid-cols-2 gap-3 mt-3">
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">デフォルトメニュー</label>
+                    <select
+                      value={form.default_menu_id || ''}
+                      onChange={(e) => setForm({ ...form, default_menu_id: e.target.value ? Number(e.target.value) : null })}
+                      className="w-full border rounded px-2 py-1.5 text-sm"
+                    >
+                      <option value="">未設定</option>
+                      {menus.map((m) => (
+                        <option key={m.id} value={m.id}>{m.name} ({m.duration_minutes}分)</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">デフォルト時間（分）</label>
+                    <input
+                      type="number"
+                      min={5}
+                      max={300}
+                      step={5}
+                      value={form.default_duration || ''}
+                      onChange={(e) => setForm({ ...form, default_duration: e.target.value ? Number(e.target.value) : null })}
+                      className="w-full border rounded px-2 py-1.5 text-sm"
+                      placeholder="例: 60"
+                    />
+                  </div>
+                  <div className="col-span-2">
+                    <label className="block text-xs text-gray-500 mb-1">担当施術者（いつもの）</label>
+                    <select
+                      value={form.preferred_practitioner_id || ''}
+                      onChange={(e) => setForm({ ...form, preferred_practitioner_id: e.target.value ? Number(e.target.value) : null })}
+                      className="w-full border rounded px-2 py-1.5 text-sm"
+                    >
+                      <option value="">未設定（指名なし）</option>
+                      {practitioners.map((p) => (
+                        <option key={p.id} value={p.id}>{p.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+                <p className="text-xs text-gray-400 mt-1">※予約作成時に自動で反映されます。担当者を設定するとLINEで「いつもの」が使えます。</p>
+              </>
+            )}
           </div>
 
           {/* 候補表示 */}
@@ -472,7 +494,7 @@ export default function PatientList() {
             <button type="submit" className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600">
               {editingId ? '更新' : (confirmNew ? '新規登録する' : '登録')}
             </button>
-            <button type="button" onClick={() => { setShowForm(false); setCandidates([]); setShowCandidates(false); setConfirmNew(false); }}
+            <button type="button" onClick={() => { setShowForm(false); setCandidates([]); setShowCandidates(false); setConfirmNew(false); setShowDefaultSettings(false); }}
               className="px-4 py-2 border rounded hover:bg-gray-100">キャンセル</button>
           </div>
         </form>

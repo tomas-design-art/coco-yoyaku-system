@@ -83,7 +83,7 @@ export default function DragSelect({ slots, slotHeight, onSlotClick, onDragSelec
         const nextMin = slot.minutes + SLOT_INTERVAL;
         let borderStyle: string;
         if (nextMin % 60 === 0) {
-          borderStyle = '1.75px solid #9ca3af'; // 毎時 — 太灰線
+          borderStyle = '2px solid #6b7280'; // 毎時 — 太灰線
         } else if (nextMin % 30 === 0) {
           borderStyle = '1.5px solid #b0b7c0'; // 30分 — 中灰線
         } else if (nextMin % 15 === 0) {

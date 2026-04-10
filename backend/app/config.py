@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     hotpepper_poll_fetch_limit: int = 50
     hotpepper_poll_max_retries: int = 3
     hotpepper_poll_retry_base_seconds: int = 2
+    notification_retention_days: int = 30
+    notification_unread_retention_days: int = 30
     chatbot_allowed_origins: str = ""
     cors_origins: str = ""  # カンマ区切りで追加のCORSオリジンを指定
     environment: str = "development"  # development | production

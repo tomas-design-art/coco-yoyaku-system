@@ -90,9 +90,12 @@ async def remind_hotpepper_sync():
 
 
 async def cleanup_old_notifications():
-    """90日以上前の既読通知ログを自動削除"""
+    """一定期間を超えた通知ログを自動削除"""
     async with async_session() as db:
-        cutoff = now_jst() - timedelta(days=90)
+        read_retention_days = max(1, settings.notification_retention_days)
+        unread_retention_days = max(1, settings.notification_unread_retention_days)
+
+        cutoff = now_jst() - timedelta(days=read_retention_days)
         result = await db.execute(
             delete(NotificationLog).where(
                 NotificationLog.is_read == True,
@@ -102,19 +105,27 @@ async def cleanup_old_notifications():
         deleted = result.rowcount
         if deleted:
             await db.commit()
-            logger.info(f"Cleaned up {deleted} old read notifications (>90 days)")
+            logger.info(
+                "Cleaned up %s old read notifications (>%s days)",
+                deleted,
+                read_retention_days,
+            )
 
-        # 未読でも180日超の通知は削除
-        cutoff_unread = now_jst() - timedelta(days=180)
+        cutoff_unread = now_jst() - timedelta(days=unread_retention_days)
         result2 = await db.execute(
             delete(NotificationLog).where(
+                NotificationLog.is_read == False,
                 NotificationLog.created_at < cutoff_unread,
             )
         )
         deleted2 = result2.rowcount
         if deleted2:
             await db.commit()
-            logger.info(f"Cleaned up {deleted2} very old notifications (>180 days)")
+            logger.info(
+                "Cleaned up %s old unread notifications (>%s days)",
+                deleted2,
+                unread_retention_days,
+            )
 
 
 async def poll_hotpepper_mail_job():

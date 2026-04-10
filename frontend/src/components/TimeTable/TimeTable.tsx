@@ -9,7 +9,6 @@ import DragSelect from './DragSelect';
 const SLOT_HEIGHT = 20;
 const TIME_COL_WIDTH = 60;
 const WEEK_PRACTITIONER_MIN_WIDTH = 64;
-const WEEK_MAX_PRACTITIONERS_PER_DAY = 3;
 const HEADER_HEIGHT = 32;
 const WEEK_HEADER_HEIGHT = 52; // date line + practitioner names line
 
@@ -21,9 +20,12 @@ interface TimeTableProps {
   reschedulingReservation?: Reservation | null;
   onRescheduleSlotClick?: (practitionerId: number, startMinutes: number, date: Date) => void;
   onCancelReschedule?: () => void;
+  isFullscreenMode?: boolean;
+  onToggleFullscreen?: () => void;
+  fullscreenRightControls?: React.ReactNode;
 }
 
-export default function TimeTable({ onSlotClick, onDragSelect, onReservationClick, refreshKey, reschedulingReservation, onRescheduleSlotClick, onCancelReschedule }: TimeTableProps) {
+export default function TimeTable({ onSlotClick, onDragSelect, onReservationClick, refreshKey, reschedulingReservation, onRescheduleSlotClick, onCancelReschedule, isFullscreenMode = false, onToggleFullscreen, fullscreenRightControls }: TimeTableProps) {
   const [allPractitioners, setAllPractitioners] = useState<Practitioner[]>([]);
   const [reservations, setReservations] = useState<Reservation[]>([]);
   const [colors, setColors] = useState<ReservationColor[]>([]);
@@ -31,7 +33,6 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
   const [viewMode, setViewMode] = useState<'day' | 'week'>('week');
   const [enabledPractitionerIds, setEnabledPractitionerIds] = useState<Set<number>>(new Set());
   const [nowMinutes, setNowMinutes] = useState<number>(getNowJSTMinutes);
-  const [containerWidth, setContainerWidth] = useState(1200);
   const [dayStart, setDayStart] = useState(DAY_START);
   const [dayEnd, setDayEnd] = useState(DAY_END);
   const [weeklySchedules, setWeeklySchedules] = useState<WeeklySchedule[]>([]);
@@ -58,15 +59,6 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
   useEffect(() => {
     const timer = setInterval(() => setNowMinutes(getNowJSTMinutes()), 60_000);
     return () => clearInterval(timer);
-  }, []);
-
-  // コンテナ幅を監視
-  useEffect(() => {
-    const el = gridRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver(([entry]) => setContainerWidth(entry.contentRect.width));
-    ro.observe(el);
-    return () => ro.disconnect();
   }, []);
 
   const weekDates = useMemo(() => getWeekDates(currentDate), [currentDate]);
@@ -161,17 +153,8 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     });
   };
 
-  // 週表示で表示可能な施術者数を自動計算
-  const weekVisiblePractitioners = useMemo(() => {
-    if (viewMode !== 'week') return activePractitioners;
-    const availableWidth = containerWidth - TIME_COL_WIDTH;
-    const dayWidth = availableWidth / 7;
-    const maxPerDay = Math.min(
-      WEEK_MAX_PRACTITIONERS_PER_DAY,
-      Math.max(1, Math.floor(dayWidth / WEEK_PRACTITIONER_MIN_WIDTH))
-    );
-    return activePractitioners.slice(0, maxPerDay);
-  }, [viewMode, activePractitioners, containerWidth]);
+  // 週表示でも全アクティブ施術者を表示（横スクロールで対応）
+  const weekVisiblePractitioners = activePractitioners;
 
   const goToday = () => setCurrentDate(getTodayJST());
   const goPrev = () => {
@@ -483,6 +466,16 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
           })}
           <button onClick={() => setViewMode('day')} className={`ml-2 px-3 py-1 text-sm rounded whitespace-nowrap ${viewMode === 'day' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}>日</button>
           <button onClick={() => setViewMode('week')} className={`px-3 py-1 text-sm rounded whitespace-nowrap ${viewMode === 'week' ? 'bg-blue-500 text-white' : 'bg-gray-200'}`}>週</button>
+          {onToggleFullscreen && (
+            <button
+              onClick={onToggleFullscreen}
+              className={`ml-2 px-3 py-1 text-sm rounded whitespace-nowrap ${isFullscreenMode ? 'bg-gray-700 text-white hover:bg-gray-800' : 'bg-indigo-500 text-white hover:bg-indigo-600'}`}
+              title={isFullscreenMode ? '全画面表示を終了' : 'タイムテーブル全画面表示'}
+            >
+              {isFullscreenMode ? '全画面終了' : 'タイムテーブル全画面表示'}
+            </button>
+          )}
+          {fullscreenRightControls}
         </div>
       </div>
 
@@ -492,13 +485,14 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
           /* ===== DAY VIEW ===== */
           <div className="flex">
             {/* Time labels */}
-            <div className="sticky left-0 z-10 bg-white" style={{ minWidth: TIME_COL_WIDTH, borderRight: '1.5px solid #374151' }}>
-              <div style={{ height: HEADER_HEIGHT }} className="border-b bg-gray-50" />
+            <div className="sticky left-0 z-20 bg-white" style={{ minWidth: TIME_COL_WIDTH, borderRight: '1.5px solid #374151' }}>
+              <div style={{ height: HEADER_HEIGHT }} className="sticky top-0 z-30 border-b bg-gray-50" />
               {slots.map((slot) => {
                 const nextMin = slot.minutes + SLOT_INTERVAL;
+                const isHour = slot.minutes % 60 === 0;
                 let borderStyle: string;
                 if (nextMin % 60 === 0) {
-                  borderStyle = '1.75px solid #9ca3af';
+                  borderStyle = '2px solid #6b7280';
                 } else if (nextMin % 30 === 0) {
                   borderStyle = '1.5px solid #b0b7c0';
                 } else if (nextMin % 15 === 0) {
@@ -510,7 +504,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                 return (
                   <div
                     key={slot.minutes}
-                    className={`flex items-center justify-end pr-2 text-xs ${showLabel ? 'text-gray-700 font-medium' : slot.minutes % 15 === 0 ? 'text-gray-500' : 'text-transparent'}`}
+                    className={`flex items-center justify-end pr-2 ${isHour ? 'text-sm text-gray-900 font-bold' : showLabel ? 'text-xs text-gray-700 font-medium' : slot.minutes % 15 === 0 ? 'text-xs text-gray-400' : 'text-xs text-transparent'}`}
                     style={{ height: SLOT_HEIGHT, borderBottom: borderStyle }}
                   >
                     {slot.minutes % 15 === 0 ? slot.label : '.'}
@@ -531,7 +525,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               >
                 <div
                   style={{ height: HEADER_HEIGHT }}
-                  className="flex items-center justify-center text-sm font-medium bg-gray-50 border-b sticky top-0 z-[5]"
+                  className="flex items-center justify-center text-sm font-medium bg-gray-50 border-b sticky top-0 z-[15]"
                 >
                   {p.name}
                 </div>
@@ -544,13 +538,14 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
           /* ===== WEEK VIEW ===== */
           <div className="flex">
             {/* Time labels */}
-            <div className="sticky left-0 z-10 bg-white" style={{ minWidth: TIME_COL_WIDTH, borderRight: '1.5px solid #374151' }}>
-              <div style={{ height: WEEK_HEADER_HEIGHT }} className="border-b bg-gray-50" />
+            <div className="sticky left-0 z-20 bg-white" style={{ minWidth: TIME_COL_WIDTH, borderRight: '1.5px solid #374151' }}>
+              <div style={{ height: WEEK_HEADER_HEIGHT }} className="sticky top-0 z-30 border-b bg-gray-50" />
               {slots.map((slot) => {
                 const nextMin = slot.minutes + SLOT_INTERVAL;
+                const isHour = slot.minutes % 60 === 0;
                 let borderStyle: string;
                 if (nextMin % 60 === 0) {
-                  borderStyle = '1.75px solid #9ca3af';
+                  borderStyle = '2px solid #6b7280';
                 } else if (nextMin % 30 === 0) {
                   borderStyle = '1.5px solid #b0b7c0';
                 } else if (nextMin % 15 === 0) {
@@ -562,7 +557,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                 return (
                   <div
                     key={slot.minutes}
-                    className={`flex items-center justify-end pr-2 text-xs ${showLabel ? 'text-gray-700 font-medium' : slot.minutes % 15 === 0 ? 'text-gray-500' : 'text-transparent'}`}
+                    className={`flex items-center justify-end pr-2 ${isHour ? 'text-sm text-gray-900 font-bold' : showLabel ? 'text-xs text-gray-700 font-medium' : slot.minutes % 15 === 0 ? 'text-xs text-gray-400' : 'text-xs text-transparent'}`}
                     style={{ height: SLOT_HEIGHT, borderBottom: borderStyle }}
                   >
                     {slot.minutes % 15 === 0 ? slot.label : '.'}
@@ -576,24 +571,27 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               const isToday = formatDate(date) === formatDate(getTodayJST());
               return (
                 <div key={`week-${di}`} className="relative" style={{ flex: 1, minWidth: weekVisiblePractitioners.length * WEEK_PRACTITIONER_MIN_WIDTH, borderRight: '1.5px solid #1f2937' }}>
-                  {/* Date header */}
-                  <div
-                    className={`text-center text-xs font-semibold border-b px-1 ${isToday ? 'bg-blue-50 text-blue-700' : 'bg-gray-50 text-gray-700'}`}
-                    style={{ height: 20, lineHeight: '20px' }}
-                  >
-                    {date.getMonth() + 1}/{date.getDate()}({WEEKDAY_LABELS[date.getDay()]})
-                  </div>
-                  {/* Practitioner sub-column headers */}
-                  <div className="flex border-b" style={{ height: WEEK_HEADER_HEIGHT - 20 }}>
-                    {weekVisiblePractitioners.map((p) => (
-                      <div
-                        key={p.id}
-                        className="flex-1 flex items-center justify-center text-xs text-gray-600 bg-gray-50 last:border-r-0 truncate px-0.5"
-                        style={{ minWidth: WEEK_PRACTITIONER_MIN_WIDTH, borderRight: '1px dashed #d1d5db' }}
-                      >
-                        {p.name}
-                      </div>
-                    ))}
+                  {/* Date + Practitioner headers — sticky top */}
+                  <div className={`sticky top-0 z-[15] ${isToday ? 'bg-blue-50' : 'bg-gray-50'}`} style={{ height: WEEK_HEADER_HEIGHT }}>
+                    {/* Date header */}
+                    <div
+                      className={`text-center text-xs font-semibold border-b px-1 ${isToday ? 'text-blue-700' : 'text-gray-700'}`}
+                      style={{ height: 20, lineHeight: '20px' }}
+                    >
+                      {date.getMonth() + 1}/{date.getDate()}({WEEKDAY_LABELS[date.getDay()]})
+                    </div>
+                    {/* Practitioner sub-column headers */}
+                    <div className="flex border-b" style={{ height: WEEK_HEADER_HEIGHT - 20 }}>
+                      {weekVisiblePractitioners.map((p) => (
+                        <div
+                          key={p.id}
+                          className={`flex-1 flex items-center justify-center text-xs text-gray-600 last:border-r-0 truncate px-0.5 ${isToday ? 'bg-blue-50' : 'bg-gray-50'}`}
+                          style={{ minWidth: WEEK_PRACTITIONER_MIN_WIDTH, borderRight: '1px dashed #d1d5db' }}
+                        >
+                          {p.name}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                   {/* Sub-columns body */}
                   <div className="flex">
