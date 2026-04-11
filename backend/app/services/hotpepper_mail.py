@@ -16,6 +16,7 @@ from app.models.menu import Menu
 from app.models.patient import Patient
 from app.models.practitioner import Practitioner
 from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
+from app.models.reservation_color import ReservationColor
 from app.models.reservation import Reservation
 from app.models.setting import Setting
 from app.services.notification_service import create_notification
@@ -33,6 +34,7 @@ FAILED_MID_COUNTS_KEY = "hotpepper_failed_mid_counts"
 MAX_PROCESSED_HASHES = 1000
 MAX_FAILED_TRACKED = 2000
 DEAD_LETTER_RETRY_LIMIT = 3
+HOTPEPPER_FIXED_COLOR_CODE = "#f2740d"
 
 
 @dataclass
@@ -399,6 +401,7 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
         return {"status": "skipped", "reason": "duplicate", "reservation_number": parsed["reservation_number"]}
 
     patient = await _find_or_create_patient(db, parsed["patient_name"])
+    hotpepper_color_id = await _resolve_hotpepper_color_id(db)
 
     # 手動登録済みの同一患者・同一時間枠があれば、HP由来情報をリンクして重複作成しない
     existing_manual = await _find_existing_manual_match(
@@ -410,6 +413,7 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
     if existing_manual:
         existing_manual.source_ref = parsed["reservation_number"]
         existing_manual.hotpepper_synced = True
+        existing_manual.color_id = hotpepper_color_id
         existing_manual.notes = (existing_manual.notes or "") + " / HPメール照合: 手動登録済み予約にリンク"
 
         await create_notification(
@@ -428,7 +432,7 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
             "reservation_number": parsed["reservation_number"],
         }
 
-    menu_id, menu_note = await _match_menu(db, parsed.get("menu_name"))
+    menu_note = f"HPメニュー名: {parsed['menu_name']}" if parsed.get("menu_name") else None
     practitioner_id, prac_note = await _assign_practitioner(
         db,
         parsed.get("practitioner_name"),
@@ -441,7 +445,8 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
     reservation = Reservation(
         patient_id=patient.id,
         practitioner_id=practitioner_id,
-        menu_id=menu_id,
+        menu_id=None,
+        color_id=hotpepper_color_id,
         start_time=parsed["start_time"],
         end_time=parsed["end_time"],
         status="CONFIRMED",
@@ -539,10 +544,9 @@ async def _handle_changed(db: AsyncSession, parsed: dict) -> dict:
     # 変更内容を更新
     reservation.start_time = parsed["start_time"]
     reservation.end_time = parsed["end_time"]
+    reservation.color_id = await _resolve_hotpepper_color_id(db)
 
-    menu_id, menu_note = await _match_menu(db, parsed.get("menu_name"))
-    if menu_id:
-        reservation.menu_id = menu_id
+    menu_note = f"HPメニュー名: {parsed['menu_name']}" if parsed.get("menu_name") else None
 
     practitioner_id, prac_note = await _assign_practitioner(
         db,
@@ -666,12 +670,24 @@ async def _find_existing_manual_match(
     return result.scalar_one_or_none()
 
 
-async def _match_menu(db: AsyncSession, menu_name: Optional[str]) -> tuple[Optional[int], Optional[str]]:
+async def _resolve_hotpepper_color_id(db: AsyncSession) -> Optional[int]:
+    """HotPepper予約に固定適用する色IDを返す。未設定時は None。"""
+    result = await db.execute(
+        select(ReservationColor).where(ReservationColor.color_code == HOTPEPPER_FIXED_COLOR_CODE)
+    )
+    color = result.scalar_one_or_none()
+    if color:
+        return color.id
+    logger.warning("HotPepper固定色が見つかりません: %s", HOTPEPPER_FIXED_COLOR_CODE)
+    return None
+
+
+async def _match_menu(db: AsyncSession, menu_name: Optional[str]) -> tuple[Optional[int], Optional[int], Optional[str]]:
     """メニュー名でシステム内メニューを検索。
-    Returns: (menu_id or None, 不一致時の注記 or None)
+    Returns: (menu_id or None, menu_color_id or None, 不一致時の注記 or None)
     """
     if not menu_name:
-        return None, None
+        return None, None, None
 
     # 完全一致
     result = await db.execute(
@@ -679,7 +695,7 @@ async def _match_menu(db: AsyncSession, menu_name: Optional[str]) -> tuple[Optio
     )
     menu = result.unique().scalar_one_or_none()
     if menu:
-        return menu.id, None
+        return menu.id, menu.color_id, None
 
     # 部分一致: メニュー名がシステム側に含まれるか
     result = await db.execute(
@@ -688,9 +704,9 @@ async def _match_menu(db: AsyncSession, menu_name: Optional[str]) -> tuple[Optio
     menus = result.unique().scalars().all()
     for m in menus:
         if m.name in menu_name or menu_name in m.name:
-            return m.id, None
+            return m.id, m.color_id, None
 
-    return None, f"HPメニュー名: {menu_name}"
+    return None, None, f"HPメニュー名: {menu_name}"
 
 
 async def _is_practitioner_available(
