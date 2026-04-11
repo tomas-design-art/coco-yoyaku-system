@@ -677,7 +677,7 @@ async def _match_menu(db: AsyncSession, menu_name: Optional[str]) -> tuple[Optio
     result = await db.execute(
         select(Menu).where(Menu.name == menu_name, Menu.is_active == True)
     )
-    menu = result.scalar_one_or_none()
+    menu = result.unique().scalar_one_or_none()
     if menu:
         return menu.id, None
 
@@ -685,7 +685,7 @@ async def _match_menu(db: AsyncSession, menu_name: Optional[str]) -> tuple[Optio
     result = await db.execute(
         select(Menu).where(Menu.is_active == True)
     )
-    menus = result.scalars().all()
+    menus = result.unique().scalars().all()
     for m in menus:
         if m.name in menu_name or menu_name in m.name:
             return m.id, None
