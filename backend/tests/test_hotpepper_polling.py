@@ -35,7 +35,7 @@ async def test_poll_hotpepper_mail_once_processes_and_marks_seen():
 
     db = AsyncMock()
     adapter = MagicMock()
-    adapter.fetch_unseen_hotpepper_mails.return_value = [mail]
+    adapter.fetch_hotpepper_mails.return_value = [mail]
 
     with patch("app.services.hotpepper_mail.settings.mail_provider", "icloud-imap"), patch(
         "app.services.hotpepper_mail.settings.icloud_email", "test@icloud.com"
@@ -83,7 +83,7 @@ async def test_poll_hotpepper_mail_once_skips_already_processed_message_id():
 
     db = AsyncMock()
     adapter = MagicMock()
-    adapter.fetch_unseen_hotpepper_mails.return_value = [mail]
+    adapter.fetch_hotpepper_mails.return_value = [mail]
 
     with patch("app.services.hotpepper_mail.settings.mail_provider", "icloud-imap"), patch(
         "app.services.hotpepper_mail.settings.icloud_email", "test@icloud.com"
@@ -128,7 +128,7 @@ async def test_poll_hotpepper_mail_once_dead_letters_after_retry_limit():
 
     db = AsyncMock()
     adapter = MagicMock()
-    adapter.fetch_unseen_hotpepper_mails.return_value = [mail]
+    adapter.fetch_hotpepper_mails.return_value = [mail]
 
     with patch("app.services.hotpepper_mail.settings.mail_provider", "icloud-imap"), patch(
         "app.services.hotpepper_mail.settings.icloud_email", "test@icloud.com"

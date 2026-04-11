@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
@@ -43,7 +43,9 @@ class IMAPAdapter:
     def connect(self) -> None:
         self._client = imaplib.IMAP4_SSL(self.host, self.port)
         self._client.login(self.username, self.password)
-        self._client.select(self.mailbox)
+        typ, data = self._client.select(self.mailbox)
+        if typ != "OK":
+            raise RuntimeError(f"IMAP mailbox select failed for '{self.mailbox}': {data}")
 
     def close(self) -> None:
         if not self._client:
@@ -58,16 +60,25 @@ class IMAPAdapter:
             pass
         self._client = None
 
-    def fetch_unseen_hotpepper_mails(
+    def fetch_hotpepper_mails(
         self,
         sender_filters: list[str],
         *,
         limit: int = 50,
+        search_days: int = 3,
     ) -> list[IMAPFetchedMail]:
+        """過去 search_days 日分のメールを既読/未読問わず取得する。
+
+        UNSEEN ではなく SINCE で検索することで、スタッフが先に開封した
+        メールもシステムが取りこぼさないようにする。
+        BODY.PEEK[] フェッチにより取得しても自動既読にならない。
+        重複処理排除は呼び出し側の Message-ID ハッシュに任せる。
+        """
         if not self._client:
             raise RuntimeError("IMAP client is not connected")
 
-        status, data = self._client.uid("search", None, "UNSEEN")
+        since_date = (datetime.now(tz=timezone.utc) - timedelta(days=search_days)).strftime("%d-%b-%Y")
+        status, data = self._client.uid("search", None, f"SINCE {since_date}")
         if status != "OK":
             logger.warning("IMAP search failed: status=%s", status)
             return []
@@ -75,9 +86,10 @@ class IMAPAdapter:
         uids = data[0].split() if data and data[0] else []
         fetched: list[IMAPFetchedMail] = []
 
-        for uid_b in uids[-limit:]:
+        for uid_b in uids:
             uid = uid_b.decode("utf-8", errors="ignore")
-            status, msg_data = self._client.uid("fetch", uid, "(RFC822)")
+            # BODY.PEEK[] = フェッチしても自動で \Seen フラグが付かない
+            status, msg_data = self._client.uid("fetch", uid, "(BODY.PEEK[])")
             if status != "OK" or not msg_data:
                 continue
 
@@ -111,7 +123,7 @@ class IMAPAdapter:
             )
 
         fetched.sort(key=lambda m: int(m.uid) if m.uid.isdigit() else 0)
-        return fetched
+        return fetched[-limit:]
 
     def mark_seen(self, uid: str) -> None:
         if not self._client:

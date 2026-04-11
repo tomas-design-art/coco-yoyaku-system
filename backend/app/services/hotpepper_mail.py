@@ -176,23 +176,25 @@ async def poll_hotpepper_mail_once() -> dict:
         mailbox=settings.imap_mailbox,
     )
 
-    retries = max(1, settings.hotpepper_poll_max_retries)
+    max_connect_retries = max(1, settings.hotpepper_poll_max_retries)
     base_delay = max(1, settings.hotpepper_poll_retry_base_seconds)
     emails: list[IMAPFetchedMail] = []
     sender_filters = _sender_filters_from_settings()
 
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, max_connect_retries + 1):
         try:
             await asyncio.to_thread(adapter.connect)
             emails = await asyncio.to_thread(
-                adapter.fetch_unseen_hotpepper_mails,
+                adapter.fetch_hotpepper_mails,
                 sender_filters,
                 limit=settings.hotpepper_poll_fetch_limit,
+                search_days=settings.hotpepper_poll_search_days,
             )
             break
         except Exception as e:
-            logger.exception("HotPepper IMAP poll failed (attempt=%s/%s): %s", attempt, retries, e)
-            if attempt >= retries:
+            logger.exception("HotPepper IMAP poll failed (attempt=%s/%s): %s", attempt, max_connect_retries, e)
+            if attempt >= max_connect_retries:
+                await asyncio.to_thread(adapter.close)
                 return {"status": "error", "reason": str(e), "attempts": attempt}
             await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
 
@@ -225,9 +227,9 @@ async def poll_hotpepper_mail_once() -> dict:
                     await asyncio.to_thread(adapter.mark_seen, mail.uid)
                 else:
                     failed += 1
-                    retries = failed_counts.get(mh, 0) + 1
-                    failed_counts[mh] = retries
-                    if retries >= DEAD_LETTER_RETRY_LIMIT:
+                    mail_fail_count = failed_counts.get(mh, 0) + 1
+                    failed_counts[mh] = mail_fail_count
+                    if mail_fail_count >= DEAD_LETTER_RETRY_LIMIT:
                         dead_lettered += 1
                         seen_set.add(mh)
                         logger.error(
@@ -235,7 +237,7 @@ async def poll_hotpepper_mail_once() -> dict:
                             mail.uid,
                             mail.message_id,
                             mh,
-                            retries,
+                            mail_fail_count,
                         )
                         await asyncio.to_thread(adapter.mark_seen, mail.uid)
                         failed_counts.pop(mh, None)
@@ -397,6 +399,35 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
         return {"status": "skipped", "reason": "duplicate", "reservation_number": parsed["reservation_number"]}
 
     patient = await _find_or_create_patient(db, parsed["patient_name"])
+
+    # 手動登録済みの同一患者・同一時間枠があれば、HP由来情報をリンクして重複作成しない
+    existing_manual = await _find_existing_manual_match(
+        db,
+        patient_id=patient.id,
+        start_time=parsed["start_time"],
+        end_time=parsed["end_time"],
+    )
+    if existing_manual:
+        existing_manual.source_ref = parsed["reservation_number"]
+        existing_manual.hotpepper_synced = True
+        existing_manual.notes = (existing_manual.notes or "") + " / HPメール照合: 手動登録済み予約にリンク"
+
+        await create_notification(
+            db,
+            "hotpepper_linked_existing",
+            f"HotPepper照合: 既存予約に紐付け {parsed['patient_name']} "
+            f"{parsed['start_time'].strftime('%m/%d %H:%M')}-{parsed['end_time'].strftime('%H:%M')}",
+            existing_manual.id,
+        )
+
+        await db.commit()
+        return {
+            "status": "skipped",
+            "reason": "linked_existing_manual",
+            "reservation_id": existing_manual.id,
+            "reservation_number": parsed["reservation_number"],
+        }
+
     menu_id, menu_note = await _match_menu(db, parsed.get("menu_name"))
     practitioner_id, prac_note = await _assign_practitioner(
         db,
@@ -421,6 +452,16 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
     )
     db.add(reservation)
     await db.flush()
+
+    await _notify_hotpepper_conflict_risk(
+        db=db,
+        parsed=parsed,
+        reservation_id=reservation.id,
+        practitioner_id=practitioner_id,
+        start_time=parsed["start_time"],
+        end_time=parsed["end_time"],
+        practitioner_note=prac_note,
+    )
 
     logger.info(f"予約作成: id={reservation.id}, source_ref={parsed['reservation_number']}")
 
@@ -514,6 +555,16 @@ async def _handle_changed(db: AsyncSession, parsed: dict) -> dict:
     notes = _build_notes(parsed, menu_note, prac_note, prefix="HotPepper変更予約")
     reservation.notes = notes
 
+    await _notify_hotpepper_conflict_risk(
+        db=db,
+        parsed=parsed,
+        reservation_id=reservation.id,
+        practitioner_id=practitioner_id,
+        start_time=parsed["start_time"],
+        end_time=parsed["end_time"],
+        practitioner_note=prac_note,
+    )
+
     logger.info(f"予約変更: id={reservation.id}, source_ref={ref}")
 
     await create_notification(
@@ -550,6 +601,39 @@ def _build_notes(parsed: dict, menu_note: str | None, prac_note: str | None,
     return " / ".join(parts)
 
 
+async def _notify_hotpepper_conflict_risk(
+    db: AsyncSession,
+    parsed: dict,
+    reservation_id: int,
+    practitioner_id: int,
+    start_time: datetime,
+    end_time: datetime,
+    practitioner_note: str | None,
+):
+    """予約バッティングの可能性がある場合に通知を作成する。"""
+    conflicts = await check_conflict(db, practitioner_id, start_time, end_time)
+    has_conflict = len(conflicts) > 0
+    fallback_warning = bool(practitioner_note and ("空きがない" in practitioner_note or "空き判定" in practitioner_note))
+
+    if not has_conflict and not fallback_warning:
+        return
+
+    detail_parts: list[str] = []
+    if has_conflict:
+        detail_parts.append(f"重複候補{len(conflicts)}件")
+    if fallback_warning:
+        detail_parts.append(practitioner_note)
+
+    await create_notification(
+        db,
+        "hotpepper_conflict",
+        f"予約バッティング注意: {parsed.get('patient_name') or '(氏名不明)'} "
+        f"{start_time.strftime('%m/%d %H:%M')}-{end_time.strftime('%H:%M')} "
+        f"({', '.join(detail_parts)})",
+        reservation_id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # ヘルパー
 # ---------------------------------------------------------------------------
@@ -559,6 +643,27 @@ async def _find_or_create_patient(db: AsyncSession, name: str) -> Patient:
     """患者を名前で検索（チャネル横断マッチング）。見つからなければ新規作成。"""
     from app.services.patient_match import find_or_create_patient
     return await find_or_create_patient(db, name=name)
+
+
+async def _find_existing_manual_match(
+    db: AsyncSession,
+    patient_id: int,
+    start_time: datetime,
+    end_time: datetime,
+) -> Reservation | None:
+    """同一患者・同一時間枠の既存予約を検索（HOTPEPPER未連携の手動予約優先）。"""
+    result = await db.execute(
+        select(Reservation)
+        .where(
+            Reservation.patient_id == patient_id,
+            Reservation.start_time == start_time,
+            Reservation.end_time == end_time,
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+            Reservation.source_ref.is_(None),
+        )
+        .order_by(Reservation.id.desc())
+    )
+    return result.scalar_one_or_none()
 
 
 async def _match_menu(db: AsyncSession, menu_name: Optional[str]) -> tuple[Optional[int], Optional[str]]:
