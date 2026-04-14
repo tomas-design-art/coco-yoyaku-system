@@ -10,6 +10,7 @@ import {
 } from '../api/client';
 import { extractErrorMessage } from '../utils/errorUtils';
 import { generate5MinOptions } from '../utils/timeUtils';
+import { normalizeSearchText } from '../utils/normalizeUtils';
 
 interface ReservationDetailProps {
   reservation: Reservation;
@@ -113,7 +114,20 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
   };
 
   const filteredPatients = patientSearch.length > 0
-    ? patients.filter(p => p.name.includes(patientSearch) || (p.patient_number && p.patient_number.includes(patientSearch)))
+    ? (() => {
+      const nq = normalizeSearchText(patientSearch);
+      return patients.filter(p => {
+        const nName = normalizeSearchText(p.name);
+        const nReading = normalizeSearchText(p.reading ?? '');
+        const nKana = normalizeSearchText(
+          [p.last_name_kana, p.first_name_kana].filter(Boolean).join(' ')
+        );
+        return nName.includes(nq)
+          || nReading.includes(nq)
+          || nKana.includes(nq)
+          || (p.patient_number && p.patient_number.includes(patientSearch));
+      });
+    })()
     : [];
 
   const handleSaveEdit = async () => {
@@ -269,8 +283,8 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
                             type="button"
                             onClick={() => setEditSelectedDuration(opt.duration)}
                             className={`px-2 py-1 rounded text-xs border transition-colors ${isActive
-                                ? 'bg-blue-500 text-white border-blue-500'
-                                : 'bg-white text-gray-700 border-gray-300 hover:border-blue-400'
+                              ? 'bg-blue-500 text-white border-blue-500'
+                              : 'bg-white text-gray-700 border-gray-300 hover:border-blue-400'
                               }`}
                           >
                             {opt.duration}分{opt.price != null && opt.price > 0 ? ` ¥${opt.price.toLocaleString()}` : ''}

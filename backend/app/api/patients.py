@@ -11,6 +11,7 @@ from app.schemas.patient import (
     PatientCreate, PatientUpdate, PatientResponse, PatientPageResponse,
     CandidateQuery, CandidateResponse, PatientPurgeRequest, _normalize_phone, build_name,
 )
+from app.utils.normalize import normalize_search_text, HIRA_CHARS, KATA_CHARS
 
 router = APIRouter(prefix="/api/patients", tags=["patients"])
 
@@ -22,6 +23,11 @@ def _normalize_for_compare(s: str | None) -> str:
     s = s.replace("\u3000", " ")
     s = re.sub(r"\s+", " ", s)
     return s.strip().lower()
+
+
+def _sql_kana_normalize(col):
+    """SQLカラムのひらがな→カタカナ変換 + lower (PostgreSQL translate)"""
+    return func.lower(func.translate(col, HIRA_CHARS, KATA_CHARS))
 
 
 async def _generate_patient_number(db: AsyncSession) -> str:
@@ -44,8 +50,13 @@ async def search_patients(
     include_inactive: bool = Query(False),
     db: AsyncSession = Depends(get_db),
 ):
-    """名前・読み方・診察券番号・電話番号で部分一致検索(active only)"""
+    """名前・読み方・診察券番号・電話番号で部分一致検索(active only)
+
+    ひらがな/カタカナ/半角カナを正規化して検索するため、
+    「やまだ」「ヤマダ」「ﾔﾏﾀﾞ」のいずれでもヒットする。
+    """
     normalized_q = _normalize_for_compare(q)
+    kana_q = normalize_search_text(q)  # ひらがな→カタカナ, 半角→全角 統一
     phone_q = _normalize_phone(q) or q
     active_filter = True if include_inactive else Patient.is_active == True
     result = await db.execute(
@@ -59,6 +70,10 @@ async def search_patients(
                     Patient.reading.ilike(f"%{normalized_q}%"),
                     Patient.last_name_kana.ilike(f"%{normalized_q}%"),
                     Patient.first_name_kana.ilike(f"%{normalized_q}%"),
+                    # カナ正規化検索: ひらがな⇔カタカナを統一して比較
+                    _sql_kana_normalize(Patient.reading).contains(kana_q),
+                    _sql_kana_normalize(Patient.last_name_kana).contains(kana_q),
+                    _sql_kana_normalize(Patient.first_name_kana).contains(kana_q),
                     Patient.patient_number.ilike(f"%{q}%"),
                     Patient.phone.ilike(f"%{phone_q}%"),
                 ),
@@ -84,6 +99,7 @@ async def find_candidates(data: CandidateQuery, db: AsyncSession = Depends(get_d
         return []
 
     reading_q = _normalize_for_compare(data.reading) if data.reading else None
+    reading_kana_q = normalize_search_text(data.reading) if data.reading else None
     phone_q = _normalize_phone(data.phone) if data.phone else None
 
     # 広範囲でOR検索
@@ -99,6 +115,11 @@ async def find_candidates(data: CandidateQuery, db: AsyncSession = Depends(get_d
         conditions.append(
             func.lower(func.replace(func.replace(Patient.reading, "\u3000", " "), " ", ""))
                 .ilike(f"%{reading_q.replace(' ', '')}%")
+        )
+    if reading_kana_q:
+        conditions.append(
+            func.replace(_sql_kana_normalize(Patient.reading), " ", "")
+                .contains(reading_kana_q.replace(" ", ""))
         )
     if phone_q:
         conditions.append(
@@ -139,15 +160,16 @@ async def find_candidates(data: CandidateQuery, db: AsyncSession = Depends(get_d
             elif query_name_nospace and query_name_nospace in p_full_nospace:
                 reasons.append("氏名部分一致")
 
-        # 読み方一致
-        if reading_q:
-            p_reading = _normalize_for_compare(p.reading)
-            p_kana = _normalize_for_compare(
+        # 読み方一致 (カナ正規化で比較)
+        if reading_kana_q:
+            p_reading_k = normalize_search_text(p.reading).replace(" ", "")
+            p_kana_k = normalize_search_text(
                 f"{p.last_name_kana or ''} {p.first_name_kana or ''}".strip()
-            )
-            if p_reading and reading_q.replace(" ", "") == p_reading.replace(" ", ""):
+            ).replace(" ", "")
+            rq = reading_kana_q.replace(" ", "")
+            if p_reading_k and rq == p_reading_k:
                 reasons.append("読み方一致")
-            elif p_kana and reading_q.replace(" ", "") == p_kana.replace(" ", ""):
+            elif p_kana_k and rq == p_kana_k:
                 reasons.append("読み方一致")
 
         # 電話番号一致
