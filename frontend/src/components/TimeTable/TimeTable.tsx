@@ -521,6 +521,22 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
           const adjustedEndMin = isTarget ? endMin + rescheduleDurationOffset : endMin;
           const height = ((adjustedEndMin - startMin) / SLOT_INTERVAL) * SLOT_HEIGHT;
           const originalDuration = Math.round((new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 60000);
+          const targetDate = pendingRescheduleTarget?.date ?? new Date(r.start_time);
+          const targetPractitionerId = pendingRescheduleTarget?.practitionerId ?? r.practitioner_id;
+          const targetStartMin = pendingRescheduleTarget?.startMinutes ?? startMin;
+          const currentDurationMin = originalDuration + rescheduleDurationOffset;
+          const nextDurationMin = currentDurationMin + 10;
+          const plusEndMin = targetStartMin + nextDurationMin;
+          const plusExceedsDayEnd = plusEndMin > dayEnd;
+          const plusWouldConflict = isTarget
+            ? getReservationsForColumn(targetPractitionerId, targetDate).some((other) => {
+              if (other.id === r.id) return false;
+              const otherStart = dateToMinutes(other.start_time);
+              const otherEnd = dateToMinutes(other.end_time);
+              return targetStartMin < otherEnd && plusEndMin > otherStart;
+            })
+            : false;
+          const disablePlus = plusExceedsDayEnd || plusWouldConflict;
           return (
             <div
               key={r.id}
@@ -583,8 +599,9 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                   <button
                     type="button"
                     onClick={(e) => { e.stopPropagation(); onRescheduleDurationChange(+10); }}
-                    className="w-7 h-7 flex items-center justify-center rounded-full bg-white/90 text-green-600 font-bold text-lg shadow border border-green-300 hover:bg-green-50 active:scale-90 transition-transform"
-                    title="+10分"
+                    disabled={disablePlus}
+                    className="w-7 h-7 flex items-center justify-center rounded-full bg-white/90 text-green-600 font-bold text-lg shadow border border-green-300 hover:bg-green-50 disabled:opacity-30 disabled:cursor-not-allowed active:scale-90 transition-transform"
+                    title={disablePlus ? '他予約との重複または営業時間外のため延長できません' : '+10分'}
                   >
                     ⊕
                   </button>

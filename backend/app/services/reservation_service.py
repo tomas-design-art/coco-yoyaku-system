@@ -486,6 +486,17 @@ async def reschedule_reservation(
         db, practitioner_id, new_start_time, new_end_time,
         exclude_reservation_id=reservation_id,
     )
+    if conflicts:
+        conflict_names = []
+        for c in conflicts:
+            name = c.patient.name if c.patient else "不明"
+            conflict_names.append(
+                f"{name}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})"
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=f"予約が競合しています: {', '.join(conflict_names)}",
+        )
 
     # 変更ログ作成
     old_date_str = reservation.start_time.strftime("%Y/%m/%d %H:%M")
@@ -503,17 +514,7 @@ async def reschedule_reservation(
     reservation.end_time = new_end_time
     reservation.practitioner_id = practitioner_id
 
-    # 競合があればconflict_noteを設定
-    if conflicts:
-        conflict_names = []
-        for c in conflicts:
-            name = c.patient.name if c.patient else "不明"
-            conflict_names.append(
-                f"{name}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})"
-            )
-        reservation.conflict_note = "競合: " + ", ".join(conflict_names)
-    else:
-        reservation.conflict_note = None
+    reservation.conflict_note = None
 
     await create_notification(
         db, "reservation_changed",
