@@ -564,7 +564,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               {/* ⊖ / ⊕ duration adjust buttons on the target bar */}
               {isTarget && onRescheduleDurationChange && (
                 <div
-                  className="absolute bottom-1 left-1/2 -translate-x-1/2 flex items-center gap-1"
+                  className="absolute bottom-1 left-1/2 -translate-x-1/2 flex flex-col items-center gap-0.5"
                   style={{ zIndex: 40 }}
                   onClick={(e) => e.stopPropagation()}
                 >
