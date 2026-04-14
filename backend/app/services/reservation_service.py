@@ -72,9 +72,8 @@ async def determine_status(
     db: AsyncSession, data: ReservationCreate
 ) -> str:
     """自動確定判定"""
-    # 全条件チェック
-    if not data.menu_id:
-        return "PENDING"
+    # メニュー未選択は仮予約条件にしない。
+    # 手入力運用ではメニュー後追い編集を許容しつつ、競合がなければ確定扱いにする。
     if not data.practitioner_id:
         return "PENDING"
 
