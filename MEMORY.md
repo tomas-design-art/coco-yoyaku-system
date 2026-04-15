@@ -124,3 +124,19 @@
 - **修正箇所**: `reservations.py` の全ステータス遷移EP + `update_reservation`、`reservation_service.py` の `create_reservation` + `handle_change_request`
 - **追加修正**: `conflict_detector.py` の競合検出クエリに `selectinload(Reservation.patient)` を追加（conflict_note 生成時に `c.patient.name` にアクセスするため）
 - **教訓**: async SQLAlchemy では `db.refresh(obj, [relation_names])` は危険。`commit()` 後は常に `selectinload` 付き再クエリを使うこと。`db.refresh(obj)` （引数なし）は全スカラーを再ロードするので安全だが、リレーションは含まない
+
+### タイムテーブル空表示 + 新規登録不可（2026-04-16）
+- **現象**: タイムテーブルが空表示になり、予約一覧取得・新規登録が失敗
+- **直接原因**: `reservations.series_id` を参照するコードが先に入ったが、DB側に `series_id` カラムがない状態で稼働
+- **根本原因**: Alembic `019_reservation_series.py` の revision chain 不整合
+  - 誤: `revision = "019"`, `down_revision = "018"`
+  - 正: `revision = "019_reservation_series"`, `down_revision = "018_menu_price_tiers"`
+- **二次要因**: DBに `reservation_series` テーブルは存在したが `alembic_version` が追随しておらず、upgrade時に `DuplicateTableError` が発生
+- **復旧手順（実施済み）**:
+  1. 019のrevision ID/down_revisionを修正
+  2. 019を冪等化（既存テーブル/カラムを存在チェックしてから作成）
+  3. `alembic stamp 018_menu_price_tiers` 後に `alembic upgrade head`
+  4. API応答確認: `/api/reservations/?date=...` が 200で返ることを確認
+- **再発防止**:
+  - Alembic revision chain の整合性テストを追加（未知の `down_revision` をCIで即検出）
+  - 新規migration追加時は「DB upgrade head」と「一覧API 200確認」を同一作業で必ず実施
