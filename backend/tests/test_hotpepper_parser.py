@@ -543,7 +543,7 @@ class TestPatientNameReading:
     """氏名の（カタカナ）読み抽出"""
 
     def test_reading_extracted(self):
-        """全角カッコ内のカタカナを reading に抽出"""
+        """全角カッコ内のカタカナをひらがな変換して reading に抽出"""
         body = (
             "■予約番号\n　BE77777\n"
             "■氏名\n　井戸 貴之（イド タカユキ）\n"
@@ -551,10 +551,10 @@ class TestPatientNameReading:
         )
         result = parse_hotpepper_mail(body)
         assert result["patient_name"] == "井戸 貴之"
-        assert result["patient_reading"] == "イド タカユキ"
+        assert result["patient_reading"] == "いど たかゆき"
 
     def test_reading_half_width_parens(self):
-        """半角カッコでも読み抽出できる"""
+        """半角カッコでもひらがな変換して読み抽出できる"""
         body = (
             "■予約番号\n　BE77778\n"
             "■氏名\n　山田 太郎(ヤマダ タロウ)\n"
@@ -562,7 +562,7 @@ class TestPatientNameReading:
         )
         result = parse_hotpepper_mail(body)
         assert result["patient_name"] == "山田 太郎"
-        assert result["patient_reading"] == "ヤマダ タロウ"
+        assert result["patient_reading"] == "やまだ たろう"
 
     def test_no_reading(self):
         """カッコなし→ reading は None"""

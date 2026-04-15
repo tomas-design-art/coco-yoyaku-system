@@ -114,6 +114,17 @@ def parse_hotpepper_mail(raw_email: str) -> dict:
         reading_m = re.search(r'[（(]\s*([\u30A0-\u30FF\u3000\s]+?)\s*[）)]', patient_name)
         if reading_m:
             patient_reading = reading_m.group(1).strip()
+            # カタカナ→ひらがな変換（運用統一）
+            patient_reading = patient_reading.translate(
+                str.maketrans(
+                    "ァアィイゥウェエォオカガキギクグケゲコゴサザシジスズセゼソゾ"
+                    "タダチヂッツヅテデトドナニヌネノハバパヒビピフブプヘベペホボポ"
+                    "マミムメモャヤュユョヨラリルレロヮワヰヱヲンヴヵヶ",
+                    "ぁあぃいぅうぇえぉおかがきぎくぐけげこごさざしじすずせぜそぞ"
+                    "ただちぢっつづてでとどなにぬねのはばぱひびぴふぶぷへべぺほぼぽ"
+                    "まみむめもゃやゅゆょよらりるれろゎわゐゑをんゔゕゖ",
+                )
+            )
             patient_name = re.sub(r'\s*[（(]\s*[\u30A0-\u30FF\u3000\s]+?\s*[）)]', '', patient_name).strip()
 
     # ── 来店日時 (必須) ──
