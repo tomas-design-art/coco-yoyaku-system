@@ -214,15 +214,17 @@ async def list_patients(
     total = total_result.scalar() or 0
 
     sort_col = {
-        "name": Patient.name,
+        "name": Patient.reading,
         "patient_number": Patient.patient_number,
         "created_at": Patient.created_at,
     }[sort_by]
     order = sort_col.asc() if sort_order == "asc" else sort_col.desc()
+    # reading が NULL の場合は末尾に回す
+    nulls_order = sort_col.asc().nulls_last() if sort_order == "asc" else sort_col.desc().nulls_first()
 
     offset = (page - 1) * per_page
     result = await db.execute(
-        select(Patient).where(base_filter).order_by(order).offset(offset).limit(per_page)
+        select(Patient).where(base_filter).order_by(nulls_order).offset(offset).limit(per_page)
     )
     items = result.scalars().all()
     return PatientPageResponse(items=items, total=total, page=page, per_page=per_page)

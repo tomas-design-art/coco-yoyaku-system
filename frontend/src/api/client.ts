@@ -34,6 +34,7 @@ import type {
 
 // @ts-ignore
 const baseURL = import.meta.env.VITE_API_URL || '/api';
+export const apiBaseURL = baseURL;
 
 const api = axios.create({
   baseURL: baseURL,

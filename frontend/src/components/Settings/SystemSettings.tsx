@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Save, KeyRound, Lock, Upload, FileDown, Trash2, AlertTriangle } from 'lucide-react';
 import type { Setting } from '../../types';
-import { getSettings, updateSetting, changePin, changePassword, resetOperationalData } from '../../api/client';
+import { getSettings, updateSetting, changePin, changePassword, resetOperationalData, apiBaseURL } from '../../api/client';
 import { extractErrorMessage } from '../../utils/errorUtils';
 import PatientImport from '../PatientImport';
 
@@ -220,14 +220,14 @@ export default function SystemSettings() {
             <Upload size={16} /> CSV / Excel を取り込む
           </button>
           <a
-            href="/api/patients/import/template/csv"
+            href={`${apiBaseURL}/patients/import/template/csv`}
             download
             className="flex items-center gap-2 px-4 py-2 border border-gray-300 text-gray-700 text-sm rounded hover:bg-gray-50"
           >
             <FileDown size={16} /> CSV テンプレート
           </a>
           <a
-            href="/api/patients/import/template/xlsx"
+            href={`${apiBaseURL}/patients/import/template/xlsx`}
             download
             className="flex items-center gap-2 px-4 py-2 border border-gray-300 text-gray-700 text-sm rounded hover:bg-gray-50"
           >

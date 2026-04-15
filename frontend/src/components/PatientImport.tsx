@@ -1,7 +1,7 @@
 import { useState, useRef } from 'react';
 import { Upload, X, ChevronRight, ChevronLeft, Check, AlertTriangle, Download, UserCheck, RefreshCw, SkipForward } from 'lucide-react';
 import type { ImportPreviewResponse, ImportExecuteResponse, ImportDuplicate, RowAction } from '../types';
-import { importPreview, importExecute } from '../api/client';
+import { importPreview, importExecute, apiBaseURL } from '../api/client';
 import { extractErrorMessage } from '../utils/errorUtils';
 
 interface Props {
@@ -154,14 +154,14 @@ export default function PatientImport({ onClose, onComplete }: Props) {
                                 <p className="text-xs text-gray-400 mb-2 text-center">テンプレートをダウンロード</p>
                                 <div className="flex justify-center gap-3">
                                     <a
-                                        href="/api/patients/import/template/csv"
+                                        href={`${apiBaseURL}/patients/import/template/csv`}
                                         download
                                         className="flex items-center gap-1 px-3 py-1.5 text-xs border rounded hover:bg-gray-50 text-gray-600"
                                     >
                                         <Download size={12} /> CSV テンプレート
                                     </a>
                                     <a
-                                        href="/api/patients/import/template/xlsx"
+                                        href={`${apiBaseURL}/patients/import/template/xlsx`}
                                         download
                                         className="flex items-center gap-1 px-3 py-1.5 text-xs border rounded hover:bg-gray-50 text-gray-600"
                                     >
