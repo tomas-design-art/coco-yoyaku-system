@@ -185,10 +185,20 @@ export default function PatientList() {
     e.preventDefault();
     setError(null);
 
-    // 新規登録時: 候補がある場合は確認を必須にする
+    // 新規登録時: 同姓同名候補がある場合
     if (!editingId && candidates.length > 0 && !confirmNew) {
+      // 同姓同名 + 電話番号 or 生年月日一致 → 同一患者 → 登録ブロック
+      const identicalPatient = candidates.find((c) => {
+        const hasNameMatch = c.match_reasons.some((r) => r === '姓名一致' || r === '氏名一致');
+        const hasExtraMatch = c.match_reasons.some((r) => r === '電話番号一致' || r === '生年月日一致');
+        return hasNameMatch && hasExtraMatch;
+      });
+      if (identicalPatient) {
+        alert('同一患者が既に登録されています。そちらのデータをお使いください。');
+        return;
+      }
       setShowCandidates(true);
-      setError('既存患者候補があります。候補を確認してください。');
+      setError('同姓同名の既存患者がいます。候補を確認してください。');
       return;
     }
 
@@ -505,7 +515,19 @@ export default function PatientList() {
                   </div>
                 ))}
               </div>
-              <button type="button" onClick={() => { setConfirmNew(true); setShowCandidates(false); }}
+              <button type="button" onClick={() => {
+                // 同姓同名 + 電話番号/生年月日一致がある場合はブロック
+                const identicalPatient = candidates.find((c) => {
+                  const hasNameMatch = c.match_reasons.some((r) => r === '姓名一致' || r === '氏名一致');
+                  const hasExtraMatch = c.match_reasons.some((r) => r === '電話番号一致' || r === '生年月日一致');
+                  return hasNameMatch && hasExtraMatch;
+                });
+                if (identicalPatient) {
+                  alert('同一患者が既に登録されています。そちらのデータをお使いください。');
+                  return;
+                }
+                setConfirmNew(true); setShowCandidates(false);
+              }}
                 className="text-sm text-gray-600 underline hover:text-gray-800">
                 それでも新規登録する
               </button>

@@ -98,29 +98,13 @@ async def find_candidates(data: CandidateQuery, db: AsyncSession = Depends(get_d
     if not query_name_nospace:
         return []
 
-    reading_q = _normalize_for_compare(data.reading) if data.reading else None
-    reading_kana_q = normalize_search_text(data.reading) if data.reading else None
     phone_q = _normalize_phone(data.phone) if data.phone else None
 
-    # 広範囲でOR検索
+    # 氏名完全一致で検索（同姓同名のみ検出）
     conditions = [
         func.lower(func.replace(func.replace(Patient.name, "\u3000", " "), " ", ""))
-            .ilike(f"%{query_name_nospace}%"),
+            == query_name_nospace,
     ]
-    if data.registration_mode == "split" and data.last_name:
-        conditions.append(
-            func.lower(func.trim(Patient.last_name)) == _normalize_for_compare(data.last_name)
-        )
-    if reading_q:
-        conditions.append(
-            func.lower(func.replace(func.replace(Patient.reading, "\u3000", " "), " ", ""))
-                .ilike(f"%{reading_q.replace(' ', '')}%")
-        )
-    if reading_kana_q:
-        conditions.append(
-            func.replace(_sql_kana_normalize(Patient.reading), " ", "")
-                .contains(reading_kana_q.replace(" ", ""))
-        )
     if phone_q:
         conditions.append(
             func.replace(func.replace(Patient.phone, "-", ""), "ー", "") == phone_q
@@ -144,51 +128,34 @@ async def find_candidates(data: CandidateQuery, db: AsyncSession = Depends(get_d
         p_ln = _normalize_for_compare(p.last_name)
         p_fn = _normalize_for_compare(p.first_name)
 
-        # 氏名一致判定
+        # 氏名一致判定（同姓同名のみ）
+        name_match = False
         if data.registration_mode == "split":
             ln = _normalize_for_compare(data.last_name)
             fn = _normalize_for_compare(data.first_name)
             if p_ln == ln and p_fn == fn:
                 reasons.append("姓名一致")
+                name_match = True
             elif p_full_nospace == query_name_nospace:
                 reasons.append("氏名一致")
-            elif p_ln == ln:
-                reasons.append("姓一致")
+                name_match = True
         else:
             if p_full_nospace == query_name_nospace:
                 reasons.append("氏名一致")
-            elif query_name_nospace and query_name_nospace in p_full_nospace:
-                reasons.append("氏名部分一致")
-
-        # 読み方一致 (カナ正規化で比較)
-        if reading_kana_q:
-            p_reading_k = normalize_search_text(p.reading).replace(" ", "")
-            p_kana_k = normalize_search_text(
-                f"{p.last_name_kana or ''} {p.first_name_kana or ''}".strip()
-            ).replace(" ", "")
-            rq = reading_kana_q.replace(" ", "")
-            if p_reading_k and rq == p_reading_k:
-                reasons.append("読み方一致")
-            elif p_kana_k and rq == p_kana_k:
-                reasons.append("読み方一致")
+                name_match = True
 
         # 電話番号一致
         if phone_q and p.phone:
             if _normalize_phone(p.phone) == phone_q:
-                if not reasons:
-                    reasons.append("電話番号一致")
-                else:
-                    reasons.append("電話番号一致")
+                reasons.append("電話番号一致")
 
         # 生年月日一致
         if data.birth_date and p.birth_date:
             if p.birth_date == data.birth_date:
-                if not reasons:
-                    reasons.append("生年月日一致")
-                else:
-                    reasons.append("生年月日一致")
+                reasons.append("生年月日一致")
 
-        if reasons:
+        # 同姓同名の場合のみ候補として返す（電話番号のみ一致は対象外）
+        if name_match and reasons:
             responses.append(CandidateResponse(
                 patient=PatientResponse.model_validate(p),
                 match_reasons=reasons,
