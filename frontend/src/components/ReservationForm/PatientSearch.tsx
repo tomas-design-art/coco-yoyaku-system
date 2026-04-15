@@ -156,7 +156,7 @@ export default function PatientSearch({ onSelect, selectedName }: PatientSearchP
             setQuery(e.target.value);
             if (selectedName) onSelect({ id: 0, name: '' } as Patient);
           }}
-          placeholder="名前・カナ・診察券番号・電話番号で検索"
+          placeholder="名前・カナ・電話番号で検索"
           className="w-full border rounded pl-9 pr-3 py-2 text-sm"
         />
       </div>

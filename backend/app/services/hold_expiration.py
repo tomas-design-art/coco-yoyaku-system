@@ -1,4 +1,4 @@
-"""HOLD自動失効ジョブ + チャットセッション自動expire + HP枠押さえリマインド + 通知ログ自動削除"""
+"""HOLD自動失効ジョブ + チャットセッション自動expire + HP枠押さえリマインド + 通知ログ自動削除 + シリーズ残り通知"""
 import logging
 from datetime import timedelta
 
@@ -9,6 +9,7 @@ from sqlalchemy.orm import selectinload
 from app.config import settings
 from app.database import async_session
 from app.models.reservation import Reservation
+from app.models.reservation_series import ReservationSeries
 from app.models.chat_session import ChatSession
 from app.models.notification_log import NotificationLog
 from app.services.notification_service import create_notification
@@ -170,6 +171,60 @@ async def poll_hotpepper_mail_job():
         )
 
 
+async def check_series_expiration():
+    """繰り返し予約シリーズの残り回数をチェックし、残り3回以下で通知を生成"""
+    async with async_session() as db:
+        now = now_jst()
+        result = await db.execute(
+            select(ReservationSeries)
+            .where(
+                ReservationSeries.is_active == True,
+                ReservationSeries.notified_at == None,
+            )
+            .options(
+                selectinload(ReservationSeries.patient),
+                selectinload(ReservationSeries.practitioner),
+            )
+        )
+        series_list = result.scalars().all()
+
+        notified_count = 0
+        for series in series_list:
+            # 未来の予約数を実際にカウント
+            future_result = await db.execute(
+                select(Reservation).where(
+                    Reservation.series_id == series.id,
+                    Reservation.start_time > now,
+                    Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+                )
+            )
+            future_count = len(future_result.scalars().all())
+            series.remaining_count = future_count
+
+            if future_count <= 3:
+                patient_name = series.patient.name if series.patient else "不明"
+                practitioner_name = series.practitioner.name if series.practitioner else "不明"
+                await create_notification(
+                    db,
+                    "series_expiring",
+                    f"繰り返し予約残り{future_count}回: "
+                    f"{patient_name}様 ({practitioner_name} / {series.frequency}) "
+                    f"— 延長・変更・キャンセルを選択してください",
+                    extra_data={"series_id": series.id},
+                )
+                series.notified_at = now
+                notified_count += 1
+                logger.info(
+                    "Series #%s expiring: %s remaining for patient %s",
+                    series.id, future_count, patient_name,
+                )
+
+        if notified_count > 0 or any(True for _ in series_list):
+            await db.commit()
+            if notified_count:
+                logger.info("Notified %s expiring series", notified_count)
+
+
 def start_hold_expiration_job():
     scheduler.add_job(expire_holds, "interval", minutes=1, id="hold_expiration")
     scheduler.add_job(expire_chat_sessions, "interval", minutes=10, id="chat_session_expiration")
@@ -181,9 +236,10 @@ def start_hold_expiration_job():
         id="hotpepper_mail_poll",
     )
     scheduler.add_job(cleanup_old_notifications, "cron", hour=3, minute=0, id="notification_cleanup")
+    scheduler.add_job(check_series_expiration, "cron", hour=9, minute=0, id="series_expiration_check")
     scheduler.start()
     logger.info(
-        "Background jobs started (HOLD expiration, chat session expiration, HP sync reminder, HotPepper mail poll, notification cleanup)"
+        "Background jobs started (HOLD expiration, chat session expiration, HP sync reminder, HotPepper mail poll, notification cleanup, series expiration check)"
     )
 
 

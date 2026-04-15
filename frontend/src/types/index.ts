@@ -214,6 +214,42 @@ export interface BulkReservationResult {
   total_requested: number;
   created_count: number;
   skipped: { date: string; reason: string }[];
+  series_id?: number;
+}
+
+// --- シリーズ管理 ---
+
+export interface SeriesResponse {
+  id: number;
+  patient_id: number | null;
+  patient_name: string | null;
+  practitioner_id: number;
+  practitioner_name: string | null;
+  menu_id: number | null;
+  menu_name: string | null;
+  start_time: string;
+  duration_minutes: number;
+  frequency: string;
+  channel: string;
+  remaining_count: number;
+  total_created: number;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface SeriesExtendRequest {
+  count: number;
+}
+
+export interface SeriesModifyRequest {
+  practitioner_id?: number;
+  menu_id?: number;
+  color_id?: number;
+  start_time?: string;
+  duration_minutes?: number;
+  frequency?: string;
+  count?: number;
+  cancel_remaining?: boolean;
 }
 
 export interface ConflictingReservation {

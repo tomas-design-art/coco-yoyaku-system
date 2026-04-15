@@ -165,7 +165,7 @@ class BulkReservationCreate(BaseModel):
     frequency: Literal["weekly", "biweekly", "monthly"] = "weekly"
     start_date: date       # 初回日
     end_date: Optional[date] = None
-    count: Optional[int] = None  # end_date or count のどちらかを指定
+    count: Optional[int] = None  # end_date or count のどちらかを指定（最大3か月分）
 
     @field_validator("channel")
     @classmethod
@@ -175,11 +175,66 @@ class BulkReservationCreate(BaseModel):
             raise ValueError(f"channel は {valid} のいずれかにしてください")
         return v
 
+    @field_validator("count")
+    @classmethod
+    def validate_count(cls, v: int | None) -> int | None:
+        if v is not None and v > 13:
+            raise ValueError("繰り返し回数は最大13回（約3か月）までです")
+        return v
+
 
 class BulkReservationResult(BaseModel):
     total_requested: int
     created_count: int
     skipped: list[dict]  # [{date: str, reason: str}]
+    series_id: Optional[int] = None  # 作成されたシリーズID
+
+
+# ──────────────────────────────────────────────
+# シリーズ管理
+# ──────────────────────────────────────────────
+class SeriesResponse(BaseModel):
+    id: int
+    patient_id: Optional[int] = None
+    patient_name: Optional[str] = None
+    practitioner_id: int
+    practitioner_name: Optional[str] = None
+    menu_id: Optional[int] = None
+    menu_name: Optional[str] = None
+    start_time: str
+    duration_minutes: int
+    frequency: str
+    channel: str
+    remaining_count: int
+    total_created: int
+    is_active: bool
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+class SeriesExtendRequest(BaseModel):
+    """シリーズ延長リクエスト"""
+    count: int  # 追加する回数
+
+    @field_validator("count")
+    @classmethod
+    def validate_count(cls, v: int) -> int:
+        if v < 1 or v > 13:
+            raise ValueError("延長回数は1〜13回（最大約3か月）にしてください")
+        return v
+
+
+class SeriesModifyRequest(BaseModel):
+    """シリーズ変更リクエスト（設定変更 + 延長 or キャンセル）"""
+    practitioner_id: Optional[int] = None
+    menu_id: Optional[int] = None
+    color_id: Optional[int] = None
+    start_time: Optional[str] = None  # "HH:MM"
+    duration_minutes: Optional[int] = None
+    frequency: Optional[str] = None
+    count: Optional[int] = None  # 新しい繰り返し回数 (None = 残りをキャンセル)
+    cancel_remaining: bool = False  # True = 未来の予約をすべてキャンセル
 
 
 class ConflictingReservation(BaseModel):

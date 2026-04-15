@@ -23,6 +23,7 @@ from app.models.reservation import Reservation
 from app.models.setting import Setting
 from app.models.notification_log import NotificationLog
 from app.models.weekly_schedule import WeeklySchedule
+from app.models.reservation_series import ReservationSeries
 
 target_metadata = Base.metadata
 

@@ -30,6 +30,7 @@ class Reservation(Base):
     conflict_note = Column(Text, nullable=True)
     hotpepper_synced = Column(Boolean, default=False)
     hold_expires_at = Column(DateTime(timezone=True), nullable=True)
+    series_id = Column(Integer, ForeignKey("reservation_series.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -37,3 +38,4 @@ class Reservation(Base):
     practitioner = relationship("Practitioner", backref="reservations")
     menu = relationship("Menu", backref="reservations")
     color = relationship("ReservationColor", backref="reservations")
+    series = relationship("ReservationSeries", back_populates="reservations")

@@ -13,6 +13,7 @@ async def create_notification(
     event_type: str,
     message: str,
     reservation_id: int | None = None,
+    extra_data: dict | None = None,
 ):
     """通知を作成しSSEでブロードキャスト"""
     notif = NotificationLog(
@@ -23,11 +24,15 @@ async def create_notification(
     db.add(notif)
     await db.flush()
 
-    await broadcast_event(event_type, {
+    payload = {
         "id": notif.id,
         "reservation_id": reservation_id,
         "event_type": event_type,
         "message": message,
-    })
+    }
+    if extra_data:
+        payload.update(extra_data)
+
+    await broadcast_event(event_type, payload)
 
     return notif

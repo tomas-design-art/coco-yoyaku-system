@@ -15,15 +15,16 @@ import PatientList from './components/PatientList';
 import NotificationBell from './components/Notification/NotificationBell';
 import AlertPopup from './components/Notification/AlertPopup';
 import NotificationPanel from './components/Notification/NotificationPanel';
+import SeriesExtensionModal from './components/Notification/SeriesExtensionModal';
 import HotPepperSync from './components/HotPepperSync';
 import PublicReserve from './components/PublicReserve';
 import AdminLoginModal from './components/Auth/AdminLoginModal';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { useSSE } from './hooks/useSSE';
 import { useNotification } from './hooks/useNotification';
-import { rescheduleReservation } from './api/client';
+import { rescheduleReservation, getSeries } from './api/client';
 import { extractErrorMessage } from './utils/errorUtils';
-import type { Reservation } from './types';
+import type { Reservation, SeriesResponse } from './types';
 
 type PendingRescheduleTarget = {
   practitionerId: number;
@@ -71,13 +72,28 @@ function AppContent() {
   const [rescheduleSuccess, setRescheduleSuccess] = useState<string | null>(null);
   const [rescheduleError, setRescheduleError] = useState<string | null>(null);
   const [rescheduleDurationOffset, setRescheduleDurationOffset] = useState(0);
+
+  // Series extension modal state
+  const [seriesExtensionTarget, setSeriesExtensionTarget] = useState<SeriesResponse | null>(null);
   const [isTimeTableFullscreen, setIsTimeTableFullscreen] = useState(false);
 
   const { toasts, unreadCount, audioInitialized, enableAudio, addToast, removeToast, clearUnread } = useNotification();
 
   const handleSSEEvent = useCallback((event: { event_type: string; data: Record<string, unknown> }) => {
     const msg = (event.data.message as string) || event.event_type;
-    if (event.event_type === 'conflict_detected') {
+    if (event.event_type === 'series_expiring') {
+      // シリーズ延長通知 — モーダルを表示
+      const seriesId = event.data.series_id as number | undefined;
+      if (seriesId) {
+        getSeries(seriesId).then((res) => {
+          setSeriesExtensionTarget(res.data);
+        }).catch(() => {
+          addToast(msg, 'warning');
+        });
+      } else {
+        addToast(msg, 'warning');
+      }
+    } else if (event.event_type === 'conflict_detected') {
       addToast(msg, 'error');
     } else if (event.event_type === 'hold_expired') {
       addToast(msg, 'warning');
@@ -364,6 +380,15 @@ function AppContent() {
 
       {/* Toast notifications */}
       <AlertPopup toasts={toasts} onDismiss={removeToast} />
+
+      {/* Series extension modal */}
+      {seriesExtensionTarget && (
+        <SeriesExtensionModal
+          series={seriesExtensionTarget}
+          onClose={() => setSeriesExtensionTarget(null)}
+          onAction={refresh}
+        />
+      )}
 
       {/* Admin login modal */}
       <AdminLoginModal

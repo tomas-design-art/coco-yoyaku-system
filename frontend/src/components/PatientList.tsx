@@ -3,6 +3,31 @@ import { Search, Edit2, ChevronLeft, ChevronRight, EyeOff, Eye, Trash2 } from 'l
 import type { Patient, CandidateResponse, Menu, Practitioner } from '../types';
 import { getPatients, searchPatientsWithInactive, createPatient, updatePatient, findCandidates, deactivatePatient, reactivatePatient, purgePatient, getMenus, getPractitioners } from '../api/client';
 import { extractErrorMessage } from '../utils/errorUtils';
+import WarekiDateInput from './WarekiDateInput';
+
+/** ISO日付 → 和暦表示文字列 (例: "S60.3.15") */
+function formatWareki(iso: string | null): string {
+  if (!iso) return '-';
+  const parts = iso.split('-');
+  if (parts.length !== 3) return iso;
+  const [y, m, d] = parts.map(Number);
+  const eraMap: { name: string; short: string; start: number; startM: number; startD: number; end: number; endM: number; endD: number }[] = [
+    { name: '昭和', short: 'S', start: 1926, startM: 12, startD: 25, end: 1989, endM: 1, endD: 7 },
+    { name: '平成', short: 'H', start: 1989, startM: 1, startD: 8, end: 2019, endM: 4, endD: 30 },
+    { name: '令和', short: 'R', start: 2019, startM: 5, startD: 1, end: 2099, endM: 12, endD: 31 },
+    { name: '大正', short: 'T', start: 1912, startM: 7, startD: 30, end: 1926, endM: 12, endD: 24 },
+  ];
+  const dt = new Date(y, m - 1, d);
+  for (const era of eraMap) {
+    const s = new Date(era.start, era.startM - 1, era.startD);
+    const e = new Date(era.end, era.endM - 1, era.endD);
+    if (dt >= s && dt <= e) {
+      const ey = y - era.start + 1;
+      return `${era.short}${ey}.${m}.${d}`;
+    }
+  }
+  return iso;
+}
 
 type SortBy = 'name' | 'patient_number' | 'created_at';
 type SortOrder = 'asc' | 'desc';
@@ -153,7 +178,6 @@ export default function PatientList() {
   const middleNameRef = useRef<HTMLInputElement>(null);
   const readingRef = useRef<HTMLInputElement>(null);
   const phoneRef = useRef<HTMLInputElement>(null);
-  const birthDateRef = useRef<HTMLInputElement>(null);
   const emailRef = useRef<HTMLInputElement>(null);
   const notesRef = useRef<HTMLTextAreaElement>(null);
 
@@ -315,7 +339,7 @@ export default function PatientList() {
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="名前・カナ・診察券番号・電話番号で検索"
+          placeholder="名前・カナ・電話番号で検索"
           className="w-full border rounded pl-9 pr-3 py-2"
         />
       </div>
@@ -375,14 +399,16 @@ export default function PatientList() {
             <div>
               <label className="block text-sm font-medium mb-1">電話番号 <span className="text-gray-400 text-xs">推奨</span></label>
               <input ref={phoneRef} value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })}
-                onKeyDown={(e) => handleEnterNext(e, birthDateRef)}
+                onKeyDown={(e) => handleEnterNext(e, emailRef)}
                 className="w-full border rounded px-3 py-2" placeholder="09012345678" />
             </div>
             <div>
               <label className="block text-sm font-medium mb-1">生年月日</label>
-              <input ref={birthDateRef} type="date" value={form.birth_date} onChange={(e) => setForm({ ...form, birth_date: e.target.value })}
+              <WarekiDateInput
+                value={form.birth_date}
+                onChange={(v) => setForm({ ...form, birth_date: v })}
                 onKeyDown={(e) => handleEnterNext(e, emailRef)}
-                className="w-full border rounded px-3 py-2" />
+              />
             </div>
             <div>
               <label className="block text-sm font-medium mb-1">メールアドレス</label>
@@ -469,7 +495,7 @@ export default function PatientList() {
                       {c.patient.reading && <span className="text-gray-400 ml-2">{c.patient.reading}</span>}
                       {!c.patient.reading && c.patient.last_name_kana && <span className="text-gray-400 ml-2">{c.patient.last_name_kana} {c.patient.first_name_kana}</span>}
                       {c.patient.phone && <span className="text-gray-500 ml-2">{c.patient.phone}</span>}
-                      {c.patient.birth_date && <span className="text-gray-500 ml-2">{c.patient.birth_date}</span>}
+                      {c.patient.birth_date && <span className="text-gray-500 ml-2">{formatWareki(c.patient.birth_date)}</span>}
                       <span className="ml-2 text-xs text-yellow-700">({c.match_reasons.join(', ')})</span>
                     </div>
                     <button type="button" onClick={() => handleSelectCandidate(c.patient)}
@@ -532,7 +558,7 @@ export default function PatientList() {
                   {p.reading || (p.last_name_kana || p.first_name_kana ? `${p.last_name_kana || ''} ${p.first_name_kana || ''}`.trim() : '-')}
                 </td>
                 <td className="px-3 py-2 text-gray-500">{p.phone || '-'}</td>
-                <td className="px-3 py-2 text-gray-500 text-xs">{p.birth_date || '-'}</td>
+                <td className="px-3 py-2 text-gray-500 text-xs">{formatWareki(p.birth_date)}</td>
                 <td className="px-3 py-2 text-gray-400 text-xs">{new Date(p.created_at).toLocaleDateString('ja-JP')}</td>
                 <td className="px-3 py-2 flex gap-1">
                   <button onClick={() => handleEdit(p)} className="p-1 hover:bg-gray-100 rounded" title="編集"><Edit2 size={14} /></button>

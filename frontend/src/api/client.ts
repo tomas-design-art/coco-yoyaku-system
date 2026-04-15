@@ -24,6 +24,9 @@ import type {
   UnavailableTime,
   BulkReservationCreate,
   BulkReservationResult,
+  SeriesResponse,
+  SeriesExtendRequest,
+  SeriesModifyRequest,
   WebReserveRequest,
   WebReserveSuccess,
   WebReserveConflict,
@@ -162,6 +165,22 @@ export const rescheduleReservation = (
 ) => api.post(`/reservations/${id}/reschedule`, data);
 
 export const getConflicts = () => api.get<Reservation[]>('/reservations/conflicts/');
+
+// ---- Reservation Series ----
+export const getActiveSeries = () =>
+  api.get<SeriesResponse[]>('/reservations/series');
+
+export const getSeries = (seriesId: number) =>
+  api.get<SeriesResponse>(`/reservations/series/${seriesId}`);
+
+export const extendSeries = (seriesId: number, data: SeriesExtendRequest) =>
+  api.post<BulkReservationResult>(`/reservations/series/${seriesId}/extend`, data);
+
+export const modifySeries = (seriesId: number, data: SeriesModifyRequest) =>
+  api.post(`/reservations/series/${seriesId}/modify`, data);
+
+export const cancelRemainingSeries = (seriesId: number) =>
+  api.post(`/reservations/series/${seriesId}/cancel-remaining`);
 
 // ---- Settings ----
 export const getSettings = () => api.get<Setting[]>('/settings/');

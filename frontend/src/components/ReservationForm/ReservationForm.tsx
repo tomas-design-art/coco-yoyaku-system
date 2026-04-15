@@ -59,8 +59,15 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
     setPatientName('');
     setMenuId(null);
     setSelectedDuration(null);
+    setColorId(null);
+    setChannel('PHONE');
     setNotes('');
+    setError(null);
     setRepeatEnabled(false);
+    setFrequency('weekly');
+    setRepeatEndMode('count');
+    setRepeatEndDate('');
+    setRepeatCount(4);
     setBulkResult(null);
   };
 
@@ -266,7 +273,7 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
               枠オサエ
             </button>
           </div>
-          <button onClick={() => { onClose(); setBulkResult(null); }} className="p-1 hover:bg-gray-100 rounded"><X size={20} /></button>
+          <button onClick={() => { resetFormState(); onClose(); }} className="p-1 hover:bg-gray-100 rounded"><X size={20} /></button>
         </div>
 
         <form onSubmit={handleSubmit} className="p-4 space-y-4 overflow-y-auto">
@@ -475,7 +482,7 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
                       <input
                         type="number"
                         min={2}
-                        max={52}
+                        max={13}
                         value={repeatCount}
                         onChange={(e) => setRepeatCount(Number(e.target.value))}
                         className="w-20 border rounded px-2 py-1.5 text-sm"
@@ -516,7 +523,7 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
 
           {/* Buttons */}
           <div className="flex justify-end gap-2 pt-2">
-            <button type="button" onClick={() => { onClose(); setBulkResult(null); }} className="px-4 py-2 text-sm border rounded hover:bg-gray-50">
+            <button type="button" onClick={() => { resetFormState(); onClose(); }} className="px-4 py-2 text-sm border rounded hover:bg-gray-50">
               {bulkResult ? '閉じる' : 'キャンセル'}
             </button>
             {!bulkResult && (

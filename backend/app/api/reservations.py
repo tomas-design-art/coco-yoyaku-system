@@ -19,6 +19,9 @@ from app.schemas.reservation import (
     RescheduleBody,
     BulkReservationCreate,
     BulkReservationResult,
+    SeriesResponse,
+    SeriesExtendRequest,
+    SeriesModifyRequest,
 )
 from app.services.reservation_service import (
     create_reservation,
@@ -30,6 +33,8 @@ from app.services.reservation_service import (
 )
 from app.services.conflict_detector import check_conflict, ACTIVE_STATUSES
 from app.services.notification_service import create_notification
+from app.models.reservation_series import ReservationSeries
+from app.utils.datetime_jst import now_jst
 
 _JST = zoneinfo.ZoneInfo("Asia/Tokyo")
 logger = logging.getLogger(__name__)
@@ -111,14 +116,18 @@ async def create_reservation_endpoint(
 
 
 def _generate_dates(start_date: date, frequency: str, end_date: date | None, count: int | None) -> list[date]:
-    """繰り返し日付リストを生成（最大52週=約1年）"""
-    MAX_COUNT = 52
+    """繰り返し日付リストを生成（最大13回=約3か月）"""
+    MAX_COUNT = 13
     dates: list[date] = []
     current = start_date
-    limit = count if count else MAX_COUNT
+    limit = min(count if count else MAX_COUNT, MAX_COUNT)
+
+    # end_date が指定されている場合も3か月上限を適用
+    max_end = start_date + timedelta(days=92)  # 約3か月
+    effective_end = min(end_date, max_end) if end_date else max_end
 
     for _ in range(limit):
-        if end_date and current > end_date:
+        if current > effective_end:
             break
         dates.append(current)
         if frequency == "weekly":
@@ -138,13 +147,31 @@ def _generate_dates(start_date: date, frequency: str, end_date: date | None, cou
 async def bulk_create_reservations(
     data: BulkReservationCreate, db: AsyncSession = Depends(get_db)
 ):
-    """繰り返し予約一括生成"""
+    """繰り返し予約一括生成（シリーズ管理付き）"""
     if not data.end_date and not data.count:
         raise HTTPException(status_code=400, detail="end_date または count を指定してください")
 
     dates = _generate_dates(data.start_date, data.frequency, data.end_date, data.count)
     if not dates:
         raise HTTPException(status_code=400, detail="生成対象の日付がありません")
+
+    # シリーズレコード作成
+    series = ReservationSeries(
+        patient_id=data.patient_id,
+        practitioner_id=data.practitioner_id,
+        menu_id=data.menu_id,
+        color_id=data.color_id,
+        start_time=data.start_time,
+        duration_minutes=data.duration_minutes,
+        frequency=data.frequency,
+        channel=data.channel,
+        notes=data.notes,
+        remaining_count=len(dates),
+        total_created=0,
+        is_active=True,
+    )
+    db.add(series)
+    await db.flush()  # series.id を確定
 
     created_count = 0
     skipped: list[dict] = []
@@ -169,7 +196,13 @@ async def bulk_create_reservations(
             notes=data.notes,
         )
         try:
-            await create_reservation(db, reservation_data)
+            reservation = await create_reservation(db, reservation_data)
+            # series_id を予約にリンク
+            result = await db.execute(
+                select(Reservation).where(Reservation.id == reservation["id"])
+            )
+            res_obj = result.scalar_one()
+            res_obj.series_id = series.id
             created_count += 1
         except HTTPException as e:
             skipped.append({"date": target_date.isoformat(), "reason": e.detail})
@@ -177,11 +210,332 @@ async def bulk_create_reservations(
             logger.error("Bulk reservation error on %s: %s", target_date, e)
             skipped.append({"date": target_date.isoformat(), "reason": "内部エラー"})
 
+    series.total_created = created_count
+    series.remaining_count = created_count
+    await db.commit()
+
     return BulkReservationResult(
         total_requested=len(dates),
         created_count=created_count,
         skipped=skipped,
+        series_id=series.id,
     )
+
+
+# ─── シリーズ管理エンドポイント ────────────────────────
+
+
+@router.get("/series", response_model=list[SeriesResponse])
+async def list_active_series(db: AsyncSession = Depends(get_db)):
+    """アクティブなシリーズ一覧"""
+    result = await db.execute(
+        select(ReservationSeries)
+        .where(ReservationSeries.is_active == True)
+        .options(
+            selectinload(ReservationSeries.patient),
+            selectinload(ReservationSeries.practitioner),
+            selectinload(ReservationSeries.menu),
+        )
+        .order_by(ReservationSeries.created_at.desc())
+    )
+    rows = result.scalars().all()
+    return [
+        SeriesResponse(
+            id=s.id,
+            patient_id=s.patient_id,
+            patient_name=s.patient.name if s.patient else None,
+            practitioner_id=s.practitioner_id,
+            practitioner_name=s.practitioner.name if s.practitioner else None,
+            menu_id=s.menu_id,
+            menu_name=s.menu.name if s.menu else None,
+            start_time=s.start_time,
+            duration_minutes=s.duration_minutes,
+            frequency=s.frequency,
+            channel=s.channel,
+            remaining_count=s.remaining_count,
+            total_created=s.total_created,
+            is_active=s.is_active,
+            created_at=s.created_at,
+        )
+        for s in rows
+    ]
+
+
+@router.get("/series/{series_id}", response_model=SeriesResponse)
+async def get_series(series_id: int, db: AsyncSession = Depends(get_db)):
+    """シリーズ詳細取得"""
+    result = await db.execute(
+        select(ReservationSeries)
+        .where(ReservationSeries.id == series_id)
+        .options(
+            selectinload(ReservationSeries.patient),
+            selectinload(ReservationSeries.practitioner),
+            selectinload(ReservationSeries.menu),
+        )
+    )
+    s = result.scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="シリーズが見つかりません")
+    return SeriesResponse(
+        id=s.id,
+        patient_id=s.patient_id,
+        patient_name=s.patient.name if s.patient else None,
+        practitioner_id=s.practitioner_id,
+        practitioner_name=s.practitioner.name if s.practitioner else None,
+        menu_id=s.menu_id,
+        menu_name=s.menu.name if s.menu else None,
+        start_time=s.start_time,
+        duration_minutes=s.duration_minutes,
+        frequency=s.frequency,
+        channel=s.channel,
+        remaining_count=s.remaining_count,
+        total_created=s.total_created,
+        is_active=s.is_active,
+        created_at=s.created_at,
+    )
+
+
+@router.post("/series/{series_id}/extend", response_model=BulkReservationResult)
+async def extend_series(
+    series_id: int, body: SeriesExtendRequest, db: AsyncSession = Depends(get_db)
+):
+    """シリーズ延長（同じ設定で追加予約を生成）"""
+    result = await db.execute(
+        select(ReservationSeries).where(ReservationSeries.id == series_id)
+    )
+    series = result.scalar_one_or_none()
+    if not series:
+        raise HTTPException(status_code=404, detail="シリーズが見つかりません")
+    if not series.is_active:
+        raise HTTPException(status_code=400, detail="このシリーズは非アクティブです")
+
+    # 最後の予約日を取得して、そこから繰り返し再開
+    res_result = await db.execute(
+        select(Reservation)
+        .where(
+            Reservation.series_id == series_id,
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+        )
+        .order_by(Reservation.start_time.desc())
+        .limit(1)
+    )
+    last_reservation = res_result.scalar_one_or_none()
+    if last_reservation:
+        last_date = last_reservation.start_time.date()
+    else:
+        last_date = date.today()
+
+    # 最後の予約日の次の日付から生成
+    if series.frequency == "weekly":
+        next_date = last_date + timedelta(days=7)
+    elif series.frequency == "biweekly":
+        next_date = last_date + timedelta(days=14)
+    else:
+        month = last_date.month % 12 + 1
+        year = last_date.year + (1 if last_date.month == 12 else 0)
+        day = min(last_date.day, 28)
+        next_date = last_date.replace(year=year, month=month, day=day)
+
+    dates = _generate_dates(next_date, series.frequency, None, body.count)
+    if not dates:
+        raise HTTPException(status_code=400, detail="延長日付を生成できません")
+
+    created_count = 0
+    skipped: list[dict] = []
+    hour, minute = map(int, series.start_time.split(":"))
+
+    for target_date in dates:
+        start_dt = datetime(
+            target_date.year, target_date.month, target_date.day,
+            hour, minute, tzinfo=_JST,
+        )
+        end_dt = start_dt + timedelta(minutes=series.duration_minutes)
+        reservation_data = ReservationCreate(
+            patient_id=series.patient_id,
+            practitioner_id=series.practitioner_id,
+            menu_id=series.menu_id,
+            color_id=series.color_id,
+            start_time=start_dt,
+            end_time=end_dt,
+            channel=series.channel,
+            notes=series.notes,
+        )
+        try:
+            reservation = await create_reservation(db, reservation_data)
+            r_result = await db.execute(
+                select(Reservation).where(Reservation.id == reservation["id"])
+            )
+            r_obj = r_result.scalar_one()
+            r_obj.series_id = series.id
+            created_count += 1
+        except HTTPException as e:
+            skipped.append({"date": target_date.isoformat(), "reason": e.detail})
+        except Exception as e:
+            logger.error("Series extend error on %s: %s", target_date, e)
+            skipped.append({"date": target_date.isoformat(), "reason": "内部エラー"})
+
+    series.remaining_count += created_count
+    series.total_created += created_count
+    series.notified_at = None  # 通知済みフラグをリセット
+    await db.commit()
+
+    return BulkReservationResult(
+        total_requested=len(dates),
+        created_count=created_count,
+        skipped=skipped,
+        series_id=series.id,
+    )
+
+
+@router.post("/series/{series_id}/modify")
+async def modify_series(
+    series_id: int, body: SeriesModifyRequest, db: AsyncSession = Depends(get_db)
+):
+    """シリーズ変更（未来の予約をキャンセルし、新しい設定で再生成 or 全キャンセル）"""
+    result = await db.execute(
+        select(ReservationSeries).where(ReservationSeries.id == series_id)
+    )
+    series = result.scalar_one_or_none()
+    if not series:
+        raise HTTPException(status_code=404, detail="シリーズが見つかりません")
+
+    now = now_jst()
+
+    # 未来の予約をキャンセル
+    future_result = await db.execute(
+        select(Reservation).where(
+            Reservation.series_id == series_id,
+            Reservation.start_time > now,
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+        )
+    )
+    future_reservations = future_result.scalars().all()
+    cancelled_count = 0
+    for r in future_reservations:
+        r.status = "CANCELLED"
+        cancelled_count += 1
+
+    if body.cancel_remaining:
+        series.is_active = False
+        series.remaining_count = 0
+        await db.commit()
+        return {
+            "action": "cancelled",
+            "cancelled_count": cancelled_count,
+            "series_id": series_id,
+        }
+
+    # 設定変更を適用
+    if body.practitioner_id is not None:
+        series.practitioner_id = body.practitioner_id
+    if body.menu_id is not None:
+        series.menu_id = body.menu_id
+    if body.color_id is not None:
+        series.color_id = body.color_id
+    if body.start_time is not None:
+        series.start_time = body.start_time
+    if body.duration_minutes is not None:
+        series.duration_minutes = body.duration_minutes
+    if body.frequency is not None:
+        series.frequency = body.frequency
+
+    new_count = body.count if body.count else cancelled_count
+    if new_count < 1:
+        new_count = 1
+    if new_count > 13:
+        new_count = 13
+
+    # 新しい日程を生成
+    start_date = now.date() + timedelta(days=1)
+    # 同じ曜日に合わせる
+    if series.frequency in ("weekly", "biweekly"):
+        target_weekday = now.weekday()
+        days_ahead = (target_weekday - start_date.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        start_date = start_date + timedelta(days=days_ahead)
+
+    dates = _generate_dates(start_date, series.frequency, None, new_count)
+
+    created_count = 0
+    skipped: list[dict] = []
+    hour, minute = map(int, series.start_time.split(":"))
+
+    for target_date in dates:
+        start_dt = datetime(
+            target_date.year, target_date.month, target_date.day,
+            hour, minute, tzinfo=_JST,
+        )
+        end_dt = start_dt + timedelta(minutes=series.duration_minutes)
+        reservation_data = ReservationCreate(
+            patient_id=series.patient_id,
+            practitioner_id=series.practitioner_id,
+            menu_id=series.menu_id,
+            color_id=series.color_id,
+            start_time=start_dt,
+            end_time=end_dt,
+            channel=series.channel,
+            notes=series.notes,
+        )
+        try:
+            reservation = await create_reservation(db, reservation_data)
+            r_result = await db.execute(
+                select(Reservation).where(Reservation.id == reservation["id"])
+            )
+            r_obj = r_result.scalar_one()
+            r_obj.series_id = series.id
+            created_count += 1
+        except HTTPException as e:
+            skipped.append({"date": target_date.isoformat(), "reason": e.detail})
+        except Exception as e:
+            logger.error("Series modify error on %s: %s", target_date, e)
+            skipped.append({"date": target_date.isoformat(), "reason": "内部エラー"})
+
+    series.remaining_count = created_count
+    series.total_created += created_count
+    series.notified_at = None
+    await db.commit()
+
+    return {
+        "action": "modified",
+        "cancelled_count": cancelled_count,
+        "created_count": created_count,
+        "skipped": skipped,
+        "series_id": series_id,
+    }
+
+
+@router.post("/series/{series_id}/cancel-remaining")
+async def cancel_remaining_series(
+    series_id: int, db: AsyncSession = Depends(get_db)
+):
+    """シリーズの残りの予約をすべてキャンセルし、シリーズを非アクティブにする"""
+    result = await db.execute(
+        select(ReservationSeries).where(ReservationSeries.id == series_id)
+    )
+    series = result.scalar_one_or_none()
+    if not series:
+        raise HTTPException(status_code=404, detail="シリーズが見つかりません")
+
+    now = now_jst()
+    future_result = await db.execute(
+        select(Reservation).where(
+            Reservation.series_id == series_id,
+            Reservation.start_time > now,
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+        )
+    )
+    future_reservations = future_result.scalars().all()
+    cancelled = 0
+    for r in future_reservations:
+        r.status = "CANCELLED"
+        cancelled += 1
+
+    series.is_active = False
+    series.remaining_count = 0
+    await db.commit()
+
+    return {"cancelled_count": cancelled, "series_id": series_id}
 
 
 @router.put("/{reservation_id}")
