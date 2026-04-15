@@ -236,7 +236,7 @@ def start_hold_expiration_job():
         id="hotpepper_mail_poll",
     )
     scheduler.add_job(cleanup_old_notifications, "cron", hour=3, minute=0, id="notification_cleanup")
-    scheduler.add_job(check_series_expiration, "cron", hour=9, minute=0, id="series_expiration_check")
+    scheduler.add_job(check_series_expiration, "cron", hour=10, minute=0, id="series_expiration_check")
     scheduler.start()
     logger.info(
         "Background jobs started (HOLD expiration, chat session expiration, HP sync reminder, HotPepper mail poll, notification cleanup, series expiration check)"

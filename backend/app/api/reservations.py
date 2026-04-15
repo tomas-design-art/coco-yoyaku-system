@@ -261,6 +261,45 @@ async def list_active_series(db: AsyncSession = Depends(get_db)):
     ]
 
 
+@router.get("/series/pending-alerts", response_model=list[SeriesResponse])
+async def get_pending_series_alerts(db: AsyncSession = Depends(get_db)):
+    """通知済みだが未対応のシリーズ延長アラートを返す（画面起動時のキャッチアップ用）"""
+    result = await db.execute(
+        select(ReservationSeries)
+        .where(
+            ReservationSeries.is_active == True,
+            ReservationSeries.notified_at != None,
+        )
+        .options(
+            selectinload(ReservationSeries.patient),
+            selectinload(ReservationSeries.practitioner),
+            selectinload(ReservationSeries.menu),
+        )
+        .order_by(ReservationSeries.notified_at.desc())
+    )
+    alert_rows = result.scalars().all()
+    return [
+        SeriesResponse(
+            id=s.id,
+            patient_id=s.patient_id,
+            patient_name=s.patient.name if s.patient else None,
+            practitioner_id=s.practitioner_id,
+            practitioner_name=s.practitioner.name if s.practitioner else None,
+            menu_id=s.menu_id,
+            menu_name=s.menu.name if s.menu else None,
+            start_time=s.start_time,
+            duration_minutes=s.duration_minutes,
+            frequency=s.frequency,
+            channel=s.channel,
+            remaining_count=s.remaining_count,
+            total_created=s.total_created,
+            is_active=s.is_active,
+            created_at=s.created_at,
+        )
+        for s in alert_rows
+    ]
+
+
 @router.get("/series/{series_id}", response_model=SeriesResponse)
 async def get_series(series_id: int, db: AsyncSession = Depends(get_db)):
     """シリーズ詳細取得"""
@@ -293,6 +332,7 @@ async def get_series(series_id: int, db: AsyncSession = Depends(get_db)):
         is_active=s.is_active,
         created_at=s.created_at,
     )
+
 
 
 @router.post("/series/{series_id}/extend", response_model=BulkReservationResult)

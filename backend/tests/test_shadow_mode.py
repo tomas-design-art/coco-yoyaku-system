@@ -10,6 +10,7 @@ import app.models.reservation_color  # noqa: F401
 import app.models.menu  # noqa: F401
 import app.models.patient  # noqa: F401
 import app.models.reservation  # noqa: F401
+import app.models.reservation_series  # noqa: F401
 
 # ── shadow_service 単体テスト ──
 
@@ -55,9 +56,10 @@ def test_format_admin_notification():
             "confidence": "high",
         },
     )
-    assert "【シャドーモード解析結果】" in result
+    assert "【原文】" in result
     assert "田中太郎" in result
-    assert "予約希望" in result
+    assert "【分類】予約希望" in result
+    assert "【患者希望の予約時間】" in result
     assert "2026-04-07" in result
     assert "10:00" in result
 

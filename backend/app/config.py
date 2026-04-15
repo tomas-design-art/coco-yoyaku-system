@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     secret_key: str = "dev-secret-key"
     admin_password: str = "admin123"
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3-flash-preview"
     line_channel_secret: str = ""
     line_channel_access_token: str = ""
     line_channel_developer_access_token: str = ""

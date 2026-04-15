@@ -46,12 +46,13 @@ _SHADOW_PARSE_PROMPT = """\
 出力JSON形式（必ず全キーを含めること）:
 {{
     "intent": "予約希望 | 変更 | キャンセル | 遅刻 | 相談 | その他",
-  "name": "患者名 or null",
+    "content": "患者の要望を1〜2文で簡潔に要約",
+    "name": "患者名 or null",
     "menu": null,
-  "date": "YYYY-MM-DD or null",
-  "time": "HH:MM or null",
-  "duration_minutes": 整数 or null,
-  "confidence": "high | medium | low"
+    "date": "YYYY-MM-DD or null",
+    "time": "HH:MM or null",
+    "duration_minutes": 整数 or null,
+    "confidence": "high | medium | low"
 }}
 
 重要:
@@ -60,6 +61,7 @@ _SHADOW_PARSE_PROMPT = """\
 - 意図は必ず6分類から1つを選ぶ。
 - 「遅刻」は遅れる旨の報告。
 - 施術時間に言及があれば `duration_minutes` に分数を入れる。
+- `content` は患者の要望を簡潔に日本語で要約する（例: "明日14時に60分の予約を希望"）。
 
 患者メッセージ:
 {message}
@@ -162,7 +164,7 @@ def _normalize_analysis(analysis: dict, message: str) -> dict:
     if conf not in {"high", "medium", "low"}:
         parsed["confidence"] = "medium" if (parsed.get("date") or parsed.get("time")) else "low"
 
-    for key in ("name",):
+    for key in ("name", "content"):
         parsed.setdefault(key, None)
 
     return parsed
@@ -185,6 +187,7 @@ def _rule_based_shadow_parse(message: str) -> dict:
     confidence = "high" if (date_val and time_val) else ("medium" if (date_val or time_val) else "low")
     return {
         "intent": intent,
+        "content": None,
         "name": None,
         "menu": None,
         "date": date_val,
@@ -273,12 +276,44 @@ async def analyze_with_llm(message: str) -> dict:
 def _empty_result() -> dict:
     return {
         "intent": None,
+        "content": None,
         "name": None,
         "menu": None,
         "date": None,
         "time": None,
         "confidence": None,
     }
+
+
+def _generate_content_summary(analysis: dict, draft: dict | None = None) -> str:
+    """解析結果から内容要約を自動生成（LLM content がなければフォールバック）"""
+    content = analysis.get("content")
+    if content and content != "null" and content.strip():
+        return content.strip()
+
+    intent = analysis.get("intent") or "不明"
+    src = draft if draft else analysis
+    parts = []
+    if src.get("date"):
+        parts.append(src["date"])
+    if src.get("time"):
+        parts.append(src["time"])
+    if src.get("duration_minutes"):
+        parts.append(f"{src['duration_minutes']}分")
+
+    time_info = " ".join(parts) if parts else ""
+
+    if intent == "予約希望":
+        return f"予約希望{' (' + time_info + ')' if time_info else ''}"
+    elif intent == "変更":
+        return "予約の変更を希望"
+    elif intent == "キャンセル":
+        return "予約のキャンセルを希望"
+    elif intent == "遅刻":
+        return "遅刻の連絡"
+    elif intent == "相談":
+        return "予約に関する相談"
+    return "その他"
 
 
 async def save_shadow_log(
@@ -315,18 +350,19 @@ def format_admin_notification(
     """管理者向け通知テキストを整形"""
     ts = now_jst().strftime("%Y-%m-%d %H:%M")
     name = display_name or "不明"
+    content = _generate_content_summary(analysis)
+    date_str = analysis.get("date") or "未抽出"
+    time_str = analysis.get("time") or "未抽出"
+    desired_time = f"{date_str} {time_str}" if date_str != "未抽出" else "未抽出"
     lines = [
-        "【シャドーモード解析結果】",
-        f"受信時刻: {ts}",
-        f"LINEユーザー: {name} ({user_id[:12]}…)",
-        f"原文: {raw_message[:200]}",
-        "── 解析結果 ──",
-        f"意図: {analysis.get('intent') or '不明'}",
-        f"患者名: {analysis.get('name') or '未抽出'}",
-        f"メニュー: {analysis.get('menu') or '未抽出'}",
-        f"日付: {analysis.get('date') or '未抽出'}",
-        f"時間: {analysis.get('time') or '未抽出'}",
-        f"確信度: {analysis.get('confidence') or '—'}",
+        f"📩 {name}さんからのメッセージ ({ts})",
+        "",
+        "【原文】",
+        raw_message[:300],
+        "",
+        f"【分類】{analysis.get('intent') or '不明'}",
+        f"【内容】{content}",
+        f"【患者希望の予約時間】{desired_time}",
     ]
     return "\n".join(lines)
 
@@ -476,9 +512,14 @@ async def handle_shadow_message(
             draft_update["duration_minutes"] = analysis["duration_minutes"]
         if analysis.get("name") and analysis["name"] != "null":
             draft_update["customer_name"] = analysis["name"]
+        if analysis.get("content"):
+            draft_update["content"] = analysis["content"]
 
-        if draft_update:
-            await merge_user_draft(db, user_id, draft_update)
+        # 原文をドラフトに蓄積
+        existing_raw = prev_draft.get("raw_messages") or ""
+        draft_update["raw_messages"] = (existing_raw + "\n" + msg).strip()
+
+        await merge_user_draft(db, user_id, draft_update)
 
         # 最新ドラフトを再取得
         user_state = await get_user_state(db, user_id)
@@ -707,6 +748,10 @@ async def _shadow_check_and_notify(
     )
 
     # ── Flex Message 構築 ──
+    raw_messages = draft.get("raw_messages") or ""
+    content_summary = _generate_content_summary(
+        {"intent": "予約希望", "content": draft.get("content")}, draft
+    )
     if practitioner:
         flex = _build_shadow_available_flex(
             request_id=request_id,
@@ -720,6 +765,8 @@ async def _shadow_check_and_notify(
             gap_after=gap_after,
             start_dt=start_dt,
             end_dt=end_dt,
+            raw_message=raw_messages,
+            content_summary=content_summary,
         )
         alt_text = f"予約確認: {customer_name}様 {date_label} {desired_time_str} 空きあり"
     else:
@@ -732,6 +779,8 @@ async def _shadow_check_and_notify(
             duration=duration,
             conflict_info=conflict_info,
             alternatives=alternatives,
+            raw_message=raw_messages,
+            content_summary=content_summary,
         )
         alt_text = f"予約確認: {customer_name}様 {date_label} {desired_time_str} 満席"
 
@@ -774,30 +823,85 @@ def _build_shadow_available_flex(
     gap_after: int,
     start_dt: datetime,
     end_dt: datetime,
+    raw_message: str = "",
+    content_summary: str = "",
 ) -> dict:
-    """空きあり時の管理者通知 Flex Message"""
+    """空きあり時の管理者通知 Flex Message（原文→分類→内容→希望時間→枠の状況）"""
     uid_suffix = f"&uid={user_id}" if user_id else ""
     end_time_str = end_dt.strftime("%H:%M")
 
-    body_lines = [
-        f"{customer_name}様からのご予約",
-        f"{date_label} {time_str}〜{end_time_str} 施術時間{duration}分",
-        "",
-        f"✅ {date_label} {time_str}枠 {practitioner_name} {duration}分",
-        "空いています。",
+    body_contents: list[dict] = [
+        # 原文セクション
+        {"type": "text", "text": "【原文】", "size": "xs", "color": "#6B7280", "weight": "bold"},
+        {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {"type": "text", "text": raw_message[:300] or "—", "wrap": True, "size": "sm"}
+            ],
+            "backgroundColor": "#F3F4F6",
+            "paddingAll": "8px",
+            "cornerRadius": "4px",
+            "margin": "xs",
+        },
+        {"type": "separator", "margin": "md"},
+        # 分類
+        {"type": "text", "text": f"【分類】予約希望", "size": "sm", "weight": "bold", "margin": "md"},
+        # 内容
+        {"type": "text", "text": f"【内容】{content_summary}", "wrap": True, "size": "sm"},
+        # 患者希望の予約時間
+        {
+            "type": "text",
+            "text": f"【患者希望の予約時間】{date_label} {time_str}〜{end_time_str}（{duration}分）",
+            "wrap": True,
+            "size": "sm",
+        },
+        {"type": "separator", "margin": "md"},
+        # 枠の状況
+        {
+            "type": "text",
+            "text": f"【枠の状況】✅ {practitioner_name} 空きあり",
+            "wrap": True,
+            "size": "sm",
+            "color": "#16A34A",
+            "weight": "bold",
+            "margin": "md",
+        },
     ]
 
-    # ギャップ情報
-    if gap_before > 0:
+    # 前後の空き状況を常に表示
+    gap_lines: list[str] = []
+    if gap_before == 0:
+        gap_lines.append(f"前: 直前まで予約あり（詰まっています）")
+    else:
         earlier = start_dt - timedelta(minutes=gap_before)
-        body_lines.append(
-            f"⚠ 直前{gap_before}分空白（{earlier.strftime('%H:%M')}〜{start_dt.strftime('%H:%M')}）"
-        )
-    if gap_after > 0:
+        gap_lines.append(f"前: {gap_before}分空き（{earlier.strftime('%H:%M')}〜{start_dt.strftime('%H:%M')}）")
+    if gap_after == 0:
+        gap_lines.append(f"後: 直後に予約あり（詰まっています）")
+    else:
         later = end_dt + timedelta(minutes=gap_after)
-        body_lines.append(
-            f"⚠ 直後{gap_after}分空白（{end_dt.strftime('%H:%M')}〜{later.strftime('%H:%M')}）"
+        gap_lines.append(f"後: {gap_after}分空き（{end_dt.strftime('%H:%M')}〜{later.strftime('%H:%M')}）")
+
+    for gl in gap_lines:
+        body_contents.append(
+            {"type": "text", "text": gl, "wrap": True, "size": "xs", "color": "#6B7280"}
         )
+
+    # 大きな空白がある場合は時間調整の提案
+    if gap_before >= 30 or gap_after >= 30:
+        suggest_parts = []
+        if gap_before >= 30:
+            tighter = start_dt - timedelta(minutes=min(gap_before, 30))
+            suggest_parts.append(f"{tighter.strftime('%H:%M')}〜に前倒し")
+        if gap_after >= 30:
+            tighter = start_dt + timedelta(minutes=min(gap_after, 30))
+            suggest_parts.append(f"{tighter.strftime('%H:%M')}〜に後ろ倒し")
+        body_contents.append(
+            {"type": "text", "text": f"💡 {' or '.join(suggest_parts)}すると枠を詰められます", "wrap": True, "size": "xs", "color": "#2563EB"}
+        )
+
+    body_contents.append({"type": "separator", "margin": "md"})
+    body_contents.append({"type": "text", "text": f"RID: {request_id}", "size": "xs", "color": "#9CA3AF"})
 
     return {
         "type": "bubble",
@@ -807,7 +911,7 @@ def _build_shadow_available_flex(
             "contents": [
                 {
                     "type": "text",
-                    "text": "📩 LINE予約確認",
+                    "text": f"📩 {customer_name}様 LINE予約確認",
                     "weight": "bold",
                     "size": "lg",
                     "color": "#ffffff",
@@ -820,13 +924,7 @@ def _build_shadow_available_flex(
             "type": "box",
             "layout": "vertical",
             "spacing": "sm",
-            "contents": [
-                {"type": "text", "text": line, "wrap": True, "size": "sm"}
-                for line in body_lines if line
-            ] + [
-                {"type": "separator", "margin": "md"},
-                {"type": "text", "text": f"RID: {request_id}", "size": "xs", "color": "#9CA3AF"},
-            ],
+            "contents": body_contents,
         },
         "footer": {
             "type": "box",
@@ -869,29 +967,56 @@ def _build_shadow_conflict_flex(
     duration: int,
     conflict_info: str,
     alternatives: list[dict],
+    raw_message: str = "",
+    content_summary: str = "",
 ) -> dict:
-    """満席時の管理者通知 Flex Message（代案3件 + その他）"""
+    """満席時の管理者通知 Flex Message（原文→分類→内容→希望時間→枠の状況→提案3件）"""
     uid_suffix = f"&uid={user_id}" if user_id else ""
 
-    body_contents = [
-        {"type": "text", "text": f"{customer_name}様からのご予約", "wrap": True, "size": "sm", "weight": "bold"},
-        {"type": "text", "text": f"{date_label} {time_str} 施術時間{duration}分", "wrap": True, "size": "sm"},
+    body_contents: list[dict] = [
+        # 原文セクション
+        {"type": "text", "text": "【原文】", "size": "xs", "color": "#6B7280", "weight": "bold"},
+        {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {"type": "text", "text": raw_message[:300] or "—", "wrap": True, "size": "sm"}
+            ],
+            "backgroundColor": "#F3F4F6",
+            "paddingAll": "8px",
+            "cornerRadius": "4px",
+            "margin": "xs",
+        },
+        {"type": "separator", "margin": "md"},
+        # 分類
+        {"type": "text", "text": f"【分類】予約希望", "size": "sm", "weight": "bold", "margin": "md"},
+        # 内容
+        {"type": "text", "text": f"【内容】{content_summary}", "wrap": True, "size": "sm"},
+        # 患者希望の予約時間
+        {
+            "type": "text",
+            "text": f"【患者希望の予約時間】{date_label} {time_str}（{duration}分）",
+            "wrap": True,
+            "size": "sm",
+        },
         {"type": "separator", "margin": "md"},
     ]
 
+    # 枠の状況
     if conflict_info:
         body_contents.append(
-            {"type": "text", "text": f"❌ 現在 {conflict_info}", "wrap": True, "size": "sm", "color": "#DC2626"}
+            {"type": "text", "text": f"【枠の状況】❌ {conflict_info}", "wrap": True, "size": "sm", "color": "#DC2626", "weight": "bold", "margin": "md"}
         )
     else:
         body_contents.append(
-            {"type": "text", "text": "❌ 希望枠は満席です", "wrap": True, "size": "sm", "color": "#DC2626"}
+            {"type": "text", "text": "【枠の状況】❌ 希望枠は満席です", "wrap": True, "size": "sm", "color": "#DC2626", "weight": "bold", "margin": "md"}
         )
 
+    # 提案
     if alternatives:
         body_contents.append({"type": "separator", "margin": "md"})
         body_contents.append(
-            {"type": "text", "text": "以下であれば予約可能です:", "wrap": True, "size": "sm", "weight": "bold"}
+            {"type": "text", "text": "【提案】", "size": "sm", "weight": "bold", "margin": "md"}
         )
         for i, alt in enumerate(alternatives, 1):
             label = alt.get("label", f"候補{i}")
@@ -899,12 +1024,8 @@ def _build_shadow_conflict_flex(
                 {"type": "text", "text": f"  {_num_to_circled(i)} {label}", "wrap": True, "size": "sm"}
             )
 
-    body_contents.append(
-        {"type": "separator", "margin": "md"},
-    )
-    body_contents.append(
-        {"type": "text", "text": f"RID: {request_id}", "size": "xs", "color": "#9CA3AF"},
-    )
+    body_contents.append({"type": "separator", "margin": "md"})
+    body_contents.append({"type": "text", "text": f"RID: {request_id}", "size": "xs", "color": "#9CA3AF"})
 
     # ボタン: 代案1〜3 + その他
     buttons = []
@@ -939,7 +1060,7 @@ def _build_shadow_conflict_flex(
             "contents": [
                 {
                     "type": "text",
-                    "text": "📩 LINE予約確認（満席）",
+                    "text": f"📩 {customer_name}様 LINE予約確認（満席）",
                     "weight": "bold",
                     "size": "lg",
                     "color": "#ffffff",

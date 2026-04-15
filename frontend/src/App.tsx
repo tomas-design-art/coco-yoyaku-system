@@ -22,7 +22,7 @@ import AdminLoginModal from './components/Auth/AdminLoginModal';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { useSSE } from './hooks/useSSE';
 import { useNotification } from './hooks/useNotification';
-import { rescheduleReservation, getSeries } from './api/client';
+import { rescheduleReservation, getSeries, getPendingSeriesAlerts } from './api/client';
 import { extractErrorMessage } from './utils/errorUtils';
 import type { Reservation, SeriesResponse } from './types';
 
@@ -106,6 +106,18 @@ function AppContent() {
   }, [addToast]);
 
   useSSE(handleSSEEvent);
+
+  // 画面起動時: SSE で受け取れなかった未対応のシリーズ延長アラートをキャッチアップ
+  useEffect(() => {
+    getPendingSeriesAlerts()
+      .then((res) => {
+        const alerts = res.data ?? [];
+        if (alerts.length > 0) {
+          setSeriesExtensionTarget(alerts[0]); // 最新1件をモーダル表示
+        }
+      })
+      .catch(() => { /* ignore */ });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const refresh = () => setRefreshKey((k) => k + 1);
 

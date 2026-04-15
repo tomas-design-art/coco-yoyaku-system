@@ -174,6 +174,9 @@ export const getActiveSeries = () =>
 export const getSeries = (seriesId: number) =>
   api.get<SeriesResponse>(`/reservations/series/${seriesId}`);
 
+export const getPendingSeriesAlerts = () =>
+  api.get<SeriesResponse[]>('/reservations/series/pending-alerts');
+
 export const extendSeries = (seriesId: number, data: SeriesExtendRequest) =>
   api.post<BulkReservationResult>(`/reservations/series/${seriesId}/extend`, data);
 
