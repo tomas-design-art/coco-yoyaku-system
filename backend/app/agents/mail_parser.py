@@ -108,6 +108,14 @@ def parse_hotpepper_mail(raw_email: str) -> dict:
     if not patient_name:
         raise ValueError("氏名が取得できません")
 
+    # ── 氏名から読み（カタカナ）を抽出 ──
+    patient_reading: Optional[str] = None
+    if patient_name:
+        reading_m = re.search(r'[（(]\s*([\u30A0-\u30FF\u3000\s]+?)\s*[）)]', patient_name)
+        if reading_m:
+            patient_reading = reading_m.group(1).strip()
+            patient_name = re.sub(r'\s*[（(]\s*[\u30A0-\u30FF\u3000\s]+?\s*[）)]', '', patient_name).strip()
+
     # ── 来店日時 (必須) ──
     start_time = _parse_visit_datetime(sections.get("来店日時", ""), raw_email)
     if start_time is None:
@@ -141,6 +149,7 @@ def parse_hotpepper_mail(raw_email: str) -> dict:
         "event_type": event_type,
         "reservation_number": reservation_number,
         "patient_name": patient_name,
+        "patient_reading": patient_reading,
         "start_time": start_time,
         "end_time": end_time,
         "duration_minutes": duration_minutes,

@@ -534,5 +534,53 @@ class TestParseDefaults:
         assert result["practitioner_name"] == "山田花子"
 
 
+# ===========================================================================
+# 氏名カタカナ読み抽出テスト
+# ===========================================================================
+
+
+class TestPatientNameReading:
+    """氏名の（カタカナ）読み抽出"""
+
+    def test_reading_extracted(self):
+        """全角カッコ内のカタカナを reading に抽出"""
+        body = (
+            "■予約番号\n　BE77777\n"
+            "■氏名\n　井戸 貴之（イド タカユキ）\n"
+            "■来店日時\n　2026年04月01日（火）10:00\n"
+        )
+        result = parse_hotpepper_mail(body)
+        assert result["patient_name"] == "井戸 貴之"
+        assert result["patient_reading"] == "イド タカユキ"
+
+    def test_reading_half_width_parens(self):
+        """半角カッコでも読み抽出できる"""
+        body = (
+            "■予約番号\n　BE77778\n"
+            "■氏名\n　山田 太郎(ヤマダ タロウ)\n"
+            "■来店日時\n　2026年04月01日（火）11:00\n"
+        )
+        result = parse_hotpepper_mail(body)
+        assert result["patient_name"] == "山田 太郎"
+        assert result["patient_reading"] == "ヤマダ タロウ"
+
+    def test_no_reading(self):
+        """カッコなし→ reading は None"""
+        body = (
+            "■予約番号\n　BE77779\n"
+            "■氏名\n　テスト太郎\n"
+            "■来店日時\n　2026年04月01日（火）12:00\n"
+        )
+        result = parse_hotpepper_mail(body)
+        assert result["patient_name"] == "テスト太郎"
+        assert result["patient_reading"] is None
+
+    def test_existing_patterns_no_reading(self):
+        """既存パターンは全て reading=None"""
+        for mail in [SAMPLE_MAIL_CREATED_BASE, SAMPLE_MAIL_CANCEL, SAMPLE_MAIL_URGENT, SAMPLE_MAIL_NEXT_DAY]:
+            result = parse_hotpepper_mail(mail)
+            assert result["patient_reading"] is None, f"Failed for {result['patient_name']}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

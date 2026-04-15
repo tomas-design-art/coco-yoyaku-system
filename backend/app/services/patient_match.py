@@ -140,6 +140,7 @@ async def find_or_create_patient(
     name: str | None = None,
     phone: str | None = None,
     line_id: str | None = None,
+    reading: str | None = None,
     auto_number: bool = True,
 ) -> Patient:
     """既存患者を検索し、なければ新規作成。見つかった場合は不足フィールドを補完する。"""
@@ -158,6 +159,9 @@ async def find_or_create_patient(
         if line_id and not patient.line_id:
             patient.line_id = line_id
             updated = True
+        if reading and not patient.reading:
+            patient.reading = reading
+            updated = True
         if not patient.patient_number and auto_number:
             patient.patient_number = await _generate_patient_number(db)
             updated = True
@@ -171,6 +175,7 @@ async def find_or_create_patient(
         name=name,
         phone=phone,
         line_id=line_id,
+        reading=reading,
         auto_number=auto_number,
     )
 
@@ -181,6 +186,7 @@ async def create_new_patient(
     name: str | None = None,
     phone: str | None = None,
     line_id: str | None = None,
+    reading: str | None = None,
     auto_number: bool = True,
 ) -> Patient:
     """既存照合せずに患者を新規作成する。"""
@@ -194,6 +200,7 @@ async def create_new_patient(
         name=name or "不明",
         last_name=last_name,
         first_name=first_name,
+        reading=reading,
         phone=norm_phone,
         line_id=line_id,
         patient_number=patient_number,

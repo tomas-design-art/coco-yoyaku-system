@@ -400,7 +400,7 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
         logger.info(f"重複スキップ: source_ref={parsed['reservation_number']} は登録済み")
         return {"status": "skipped", "reason": "duplicate", "reservation_number": parsed["reservation_number"]}
 
-    patient = await _find_or_create_patient(db, parsed["patient_name"])
+    patient = await _find_or_create_patient(db, parsed["patient_name"], reading=parsed.get("patient_reading"))
     hotpepper_color_id = await _resolve_hotpepper_color_id(db)
 
     # 手動登録済みの同一患者・同一時間枠があれば、HP由来情報をリンクして重複作成しない
@@ -643,10 +643,10 @@ async def _notify_hotpepper_conflict_risk(
 # ---------------------------------------------------------------------------
 
 
-async def _find_or_create_patient(db: AsyncSession, name: str) -> Patient:
+async def _find_or_create_patient(db: AsyncSession, name: str, reading: str | None = None) -> Patient:
     """患者を名前で検索（チャネル横断マッチング）。見つからなければ新規作成。"""
     from app.services.patient_match import find_or_create_patient
-    return await find_or_create_patient(db, name=name)
+    return await find_or_create_patient(db, name=name, reading=reading)
 
 
 async def _find_existing_manual_match(
