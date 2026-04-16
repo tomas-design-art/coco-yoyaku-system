@@ -76,7 +76,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         checkAuth();
     }, []);
 
-    // Auto-expire admin mode after 30min client-side
+    // Auto-expire admin mode after 8h client-side
     useEffect(() => {
         if (role === 'admin') {
             adminTimerRef.current = setTimeout(() => {
@@ -93,12 +93,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
                     setAuthenticated(false);
                     setRole(null);
                 }
-            }, 30 * 60 * 1000);
+            }, 8 * 60 * 60 * 1000);
         }
         return () => {
             if (adminTimerRef.current) clearTimeout(adminTimerRef.current);
         };
     }, [role, applyToken]);
+
+    // Listen for server-side admin token expiration (from 401 interceptor)
+    useEffect(() => {
+        const handleAdminExpired = () => {
+            if (adminTimerRef.current) clearTimeout(adminTimerRef.current);
+            localStorage.removeItem(ADMIN_TOKEN_KEY);
+            const staffToken = localStorage.getItem(STAFF_TOKEN_KEY);
+            if (staffToken) {
+                setRole('staff');
+            } else {
+                localStorage.removeItem(AUTH_TOKEN_KEY);
+                setAuthenticated(false);
+                setRole(null);
+            }
+        };
+        window.addEventListener('auth:admin-expired', handleAdminExpired);
+        return () => window.removeEventListener('auth:admin-expired', handleAdminExpired);
+    }, []);
 
     const staffLoginAction = useCallback(async (pin: string): Promise<boolean> => {
         try {

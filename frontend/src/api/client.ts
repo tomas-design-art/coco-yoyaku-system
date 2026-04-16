@@ -50,6 +50,32 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
+// 401 response interceptor — admin token 期限切れ時に staff token で自動リトライ
+api.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const original = error.config;
+    if (
+      error.response?.status === 401 &&
+      !original._retry
+    ) {
+      const currentToken = localStorage.getItem('auth_token');
+      const staffToken = localStorage.getItem('staff_token');
+      // staff token が存在し、現在のトークンと異なる場合にフォールバック
+      if (staffToken && staffToken !== currentToken) {
+        original._retry = true;
+        localStorage.removeItem('admin_token');
+        localStorage.setItem('auth_token', staffToken);
+        original.headers.Authorization = `Bearer ${staffToken}`;
+        // useAuth に role 降格を通知
+        window.dispatchEvent(new CustomEvent('auth:admin-expired'));
+        return api(original);
+      }
+    }
+    return Promise.reject(error);
+  },
+);
+
 // ---- Practitioners ----
 export const getPractitioners = () => api.get<Practitioner[]>('/practitioners/');
 export const createPractitioner = (data: Partial<Practitioner>) =>
@@ -120,6 +146,8 @@ export const updateMenu = (id: number, data: Partial<Menu>) =>
   api.put<Menu>(`/menus/${id}`, data);
 export const deleteMenu = (id: number) => api.delete<Menu>(`/menus/${id}`);
 export const purgeMenu = (id: number) => api.post(`/menus/${id}/purge`);
+export const reorderMenus = (items: { id: number; display_order: number }[]) =>
+  api.put<Menu[]>('/menus/reorder', items);
 
 // ---- Reservations ----
 export const getReservations = (params: {

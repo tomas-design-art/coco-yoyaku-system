@@ -98,7 +98,11 @@ def build_reservation_response(reservation: Reservation) -> dict:
     """ReservationレスポンスDictを構築"""
     resp = {
         "id": reservation.id,
+        "patient": None,
         "practitioner_id": reservation.practitioner_id,
+        "practitioner_name": None,
+        "menu": None,
+        "color": None,
         "color_id": reservation.color_id,
         "start_time": reservation.start_time,
         "end_time": reservation.end_time,
@@ -139,6 +143,10 @@ async def create_reservation(
     db: AsyncSession, data: ReservationCreate
 ) -> dict:
     """予約登録"""
+    # patient_id=0 は無効 → Noneに正規化
+    if data.patient_id is not None and data.patient_id <= 0:
+        data.patient_id = None
+
     # color_id が未指定ならメニューの色を引き継ぐ（LINE/Web等の自動登録向け）
     resolved_color_id = data.color_id
     if resolved_color_id is None and data.menu_id is not None:

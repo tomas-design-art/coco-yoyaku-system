@@ -21,7 +21,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 ALGORITHM = "HS256"
 STAFF_TOKEN_HOURS = 24
-ADMIN_TOKEN_MINUTES = 30
+ADMIN_TOKEN_HOURS = 8
 
 
 def _create_token(role: str, expires_delta: timedelta) -> str:
@@ -125,7 +125,7 @@ async def admin_login(body: AdminLoginRequest, db: AsyncSession = Depends(get_db
         raise HTTPException(status_code=401, detail="IDまたはパスワードが正しくありません")
     if not pwd_context.verify(body.password, stored_hash):
         raise HTTPException(status_code=401, detail="IDまたはパスワードが正しくありません")
-    token = _create_token("admin", timedelta(minutes=ADMIN_TOKEN_MINUTES))
+    token = _create_token("admin", timedelta(hours=ADMIN_TOKEN_HOURS))
     return {"token": token, "role": "admin"}
 
 

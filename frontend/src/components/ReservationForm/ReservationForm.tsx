@@ -19,12 +19,10 @@ interface ReservationFormProps {
   };
 }
 
-const channels: { value: Channel; label: string }[] = [
-  { value: 'PHONE', label: '📞 電話' },
-  { value: 'WALK_IN', label: '🏥 窓口' },
-  { value: 'LINE', label: '💬 LINE' },
-  { value: 'HOTPEPPER', label: '🔥 HotPepper' },
-  { value: 'CHATBOT', label: '🤖 チャットボット' },
+const channels: { value: Channel; label: string; icon: string }[] = [
+  { value: 'PHONE', label: '電話', icon: '📞' },
+  { value: 'WALK_IN', label: '窓口', icon: '🏥' },
+  { value: 'LINE', label: 'LINE', icon: '💬' },
 ];
 
 export default function ReservationForm({ isOpen, onClose, onSuccess, initialData }: ReservationFormProps) {
@@ -146,12 +144,16 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
 
   // 患者選択時にデフォルトメニュー・時間を自動適用
   const handlePatientSelect = (patient: Patient) => {
-    setPatientId(patient.id);
+    setPatientId(patient.id || null);
     setPatientName(patient.name);
     if (patient.default_menu_id && menus.some((m) => m.id === patient.default_menu_id)) {
       setMenuId(patient.default_menu_id);
-    }
-    if (patient.default_duration && !menuId) {
+      // 患者のデフォルト時間があればそれを使用、なければメニューのベース時間をuseEffectが適用
+      if (patient.default_duration) {
+        setSelectedDuration(patient.default_duration);
+      }
+    } else if (patient.default_duration) {
+      // メニュー未設定時は直接終了時刻を設定
       const [h, m] = startTime.split(':').map(Number);
       const totalMin = h * 60 + m + patient.default_duration;
       setEndTime(minutesToTime(totalMin));
@@ -398,15 +400,21 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
           {/* Channel */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">チャネル <span className="text-red-500">*</span></label>
-            <select
-              value={channel}
-              onChange={(e) => setChannel(e.target.value as Channel)}
-              className="w-full border rounded px-3 py-2 text-sm"
-            >
+            <div className="flex gap-2">
               {channels.map((c) => (
-                <option key={c.value} value={c.value}>{c.label}</option>
+                <button
+                  key={c.value}
+                  type="button"
+                  onClick={() => setChannel(c.value)}
+                  className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium border-2 transition-all ${channel === c.value
+                      ? 'border-blue-500 bg-blue-50 text-blue-700 shadow-sm'
+                      : 'border-gray-200 bg-white text-gray-600 hover:border-gray-300 hover:bg-gray-50'
+                    }`}
+                >
+                  <span>{c.icon}</span> {c.label}
+                </button>
               ))}
-            </select>
+            </div>
           </div>
 
           {/* Color */}

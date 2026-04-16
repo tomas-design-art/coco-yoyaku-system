@@ -1,7 +1,7 @@
-import { useState, useEffect } from 'react';
-import { Plus, Edit2, Trash2, X } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { Plus, Edit2, Trash2, X, GripVertical } from 'lucide-react';
 import type { Menu, ReservationColor, MenuPriceTier } from '../../types';
-import { getMenus, createMenu, updateMenu, deleteMenu, purgeMenu, getReservationColors } from '../../api/client';
+import { getMenus, createMenu, updateMenu, deleteMenu, purgeMenu, getReservationColors, reorderMenus } from '../../api/client';
 import { extractErrorMessage } from '../../utils/errorUtils';
 
 interface TierDraft {
@@ -23,6 +23,12 @@ export default function MenuManager() {
   const [editingWasInactive, setEditingWasInactive] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [priceTiers, setPriceTiers] = useState<TierDraft[]>([]);
+  const [reordering, setReordering] = useState(false);
+
+  // Drag-and-drop state
+  const dragItem = useRef<number | null>(null);
+  const dragOverItem = useRef<number | null>(null);
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
 
   const fetchData = async () => {
     try {
@@ -144,13 +150,66 @@ export default function MenuManager() {
     ).join('、');
   };
 
+  const handleDragStart = useCallback((index: number) => {
+    dragItem.current = index;
+    setDragIdx(index);
+  }, []);
+
+  const handleDragEnter = useCallback((index: number) => {
+    dragOverItem.current = index;
+    if (dragItem.current === null || dragItem.current === index) return;
+    setMenus(prev => {
+      const updated = [...prev];
+      const [dragged] = updated.splice(dragItem.current!, 1);
+      updated.splice(index, 0, dragged);
+      dragItem.current = index;
+      return updated;
+    });
+  }, []);
+
+  const handleDragEnd = useCallback(() => {
+    dragItem.current = null;
+    dragOverItem.current = null;
+    setDragIdx(null);
+  }, []);
+
+  const saveReorder = async () => {
+    setError(null);
+    try {
+      const items = menus.map((m, i) => ({ id: m.id, display_order: i }));
+      const res = await reorderMenus(items);
+      setMenus(res.data ?? []);
+      setReordering(false);
+    } catch (err) {
+      setError(extractErrorMessage(err, '並び替えの保存に失敗しました'));
+    }
+  };
+
   return (
     <div className="max-w-2xl mx-auto p-6">
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold">メニュー管理</h1>
-        <button onClick={() => { setShowForm(true); setEditingId(null); }} className="flex items-center gap-1 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600">
-          <Plus size={16} /> 追加
-        </button>
+        <div className="flex gap-2">
+          {reordering ? (
+            <>
+              <button onClick={saveReorder} className="flex items-center gap-1 px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600 text-sm">
+                並び順を保存
+              </button>
+              <button onClick={() => { setReordering(false); fetchData(); }} className="px-4 py-2 border rounded hover:bg-gray-100 text-sm">
+                キャンセル
+              </button>
+            </>
+          ) : (
+            <>
+              <button onClick={() => setReordering(true)} className="flex items-center gap-1 px-4 py-2 border rounded hover:bg-gray-100 text-sm">
+                <GripVertical size={16} /> 並び替え
+              </button>
+              <button onClick={() => { setShowForm(true); setEditingId(null); }} className="flex items-center gap-1 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 text-sm">
+                <Plus size={16} /> 追加
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       {error && (
@@ -256,10 +315,21 @@ export default function MenuManager() {
         {menus.length === 0 && (
           <p className="text-center text-gray-400 text-sm py-8">メニューが登録されていません</p>
         )}
-        {menus.map((m) => (
-          <div key={m.id} className={`p-3 bg-white rounded border ${!m.is_active ? 'opacity-50' : ''}`}>
+        {menus.map((m, idx) => (
+          <div
+            key={m.id}
+            draggable={reordering}
+            onDragStart={() => handleDragStart(idx)}
+            onDragEnter={() => handleDragEnter(idx)}
+            onDragEnd={handleDragEnd}
+            onDragOver={(e) => e.preventDefault()}
+            className={`p-3 bg-white rounded border ${!m.is_active ? 'opacity-50' : ''} ${reordering ? 'cursor-grab active:cursor-grabbing' : ''} ${dragIdx === idx ? 'opacity-40 border-blue-400' : ''} transition-opacity`}
+          >
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 flex-wrap">
+                {reordering && (
+                  <GripVertical size={16} className="text-gray-400 shrink-0" />
+                )}
                 {m.color && (
                   <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs" style={{ backgroundColor: m.color.color_code + '22', color: m.color.color_code }}>
                     <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: m.color.color_code }} />
@@ -276,13 +346,18 @@ export default function MenuManager() {
                 {m.price != null && m.price > 0 && <span className="text-sm text-gray-500">¥{m.price.toLocaleString()}</span>}
                 {!m.is_active && <span className="text-xs bg-gray-200 px-2 py-0.5 rounded">無効</span>}
               </div>
-              <div className="flex gap-1 shrink-0">
-                <button onClick={() => handleEdit(m)} className="p-1.5 hover:bg-gray-100 rounded"><Edit2 size={14} /></button>
-                {m.is_active && (
-                  <button onClick={() => handleDelete(m.id)} className="p-1.5 hover:bg-red-50 text-red-500 rounded"><Trash2 size={14} /></button>
-                )}
-                {!m.is_active && (
-                  <button onClick={() => handlePermanentDelete(m.id)} className="p-1.5 hover:bg-red-50 text-red-600 rounded" title="完全削除"><Trash2 size={14} /></button>
+              <div className="flex items-center gap-1 shrink-0">
+                <span className="text-[10px] text-gray-300 font-mono mr-1">ID:{m.id}</span>
+                {!reordering && (
+                  <>
+                    <button onClick={() => handleEdit(m)} className="p-1.5 hover:bg-gray-100 rounded"><Edit2 size={14} /></button>
+                    {m.is_active && (
+                      <button onClick={() => handleDelete(m.id)} className="p-1.5 hover:bg-red-50 text-red-500 rounded"><Trash2 size={14} /></button>
+                    )}
+                    {!m.is_active && (
+                      <button onClick={() => handlePermanentDelete(m.id)} className="p-1.5 hover:bg-red-50 text-red-600 rounded" title="完全削除"><Trash2 size={14} /></button>
+                    )}
+                  </>
                 )}
               </div>
             </div>

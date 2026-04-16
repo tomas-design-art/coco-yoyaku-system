@@ -450,7 +450,15 @@ export default function PatientList() {
                     <label className="block text-xs text-gray-500 mb-1">デフォルトメニュー</label>
                     <select
                       value={form.default_menu_id || ''}
-                      onChange={(e) => setForm({ ...form, default_menu_id: e.target.value ? Number(e.target.value) : null })}
+                      onChange={(e) => {
+                        const id = e.target.value ? Number(e.target.value) : null;
+                        const selected = menus.find((m) => m.id === id);
+                        setForm({
+                          ...form,
+                          default_menu_id: id,
+                          default_duration: selected ? selected.duration_minutes : null,
+                        });
+                      }}
                       className="w-full border rounded px-2 py-1.5 text-sm"
                     >
                       <option value="">未設定</option>
@@ -460,17 +468,52 @@ export default function PatientList() {
                     </select>
                   </div>
                   <div>
-                    <label className="block text-xs text-gray-500 mb-1">デフォルト時間（分）</label>
-                    <input
-                      type="number"
-                      min={5}
-                      max={300}
-                      step={5}
-                      value={form.default_duration || ''}
-                      onChange={(e) => setForm({ ...form, default_duration: e.target.value ? Number(e.target.value) : null })}
-                      className="w-full border rounded px-2 py-1.5 text-sm"
-                      placeholder="例: 60"
-                    />
+                    <label className="block text-xs text-gray-500 mb-1">デフォルト時間</label>
+                    {(() => {
+                      const selMenu = form.default_menu_id ? menus.find((m) => m.id === form.default_menu_id) : null;
+                      if (selMenu) {
+                        const opts: { duration: number; label: string }[] = [];
+                        opts.push({ duration: selMenu.duration_minutes, label: `${selMenu.duration_minutes}分` });
+                        if (selMenu.price_tiers?.length) {
+                          for (const t of selMenu.price_tiers) {
+                            if (!opts.some((o) => o.duration === t.duration_minutes)) {
+                              opts.push({ duration: t.duration_minutes, label: `${t.duration_minutes}分` });
+                            }
+                          }
+                        }
+                        if (selMenu.is_duration_variable && selMenu.max_duration_minutes) {
+                          for (let d = selMenu.duration_minutes + 10; d <= selMenu.max_duration_minutes; d += 10) {
+                            if (!opts.some((o) => o.duration === d)) {
+                              opts.push({ duration: d, label: `${d}分` });
+                            }
+                          }
+                        }
+                        opts.sort((a, b) => a.duration - b.duration);
+                        return (
+                          <select
+                            value={form.default_duration || ''}
+                            onChange={(e) => setForm({ ...form, default_duration: e.target.value ? Number(e.target.value) : null })}
+                            className="w-full border rounded px-2 py-1.5 text-sm"
+                          >
+                            {opts.map((o) => (
+                              <option key={o.duration} value={o.duration}>{o.label}</option>
+                            ))}
+                          </select>
+                        );
+                      }
+                      return (
+                        <input
+                          type="number"
+                          min={5}
+                          max={300}
+                          step={5}
+                          value={form.default_duration || ''}
+                          onChange={(e) => setForm({ ...form, default_duration: e.target.value ? Number(e.target.value) : null })}
+                          className="w-full border rounded px-2 py-1.5 text-sm"
+                          placeholder="メニューを選択"
+                        />
+                      );
+                    })()}
                   </div>
                   <div className="col-span-2">
                     <label className="block text-xs text-gray-500 mb-1">担当施術者（いつもの）</label>
@@ -548,6 +591,49 @@ export default function PatientList() {
         </form>
       )}
 
+      {/* Pagination (top) */}
+      {!query && totalPages > 1 && (
+        <div className="flex items-center justify-between text-sm text-gray-600">
+          <span>全 {total} 件（{page}/{totalPages} ページ）</span>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setPage(p => Math.max(1, p - 1))}
+              disabled={page <= 1}
+              className="p-1.5 rounded border hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed"
+            >
+              <ChevronLeft size={16} />
+            </button>
+            {Array.from({ length: totalPages }, (_, i) => i + 1)
+              .filter(p => p === 1 || p === totalPages || Math.abs(p - page) <= 2)
+              .reduce<(number | '...')[]>((acc, p, i, arr) => {
+                if (i > 0 && p - (arr[i - 1] as number) > 1) acc.push('...');
+                acc.push(p);
+                return acc;
+              }, [])
+              .map((p, i) =>
+                p === '...' ? (
+                  <span key={`dot-top-${i}`} className="px-1">…</span>
+                ) : (
+                  <button
+                    key={`top-${p}`}
+                    onClick={() => setPage(p)}
+                    className={`px-2.5 py-1 rounded border text-xs ${page === p ? 'bg-blue-500 text-white border-blue-500' : 'hover:bg-gray-100'}`}
+                  >
+                    {p}
+                  </button>
+                )
+              )}
+            <button
+              onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+              disabled={page >= totalPages}
+              className="p-1.5 rounded border hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed"
+            >
+              <ChevronRight size={16} />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Table */}
       <div className="bg-white rounded border overflow-hidden">
         <table className="w-full text-sm">
@@ -599,8 +685,8 @@ export default function PatientList() {
         </table>
       </div>
 
-      {/* Pagination */}
-      {!query && totalPages > 0 && (
+      {/* Pagination (bottom) */}
+      {!query && totalPages > 1 && (
         <div className="flex items-center justify-between mt-4 text-sm text-gray-600">
           <span>全 {total} 件（{page}/{totalPages} ページ）</span>
           <div className="flex items-center gap-1">

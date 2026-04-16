@@ -151,6 +151,10 @@ async def bulk_create_reservations(
     if not data.end_date and not data.count:
         raise HTTPException(status_code=400, detail="end_date または count を指定してください")
 
+    # patient_id=0 は無効 → Noneに正規化
+    if data.patient_id is not None and data.patient_id <= 0:
+        data.patient_id = None
+
     dates = _generate_dates(data.start_date, data.frequency, data.end_date, data.count)
     if not dates:
         raise HTTPException(status_code=400, detail="生成対象の日付がありません")

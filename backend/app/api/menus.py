@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete as sa_delete
 
@@ -12,8 +13,26 @@ from app.api.auth import require_admin
 router = APIRouter(prefix="/api/menus", tags=["menus"])
 
 
+class ReorderItem(BaseModel):
+    id: int
+    display_order: int
+
+
 @router.get("/", response_model=list[MenuResponse])
 async def list_menus(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Menu).order_by(Menu.display_order, Menu.id)
+    )
+    return result.scalars().unique().all()
+
+
+@router.put("/reorder", response_model=list[MenuResponse])
+async def reorder_menus(items: list[ReorderItem], db: AsyncSession = Depends(get_db), _auth: dict = Depends(require_admin)):
+    for item in items:
+        await db.execute(
+            update(Menu).where(Menu.id == item.id).values(display_order=item.display_order)
+        )
+    await db.commit()
     result = await db.execute(
         select(Menu).order_by(Menu.display_order, Menu.id)
     )
@@ -100,3 +119,4 @@ async def purge_menu(menu_id: int, db: AsyncSession = Depends(get_db), _auth: di
     await db.delete(menu)
     await db.commit()
     return {"status": "ok", "deleted_id": menu_id}
+
