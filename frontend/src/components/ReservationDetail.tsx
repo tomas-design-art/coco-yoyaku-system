@@ -399,7 +399,7 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
               {r.menu && (
                 <div>
                   <span className="text-xs text-gray-500">メニュー</span>
-                  <p>{r.menu.name} ({r.menu.duration_minutes}分)</p>
+                  <p>{r.menu.name} ({durationMin}分)</p>
                 </div>
               )}
 
