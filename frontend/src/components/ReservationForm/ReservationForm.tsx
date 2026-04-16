@@ -288,6 +288,7 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
             <label className="block text-sm font-medium text-gray-700 mb-1">患者</label>
             <PatientSearch
               onSelect={handlePatientSelect}
+              onClear={() => { setPatientId(null); setPatientName(''); }}
               selectedName={patientName}
             />
           </div>
@@ -407,8 +408,8 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
                   type="button"
                   onClick={() => setChannel(c.value)}
                   className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium border-2 transition-all ${channel === c.value
-                      ? 'border-blue-500 bg-blue-50 text-blue-700 shadow-sm'
-                      : 'border-gray-200 bg-white text-gray-600 hover:border-gray-300 hover:bg-gray-50'
+                    ? 'border-blue-500 bg-blue-50 text-blue-700 shadow-sm'
+                    : 'border-gray-200 bg-white text-gray-600 hover:border-gray-300 hover:bg-gray-50'
                     }`}
                 >
                   <span>{c.icon}</span> {c.label}

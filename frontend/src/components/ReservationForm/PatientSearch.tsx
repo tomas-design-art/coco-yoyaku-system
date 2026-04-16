@@ -1,15 +1,16 @@
 import { useState, useEffect, useRef } from 'react';
-import { Search, Plus } from 'lucide-react';
+import { Search, Plus, X as XIcon } from 'lucide-react';
 import type { Patient, CandidateResponse } from '../../types';
 import { searchPatients, createPatient, findCandidates } from '../../api/client';
 import { extractErrorMessage } from '../../utils/errorUtils';
 
 interface PatientSearchProps {
   onSelect: (patient: Patient) => void;
+  onClear: () => void;
   selectedName: string;
 }
 
-export default function PatientSearch({ onSelect, selectedName }: PatientSearchProps) {
+export default function PatientSearch({ onSelect, onClear, selectedName }: PatientSearchProps) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<Patient[]>([]);
   const [showDropdown, setShowDropdown] = useState(false);
@@ -148,17 +149,31 @@ export default function PatientSearch({ onSelect, selectedName }: PatientSearchP
         <div className="mb-2 p-2 bg-red-50 border border-red-200 rounded text-red-700 text-xs">{error}</div>
       )}
       <div className="relative">
-        <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
-        <input
-          type="text"
-          value={selectedName || query}
-          onChange={(e) => {
-            setQuery(e.target.value);
-            if (selectedName) onSelect({ id: 0, name: '' } as Patient);
-          }}
-          placeholder="名前・カナ・電話番号で検索"
-          className="w-full border rounded pl-9 pr-3 py-2 text-sm"
-        />
+        {selectedName ? (
+          <div className="flex items-center w-full border rounded px-3 py-2 text-sm bg-blue-50 border-blue-200">
+            <Search size={16} className="text-blue-400 mr-2 shrink-0" />
+            <span className="font-medium text-blue-800 truncate flex-1">{selectedName}</span>
+            <button
+              type="button"
+              onClick={() => { onClear(); setQuery(''); }}
+              className="ml-2 p-0.5 rounded hover:bg-blue-100 text-blue-400 hover:text-blue-600 shrink-0"
+              title="患者選択を解除"
+            >
+              <XIcon size={16} />
+            </button>
+          </div>
+        ) : (
+          <>
+            <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="名前・カナ・電話番号で検索"
+              className="w-full border rounded pl-9 pr-3 py-2 text-sm"
+            />
+          </>
+        )}
       </div>
 
       {showDropdown && results.length > 0 && (
