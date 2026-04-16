@@ -1,12 +1,15 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { ChevronLeft, ChevronRight } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Minus, Plus } from 'lucide-react';
 import type { Practitioner, Reservation, ReservationColor, WeeklySchedule, PractitionerDayStatus, BusinessHoursDay } from '../../types';
 import { CHANNEL_ICONS } from '../../types';
 import { generateTimeSlots, dateToMinutes, DAY_START, DAY_END, SLOT_INTERVAL, formatDate, getWeekDates, WEEKDAY_LABELS, getTodayJST, getNowJSTMinutes, timeToMinutes } from '../../utils/timeUtils';
 import { getPractitioners, getReservations, getReservationColors, getSettings, getWeeklySchedules, getScheduleStatus, getBusinessHoursRange, createUnavailableTime, deleteUnavailableTime } from '../../api/client';
 import DragSelect from './DragSelect';
 
-const SLOT_HEIGHT = 20;
+const DEFAULT_SLOT_HEIGHT = 20;
+const MIN_SLOT_HEIGHT = 6;
+const MAX_SLOT_HEIGHT = 40;
+const ZOOM_STEP = 2;
 const TIME_COL_WIDTH = 60;
 const HEADER_HEIGHT = 32;
 const WEEK_HEADER_HEIGHT = 52; // date line + practitioner names line
@@ -50,9 +53,12 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
   const [isDraggingRescheduleTarget, setIsDraggingRescheduleTarget] = useState(false);
   const rescheduleDragAnchorMinutesRef = useRef(0);
   const gridRef = useRef<HTMLDivElement>(null);
+  const [slotHeight, setSlotHeight] = useState(DEFAULT_SLOT_HEIGHT);
 
   // 営業時間に基づく動的スロット
   const slots = useMemo(() => generateTimeSlots(dayStart, dayEnd), [dayStart, dayEnd]);
+
+  const zoomPercent = Math.round((slotHeight / DEFAULT_SLOT_HEIGHT) * 100);
 
   // visible & active practitioners only
   const visiblePractitioners = useMemo(
@@ -319,7 +325,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     // 営業開始前
     if (openMin > dayStart) {
       const topPx = headerH;
-      const heightPx = ((openMin - dayStart) / SLOT_INTERVAL) * SLOT_HEIGHT;
+      const heightPx = ((openMin - dayStart) / SLOT_INTERVAL) * slotHeight;
       overlays.push(
         <div
           key="before"
@@ -333,8 +339,8 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
 
     // 営業終了後
     if (closeMin < dayEnd) {
-      const topPx = ((closeMin - dayStart) / SLOT_INTERVAL) * SLOT_HEIGHT + headerH;
-      const heightPx = ((dayEnd - closeMin) / SLOT_INTERVAL) * SLOT_HEIGHT;
+      const topPx = ((closeMin - dayStart) / SLOT_INTERVAL) * slotHeight + headerH;
+      const heightPx = ((dayEnd - closeMin) / SLOT_INTERVAL) * slotHeight;
       overlays.push(
         <div
           key="after"
@@ -347,18 +353,18 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     }
 
     return overlays.length > 0 ? <>{overlays}</> : null;
-  }, [getBusinessHoursForDate, getScheduleForDate, dayStart, dayEnd]);
+  }, [getBusinessHoursForDate, getScheduleForDate, dayStart, dayEnd, slotHeight]);
 
   // ----- レンダリング用ヘルパー -----
   const isRescheduling = !!reschedulingReservation;
 
   const getDropStartMinutes = useCallback((clientY: number, rect: DOMRect, headerH: number, durationMin: number) => {
     const relativeY = clientY - rect.top - headerH;
-    const pointerMinutes = dayStart + Math.round(relativeY / SLOT_HEIGHT) * SLOT_INTERVAL;
+    const pointerMinutes = dayStart + Math.round(relativeY / slotHeight) * SLOT_INTERVAL;
     const rawMinutes = pointerMinutes - rescheduleDragAnchorMinutesRef.current;
     const maxStart = Math.max(dayStart, dayEnd - durationMin);
     return Math.min(Math.max(rawMinutes, dayStart), maxStart);
-  }, [dayStart, dayEnd]);
+  }, [dayStart, dayEnd, slotHeight]);
 
   const handleRescheduleDrop = useCallback((e: React.DragEvent<HTMLDivElement>, practitionerId: number, date: Date, headerH: number) => {
     if (!isRescheduling || !onRescheduleSlotClick || !reschedulingReservation) return;
@@ -438,16 +444,16 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
       ? Math.round((new Date(reschedulingReservation.end_time).getTime() - new Date(reschedulingReservation.start_time).getTime()) / 60000) + rescheduleDurationOffset
       : 0;
     const pendingTop = hasPendingTarget
-      ? ((pendingRescheduleTarget!.startMinutes - dayStart) / SLOT_INTERVAL) * SLOT_HEIGHT
+      ? ((pendingRescheduleTarget!.startMinutes - dayStart) / SLOT_INTERVAL) * slotHeight
       : 0;
     const pendingHeight = hasPendingTarget
-      ? (pendingDurationMin / SLOT_INTERVAL) * SLOT_HEIGHT
+      ? (pendingDurationMin / SLOT_INTERVAL) * slotHeight
       : 0;
 
     return (
       <div
         className="relative"
-        style={{ minHeight: slots.length * SLOT_HEIGHT + headerH }}
+        style={{ minHeight: slots.length * slotHeight + headerH }}
         onDragOver={(e) => {
           if (dayOff || !isDraggingRescheduleTarget) return;
           e.preventDefault();
@@ -478,7 +484,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
         ) : (
           <DragSelect
             slots={slots}
-            slotHeight={SLOT_HEIGHT}
+            slotHeight={slotHeight}
             onSlotClick={(minutes) => {
               if (isRescheduling && onRescheduleSlotClick) {
                 onRescheduleSlotClick(practitionerId, minutes, date);
@@ -503,7 +509,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                 className="absolute left-0 right-0 pointer-events-none"
                 style={{
                   top: headerH,
-                  height: ((workingHours.start - dayStart) / SLOT_INTERVAL) * SLOT_HEIGHT,
+                  height: ((workingHours.start - dayStart) / SLOT_INTERVAL) * slotHeight,
                   zIndex: 3,
                   background: BLOCKED_HATCH_BG,
                   backgroundColor: BLOCKED_BASE_BG,
@@ -516,8 +522,8 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               <div
                 className="absolute left-0 right-0 pointer-events-none"
                 style={{
-                  top: ((workingHours.end - dayStart) / SLOT_INTERVAL) * SLOT_HEIGHT + headerH,
-                  height: ((dayEnd - workingHours.end) / SLOT_INTERVAL) * SLOT_HEIGHT,
+                  top: ((workingHours.end - dayStart) / SLOT_INTERVAL) * slotHeight + headerH,
+                  height: ((dayEnd - workingHours.end) / SLOT_INTERVAL) * slotHeight,
                   zIndex: 3,
                   background: BLOCKED_HATCH_BG,
                   backgroundColor: BLOCKED_BASE_BG,
@@ -534,15 +540,15 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
           const [eh, em] = ut.end_time.split(':').map(Number);
           const startMin = sh * 60 + sm;
           const endMin = eh * 60 + em;
-          const top = ((startMin - dayStart) / SLOT_INTERVAL) * SLOT_HEIGHT + headerH;
-          const height = ((endMin - startMin) / SLOT_INTERVAL) * SLOT_HEIGHT;
+          const top = ((startMin - dayStart) / SLOT_INTERVAL) * slotHeight + headerH;
+          const height = ((endMin - startMin) / SLOT_INTERVAL) * slotHeight;
           return (
             <div
               key={`ut-${ut.id}`}
               className="absolute left-0 right-0 flex items-center justify-center cursor-pointer"
               style={{
                 top,
-                height: Math.max(height, SLOT_HEIGHT),
+                height: Math.max(height, slotHeight),
                 zIndex: 4,
                 background: BLOCKED_HATCH_BG,
                 backgroundColor: BLOCKED_BASE_BG,
@@ -562,10 +568,10 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
         {getReservationsForColumn(practitionerId, date).map((r) => {
           const startMin = dateToMinutes(r.start_time);
           const endMin = dateToMinutes(r.end_time);
-          const top = ((startMin - dayStart) / SLOT_INTERVAL) * SLOT_HEIGHT;
+          const top = ((startMin - dayStart) / SLOT_INTERVAL) * slotHeight;
           const isTarget = isRescheduling && reschedulingReservation?.id === r.id;
           const adjustedEndMin = isTarget ? endMin + rescheduleDurationOffset : endMin;
-          const height = ((adjustedEndMin - startMin) / SLOT_INTERVAL) * SLOT_HEIGHT;
+          const height = ((adjustedEndMin - startMin) / SLOT_INTERVAL) * slotHeight;
           const originalDuration = Math.round((new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 60000);
           const targetDate = pendingRescheduleTarget?.date ?? new Date(r.start_time);
           const targetPractitionerId = pendingRescheduleTarget?.practitionerId ?? r.practitioner_id;
@@ -589,7 +595,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               className={`absolute left-0.5 right-0.5 rounded px-1 text-white shadow-sm ${isTarget ? 'ring-2 ring-blue-400 animate-pulse pointer-events-auto cursor-grab active:cursor-grabbing overflow-visible' : 'overflow-hidden'} ${isRescheduling ? '' : 'cursor-pointer hover:opacity-90'}`}
               style={{
                 top: top + headerH,
-                height: Math.max(height, SLOT_HEIGHT),
+                height: Math.max(height, slotHeight),
                 backgroundColor: getBlockColor(r),
                 zIndex: isTarget ? 30 : 2,
                 fontSize: 10,
@@ -606,7 +612,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                 const blockRect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
                 const anchorPx = Math.max(0, Math.min(e.clientY - blockRect.top, blockRect.height));
                 // Keep the grab position inside the bar so tiny shifts (e.g. +5/+10 min) are easy to control.
-                rescheduleDragAnchorMinutesRef.current = Math.round(anchorPx / SLOT_HEIGHT) * SLOT_INTERVAL;
+                rescheduleDragAnchorMinutesRef.current = Math.round(anchorPx / slotHeight) * SLOT_INTERVAL;
 
                 setIsDraggingRescheduleTarget(true);
               }}
@@ -620,7 +626,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                 <span>{CHANNEL_ICONS[r.channel]}</span>
                 <span className="font-medium truncate">{r.patient?.name || '飛び込み'}</span>
               </div>
-              {height >= SLOT_HEIGHT * 2 && (
+              {height >= slotHeight * 2 && (
                 <div className="truncate opacity-90">{r.menu?.name || ''}</div>
               )}
               {/* ⊖ / ⊕ duration adjust buttons on the target bar */}
@@ -661,7 +667,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
             className="absolute left-0.5 right-0.5 rounded border-2 border-blue-500 bg-blue-500/20 pointer-events-none"
             style={{
               top: pendingTop + headerH,
-              height: Math.max(pendingHeight, SLOT_HEIGHT),
+              height: Math.max(pendingHeight, slotHeight),
               zIndex: 9,
             }}
           >
@@ -676,7 +682,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
             <div
               className="absolute left-0 right-0 pointer-events-none"
               style={{
-                top: ((nowMinutes - dayStart) / SLOT_INTERVAL) * SLOT_HEIGHT + headerH,
+                top: ((nowMinutes - dayStart) / SLOT_INTERVAL) * slotHeight + headerH,
                 zIndex: 6,
               }}
             >
@@ -745,6 +751,48 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
           </span>
           <button onClick={goNext} className="p-1 hover:bg-gray-100 rounded"><ChevronRight size={18} /></button>
           <button onClick={goToday} className="ml-1 md:ml-2 px-2 md:px-3 py-1 text-xs md:text-sm bg-blue-500 text-white rounded hover:bg-blue-600">今日</button>
+          {/* Zoom controls */}
+          <div className="flex items-center gap-0.5 ml-2 border-l pl-2 border-gray-200">
+            <button
+              onClick={() => setSlotHeight(h => Math.max(h - ZOOM_STEP, MIN_SLOT_HEIGHT))}
+              disabled={slotHeight <= MIN_SLOT_HEIGHT}
+              className="p-1 hover:bg-gray-100 rounded disabled:opacity-30 disabled:cursor-not-allowed"
+              title="縮小"
+            >
+              <Minus size={14} />
+            </button>
+            <button
+              onClick={() => setSlotHeight(DEFAULT_SLOT_HEIGHT)}
+              className="px-1.5 py-0.5 text-[10px] md:text-xs text-gray-600 hover:bg-gray-100 rounded whitespace-nowrap min-w-[36px] text-center"
+              title="ズームリセット"
+            >
+              {zoomPercent}%
+            </button>
+            <button
+              onClick={() => setSlotHeight(h => Math.min(h + ZOOM_STEP, MAX_SLOT_HEIGHT))}
+              disabled={slotHeight >= MAX_SLOT_HEIGHT}
+              className="p-1 hover:bg-gray-100 rounded disabled:opacity-30 disabled:cursor-not-allowed"
+              title="拡大"
+            >
+              <Plus size={14} />
+            </button>
+            <button
+              onClick={() => {
+                if (!gridRef.current) return;
+                const viewportH = gridRef.current.clientHeight;
+                const headerH = viewMode === 'day' ? HEADER_HEIGHT : WEEK_HEADER_HEIGHT;
+                const available = viewportH - headerH;
+                const needed = slots.length;
+                if (needed <= 0) return;
+                const fit = Math.max(MIN_SLOT_HEIGHT, Math.min(MAX_SLOT_HEIGHT, Math.floor(available / needed)));
+                setSlotHeight(fit);
+              }}
+              className="px-1.5 py-0.5 text-[10px] md:text-xs text-gray-500 hover:bg-gray-100 rounded border border-gray-200 whitespace-nowrap"
+              title="一日分を画面に収める"
+            >
+              全体
+            </button>
+          </div>
         </div>
         <div className="flex-1 min-w-0" />
         <div className="flex items-center gap-1 shrink-0 flex-nowrap max-[430px]:flex-wrap max-[430px]:w-full">
@@ -809,7 +857,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                   <div
                     key={slot.minutes}
                     className={`flex items-center justify-end pr-2 ${isHour ? 'text-sm text-gray-900 font-bold' : showLabel ? 'text-xs text-gray-700 font-medium' : slot.minutes % 15 === 0 ? 'text-xs text-gray-400' : 'text-xs text-transparent'}`}
-                    style={{ height: SLOT_HEIGHT, borderBottom: borderStyle }}
+                    style={{ height: slotHeight, borderBottom: borderStyle }}
                   >
                     {slot.minutes % 15 === 0 ? slot.label : '.'}
                   </div>
@@ -834,7 +882,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                   {p.name}
                 </div>
                 {renderColumn(p.id, currentDate, HEADER_HEIGHT)}
-                {renderScheduleOverlay(currentDate, HEADER_HEIGHT, slots.length * SLOT_HEIGHT)}
+                {renderScheduleOverlay(currentDate, HEADER_HEIGHT, slots.length * slotHeight)}
               </div>
             ))}
           </div>
@@ -865,7 +913,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                   <div
                     key={slot.minutes}
                     className={`flex items-center justify-end pr-2 ${isHour ? 'text-sm text-gray-900 font-bold' : showLabel ? 'text-xs text-gray-700 font-medium' : slot.minutes % 15 === 0 ? 'text-xs text-gray-400' : 'text-xs text-transparent'}`}
-                    style={{ height: SLOT_HEIGHT, borderBottom: borderStyle }}
+                    style={{ height: slotHeight, borderBottom: borderStyle }}
                   >
                     {slot.minutes % 15 === 0 ? slot.label : '.'}
                   </div>
@@ -913,7 +961,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                     ))}
                   </div>
                   {/* 休診日・営業時間外オーバーレイ */}
-                  {renderScheduleOverlay(date, WEEK_HEADER_HEIGHT, slots.length * SLOT_HEIGHT)}
+                  {renderScheduleOverlay(date, WEEK_HEADER_HEIGHT, slots.length * slotHeight)}
                 </div>
               );
             })}
