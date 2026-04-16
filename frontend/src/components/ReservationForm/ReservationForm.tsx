@@ -162,6 +162,15 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    // 患者未入力の注意喚起
+    if (!patientId) {
+      const ok = window.confirm(
+        '患者情報が未入力ですが、このまま登録しますか？\n\n※「飛び込み」として登録されます。'
+      );
+      if (!ok) return;
+    }
+
     setError(null);
     setBulkResult(null);
     setSubmitting(true);
