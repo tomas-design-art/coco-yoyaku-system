@@ -7,14 +7,13 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.line_parser import parse_line_message
 from app.database import get_db
 from app.models.menu import Menu
-from app.models.patient import Patient
-from app.models.practitioner import Practitioner
+
 from app.schemas.reservation import ReservationCreate
 from app.services.reservation_service import create_reservation
 from app.utils.datetime_jst import JST, now_jst
@@ -26,31 +25,6 @@ from app.api.line import (
 from app.services.slot_scorer import find_best_practitioner, score_candidates
 
 router = APIRouter(prefix="/api", tags=["web_reserve"])
-
-
-async def _generate_patient_number_web(db: AsyncSession) -> str:
-    max_num = (
-        await db.execute(
-            select(func.max(Patient.patient_number))
-            .where(Patient.patient_number.op("~")(r"^P\d+$"))
-        )
-    ).scalar()
-    next_val = int(max_num[1:]) + 1 if max_num else 1
-    return f"P{next_val:06d}"
-
-
-def _normalize_name_for_match(name: str | None) -> str:
-    if not name:
-        return ""
-    return " ".join(name.replace("\u3000", " ").strip().split())
-
-
-def _normalize_phone_for_match(phone: str | None) -> str:
-    if not phone:
-        return ""
-    normalized = phone.translate(str.maketrans("０１２３４５６７８９－", "0123456789-"))
-    normalized = normalized.replace("-", "").replace("ー", "").replace(" ", "").replace("\u3000", "")
-    return normalized.strip()
 
 
 # DB保存しないWebチャット用の一時セッション
@@ -166,26 +140,9 @@ async def web_reserve(body: WebReserveRequest, db: AsyncSession = Depends(get_db
         ]
         return WebReserveConflict(status="conflict", alternatives=iso_alternatives)
 
-    req_phone = _normalize_phone_for_match(body.phone)
-    req_name = _normalize_name_for_match(body.name)
-
-    phone_candidates = (
-        await db.execute(select(Patient).where(Patient.phone.is_not(None)))
-    ).scalars().all()
-    same_phone = [p for p in phone_candidates if _normalize_phone_for_match(p.phone) == req_phone]
-
-    patient = next((p for p in same_phone if _normalize_name_for_match(p.name) == req_name), None)
-    if not patient and len(same_phone) == 1 and same_phone[0].name in {"", "不明", "LINE患者"}:
-        patient = same_phone[0]
-
-    if not patient:
-        patient_number = await _generate_patient_number_web(db)
-        patient = Patient(name=body.name, phone=body.phone, registration_mode="split", patient_number=patient_number)
-        db.add(patient)
-        await db.flush()
-    elif patient.name in {"", "不明", "LINE患者"}:
-        patient.name = body.name
-        await db.flush()
+    # 患者を検索 or 作成（電話番号 → LINE ID → 名前 のフォールバックマッチ）
+    from app.services.patient_match import find_or_create_patient
+    patient = await find_or_create_patient(db, name=body.name, phone=body.phone)
 
     reservation = await create_reservation(
         db,

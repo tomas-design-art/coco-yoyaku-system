@@ -98,6 +98,13 @@ async def find_existing_patient(
         if len(candidates) == 1:
             logger.info("患者マッチ(名前): id=%d name=%s", candidates[0].id, candidates[0].name)
             return candidates[0]
+        if len(candidates) > 1:
+            logger.warning(
+                "患者マッチ(名前): 同姓同名が%d件のためスキップ name=%s ids=%s",
+                len(candidates), name, [c.id for c in candidates],
+            )
+
+    logger.info("患者マッチ: 該当なし name=%s phone=%s line_id=%s", name, phone, line_id)
 
     return None
 
