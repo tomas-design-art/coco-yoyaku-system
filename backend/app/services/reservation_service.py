@@ -16,7 +16,7 @@ from app.models.weekly_schedule import WeeklySchedule
 from app.schemas.reservation import ReservationCreate, ReservationResponse, PatientBrief, MenuBrief
 from app.services.conflict_detector import check_conflict, check_patient_conflict, ACTIVE_STATUSES
 from app.services.notification_service import create_notification
-from app.services.schedule_service import is_practitioner_working
+from app.services.schedule_service import is_practitioner_working, get_practitioner_working_hours
 from app.services.business_hours import get_business_hours_for_date
 from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
 from app.utils.datetime_jst import now_jst
@@ -159,6 +159,21 @@ async def create_reservation(
         if reason:
             detail += f"（理由: {reason}）"
         raise HTTPException(status_code=400, detail=detail)
+
+    # 施術者の勤務時間チェック（時短勤務対応）
+    p_start, p_end = await get_practitioner_working_hours(db, data.practitioner_id, target_date)
+    if p_start and p_end:
+        p_sh, p_sm = map(int, p_start.split(":"))
+        p_eh, p_em = map(int, p_end.split(":"))
+        p_start_min = p_sh * 60 + p_sm
+        p_end_min = p_eh * 60 + p_em
+        start_minutes = data.start_time.hour * 60 + data.start_time.minute
+        end_minutes = data.end_time.hour * 60 + data.end_time.minute
+        if start_minutes < p_start_min or end_minutes > p_end_min:
+            raise HTTPException(
+                status_code=400,
+                detail=f"この施術者の勤務時間は{p_start}〜{p_end}です",
+            )
 
     # 施術者の時間帯休みチェック
     from sqlalchemy import and_

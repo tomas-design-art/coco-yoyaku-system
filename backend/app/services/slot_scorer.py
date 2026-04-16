@@ -19,7 +19,7 @@ from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
 from app.models.reservation import Reservation
 from app.services.business_hours import get_business_hours_for_date
 from app.services.conflict_detector import ACTIVE_STATUSES, check_conflict
-from app.services.schedule_service import is_practitioner_working
+from app.services.schedule_service import is_practitioner_working, get_practitioner_working_hours
 from app.utils.datetime_jst import JST
 
 logger = logging.getLogger(__name__)
@@ -82,6 +82,8 @@ class _DayInfo:
     is_working: bool
     reservations: list[tuple[int, int]] = field(default_factory=list)
     unavailable: list[tuple[int, int]] = field(default_factory=list)
+    work_start: int | None = None   # 勤務開始（分）
+    work_end: int | None = None     # 勤務終了（分）
 
     @property
     def load(self) -> int:
@@ -107,6 +109,16 @@ async def _load_day_infos(
         if not working:
             infos.append(_DayInfo(p, False))
             continue
+
+        # 施術者個別の勤務時間を取得
+        wh_start, wh_end = await get_practitioner_working_hours(db, p.id, target_date)
+        work_start_min = None
+        work_end_min = None
+        if wh_start and wh_end:
+            wsh, wsm = map(int, wh_start.split(":"))
+            weh, wem = map(int, wh_end.split(":"))
+            work_start_min = wsh * 60 + wsm
+            work_end_min = weh * 60 + wem
 
         res = await db.execute(
             select(Reservation).where(
@@ -138,13 +150,18 @@ async def _load_day_infos(
             eh, em = map(int, ut.end_time.split(":"))
             unavailable.append((sh * 60 + sm, eh * 60 + em))
 
-        infos.append(_DayInfo(p, True, reservations, unavailable))
+        infos.append(_DayInfo(p, True, reservations, unavailable, work_start_min, work_end_min))
 
     return infos
 
 
 def _is_slot_available(info: _DayInfo, s: int, e: int) -> bool:
     if not info.is_working:
+        return False
+    # 施術者個別の勤務時間外はブロック
+    if info.work_start is not None and s < info.work_start:
+        return False
+    if info.work_end is not None and e > info.work_end:
         return False
     for us, ue in info.unavailable:
         if s < ue and e > us:

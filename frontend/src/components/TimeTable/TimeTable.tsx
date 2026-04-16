@@ -262,6 +262,18 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     return status?.unavailable_times || [];
   }, [practitionerStatuses]);
 
+  // ----- 施術者の勤務時間を取得 (時短勤務対応) -----
+  const getPractitionerWorkingHours = useCallback((practitionerId: number, date: Date): { start: number; end: number } | null => {
+    const dateStr = formatDate(date);
+    const status = practitionerStatuses.find(
+      (s) => s.practitioner_id === practitionerId && s.date === dateStr
+    );
+    if (!status || !status.is_working || !status.start_time || !status.end_time) return null;
+    const [sh, sm] = status.start_time.split(':').map(Number);
+    const [eh, em] = status.end_time.split(':').map(Number);
+    return { start: sh * 60 + sm, end: eh * 60 + em };
+  }, [practitionerStatuses]);
+
   const renderScheduleOverlay = useCallback((date: Date, headerH: number, _totalHeight: number) => {
     // 解決済み営業時間を優先、なければ weeklySchedule にフォールバック
     const bh = getBusinessHoursForDate(date);
@@ -416,6 +428,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
 
   const renderColumn = (practitionerId: number, date: Date, headerH: number) => {
     const dayOff = getPractitionerDayOff(practitionerId, date);
+    const workingHours = getPractitionerWorkingHours(practitionerId, date);
     const unavailableTimes = getUnavailableTimesForColumn(practitionerId, date);
     const hasPendingTarget = !!pendingRescheduleTarget
       && pendingRescheduleTarget.practitionerId === practitionerId
@@ -481,6 +494,39 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               }
             }}
           />
+        )}
+        {/* 施術者の勤務時間外オーバーレイ（時短勤務対応） */}
+        {!dayOff && workingHours && (
+          <>
+            {workingHours.start > dayStart && (
+              <div
+                className="absolute left-0 right-0 pointer-events-none"
+                style={{
+                  top: headerH,
+                  height: ((workingHours.start - dayStart) / SLOT_INTERVAL) * SLOT_HEIGHT,
+                  zIndex: 3,
+                  background: BLOCKED_HATCH_BG,
+                  backgroundColor: BLOCKED_BASE_BG,
+                }}
+              >
+                <span className="absolute bottom-1 left-1/2 -translate-x-1/2 text-gray-400 text-[9px] bg-white/70 px-1 rounded whitespace-nowrap">勤務時間外</span>
+              </div>
+            )}
+            {workingHours.end < dayEnd && (
+              <div
+                className="absolute left-0 right-0 pointer-events-none"
+                style={{
+                  top: ((workingHours.end - dayStart) / SLOT_INTERVAL) * SLOT_HEIGHT + headerH,
+                  height: ((dayEnd - workingHours.end) / SLOT_INTERVAL) * SLOT_HEIGHT,
+                  zIndex: 3,
+                  background: BLOCKED_HATCH_BG,
+                  backgroundColor: BLOCKED_BASE_BG,
+                }}
+              >
+                <span className="absolute top-1 left-1/2 -translate-x-1/2 text-gray-400 text-[9px] bg-white/70 px-1 rounded whitespace-nowrap">勤務時間外</span>
+              </div>
+            )}
+          </>
         )}
         {/* 時間帯休みオーバーレイ */}
         {!dayOff && unavailableTimes.map((ut) => {

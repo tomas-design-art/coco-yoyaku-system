@@ -63,6 +63,41 @@ async def is_practitioner_working(
     return True, None, "clinic"
 
 
+async def get_practitioner_working_hours(
+    db: AsyncSession,
+    practitioner_id: int,
+    target_date: date,
+) -> tuple[str | None, str | None]:
+    """
+    施術者のその日の勤務開始/終了時刻を返す。
+    Returns: (start_time "HH:MM" or None, end_time "HH:MM" or None)
+    出勤していない場合や時刻情報がない場合は (None, None)。
+    """
+    is_working, _, source = await is_practitioner_working(db, practitioner_id, target_date)
+    if not is_working:
+        return None, None
+
+    dow = target_date.isoweekday() % 7
+    if source == "default":
+        result = await db.execute(
+            select(PractitionerSchedule).where(
+                and_(
+                    PractitionerSchedule.practitioner_id == practitioner_id,
+                    PractitionerSchedule.day_of_week == dow,
+                )
+            )
+        )
+        s = result.scalar_one_or_none()
+        if s:
+            return s.start_time, s.end_time
+
+    # override / clinic → 院営業時間にフォールバック
+    bh = await get_business_hours_for_date(db, target_date)
+    if bh.is_open and bh.open_time and bh.close_time:
+        return bh.open_time, bh.close_time
+    return None, None
+
+
 async def get_practitioner_day_status(
     db: AsyncSession,
     practitioner_id: int,
@@ -73,28 +108,13 @@ async def get_practitioner_day_status(
 
     result = {"practitioner_id": practitioner_id, "date": target_date, "is_working": is_working, "reason": reason, "source": source}
 
-    dow = target_date.isoweekday() % 7
-    if is_working and source == "default":
-        sched = await db.execute(
-            select(PractitionerSchedule).where(
-                and_(
-                    PractitionerSchedule.practitioner_id == practitioner_id,
-                    PractitionerSchedule.day_of_week == dow,
-                )
-            )
-        )
-        s = sched.scalar_one_or_none()
-        if s:
-            result["start_time"] = s.start_time
-            result["end_time"] = s.end_time
-    elif is_working and source == "clinic":
-        clinic = await db.execute(
-            select(WeeklySchedule).where(WeeklySchedule.day_of_week == dow)
-        )
-        w = clinic.scalar_one_or_none()
-        if w:
-            result["start_time"] = w.open_time
-            result["end_time"] = w.close_time
+    # 勤務時間を取得 (全source共通)
+    if is_working:
+        wh_start, wh_end = await get_practitioner_working_hours(db, practitioner_id, target_date)
+        if wh_start:
+            result["start_time"] = wh_start
+        if wh_end:
+            result["end_time"] = wh_end
 
     # 時間帯休み
     ut_result = await db.execute(
