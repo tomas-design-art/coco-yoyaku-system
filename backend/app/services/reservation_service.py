@@ -113,9 +113,20 @@ def build_reservation_response(reservation: Reservation) -> dict:
         "conflict_note": reservation.conflict_note,
         "hotpepper_synced": reservation.hotpepper_synced,
         "hold_expires_at": reservation.hold_expires_at,
+        "series_id": reservation.series_id,
+        "series_info": None,
         "created_at": reservation.created_at,
         "updated_at": reservation.updated_at,
     }
+    if reservation.series_id and reservation.series:
+        s = reservation.series
+        resp["series_info"] = {
+            "id": s.id,
+            "frequency": s.frequency,
+            "total_created": s.total_created,
+            "remaining_count": s.remaining_count,
+            "is_active": s.is_active,
+        }
     if reservation.patient:
         resp["patient"] = {
             "id": reservation.patient.id,

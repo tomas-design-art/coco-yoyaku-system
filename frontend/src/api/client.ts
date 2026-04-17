@@ -27,6 +27,7 @@ import type {
   SeriesResponse,
   SeriesExtendRequest,
   SeriesModifyRequest,
+  SeriesBulkEditRequest,
   WebReserveRequest,
   WebReserveSuccess,
   WebReserveConflict,
@@ -213,6 +214,15 @@ export const modifySeries = (seriesId: number, data: SeriesModifyRequest) =>
 
 export const cancelRemainingSeries = (seriesId: number) =>
   api.post(`/reservations/series/${seriesId}/cancel-remaining`);
+
+export const cancelSeriesFrom = (seriesId: number, reservationId: number) =>
+  api.post(`/reservations/series/${seriesId}/cancel-from/${reservationId}`);
+
+export const editSeriesFrom = (seriesId: number, reservationId: number, data: SeriesBulkEditRequest) =>
+  api.post(`/reservations/series/${seriesId}/edit-from/${reservationId}`, data);
+
+export const getSeriesReservations = (seriesId: number) =>
+  api.get<Reservation[]>(`/reservations/series/${seriesId}/reservations`);
 
 // ---- Settings ----
 export const getSettings = () => api.get<Setting[]>('/settings/');
