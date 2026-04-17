@@ -22,6 +22,7 @@ from app.schemas.reservation import (
     SeriesResponse,
     SeriesExtendRequest,
     SeriesModifyRequest,
+    SeriesBulkEditRequest,
 )
 from app.services.reservation_service import (
     create_reservation,
@@ -30,10 +31,13 @@ from app.services.reservation_service import (
     handle_change_approve,
     reschedule_reservation,
     build_reservation_response,
+    refresh_conflict_notes_for_overlapping,
 )
-from app.services.conflict_detector import check_conflict, ACTIVE_STATUSES
+from app.services.conflict_detector import check_conflict, check_patient_conflict, ACTIVE_STATUSES
 from app.services.notification_service import create_notification
 from app.models.reservation_series import ReservationSeries
+from app.services.schedule_service import is_practitioner_working
+from app.services.business_hours import get_business_hours_for_date
 from app.utils.datetime_jst import now_jst
 
 _JST = zoneinfo.ZoneInfo("Asia/Tokyo")
@@ -53,6 +57,7 @@ async def list_conflicts(db: AsyncSession = Depends(get_db)):
             selectinload(Reservation.practitioner),
             selectinload(Reservation.menu),
             selectinload(Reservation.color),
+            selectinload(Reservation.series),
         )
         .order_by(Reservation.created_at.desc())
         .limit(50)
@@ -73,6 +78,7 @@ async def list_reservations(
         selectinload(Reservation.practitioner),
         selectinload(Reservation.menu),
         selectinload(Reservation.color),
+        selectinload(Reservation.series),
     )
 
     if start_date:
@@ -100,6 +106,7 @@ async def get_reservation(reservation_id: int, db: AsyncSession = Depends(get_db
             selectinload(Reservation.practitioner),
             selectinload(Reservation.menu),
             selectinload(Reservation.color),
+            selectinload(Reservation.series),
         )
     )
     reservation = result.scalar_one_or_none()
@@ -188,6 +195,38 @@ async def bulk_create_reservations(
             hour, minute, tzinfo=_JST,
         )
         end_dt = start_dt + timedelta(minutes=data.duration_minutes)
+
+        # ── 事前競合チェック（ダブルブッキング防止） ──
+        # 施術者の時間帯競合
+        practitioner_conflicts = await check_conflict(
+            db, data.practitioner_id, start_dt, end_dt
+        )
+        if practitioner_conflicts:
+            names = []
+            for c in practitioner_conflicts:
+                name = c.patient.name if c.patient else "不明"
+                names.append(f"{name}({c.start_time.astimezone(_JST).strftime('%H:%M')}-{c.end_time.astimezone(_JST).strftime('%H:%M')})")
+            skipped.append({
+                "date": target_date.isoformat(),
+                "reason": f"ダブルブッキング: {', '.join(names)}と時間が重複しています",
+            })
+            continue
+
+        # 同一患者の時間帯競合
+        if data.patient_id:
+            patient_conflicts = await check_patient_conflict(
+                db, data.patient_id, start_dt, end_dt
+            )
+            if patient_conflicts:
+                names = []
+                for c in patient_conflicts:
+                    prac_name = c.practitioner.name if c.practitioner else "不明"
+                    names.append(f"{prac_name}({c.start_time.astimezone(_JST).strftime('%H:%M')}-{c.end_time.astimezone(_JST).strftime('%H:%M')})")
+                skipped.append({
+                    "date": target_date.isoformat(),
+                    "reason": f"患者ダブルブッキング: {', '.join(names)}と時間が重複しています",
+                })
+                continue
 
         reservation_data = ReservationCreate(
             patient_id=data.patient_id,
@@ -394,6 +433,23 @@ async def extend_series(
             hour, minute, tzinfo=_JST,
         )
         end_dt = start_dt + timedelta(minutes=series.duration_minutes)
+
+        # ── 事前競合チェック（ダブルブッキング防止） ──
+        practitioner_conflicts = await check_conflict(
+            db, series.practitioner_id, start_dt, end_dt
+        )
+        if practitioner_conflicts:
+            names = [f"{(c.patient.name if c.patient else '不明')}({c.start_time.astimezone(_JST).strftime('%H:%M')}-{c.end_time.astimezone(_JST).strftime('%H:%M')})" for c in practitioner_conflicts]
+            skipped.append({"date": target_date.isoformat(), "reason": f"ダブルブッキング: {', '.join(names)}と時間が重複しています"})
+            continue
+
+        if series.patient_id:
+            patient_conflicts = await check_patient_conflict(db, series.patient_id, start_dt, end_dt)
+            if patient_conflicts:
+                names = [f"{(c.practitioner.name if c.practitioner else '不明')}({c.start_time.astimezone(_JST).strftime('%H:%M')}-{c.end_time.astimezone(_JST).strftime('%H:%M')})" for c in patient_conflicts]
+                skipped.append({"date": target_date.isoformat(), "reason": f"患者ダブルブッキング: {', '.join(names)}と時間が重複しています"})
+                continue
+
         reservation_data = ReservationCreate(
             patient_id=series.patient_id,
             practitioner_id=series.practitioner_id,
@@ -445,19 +501,24 @@ async def modify_series(
 
     now = now_jst()
 
-    # 未来の予約をキャンセル
+    # 未来の予約をキャンセル（終端ステータス以外は全て対象）
     future_result = await db.execute(
         select(Reservation).where(
             Reservation.series_id == series_id,
             Reservation.start_time > now,
-            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD", "CANCEL_REQUESTED", "CHANGE_REQUESTED"]),
         )
     )
     future_reservations = future_result.scalars().all()
     cancelled_count = 0
     for r in future_reservations:
         r.status = "CANCELLED"
+        r.conflict_note = None
         cancelled_count += 1
+
+    # キャンセルされた予約と競合していた他の予約のconflict_noteを再評価
+    for r in future_reservations:
+        await refresh_conflict_notes_for_overlapping(db, r)
 
     if body.cancel_remaining:
         series.is_active = False
@@ -511,6 +572,23 @@ async def modify_series(
             hour, minute, tzinfo=_JST,
         )
         end_dt = start_dt + timedelta(minutes=series.duration_minutes)
+
+        # ── 事前競合チェック（ダブルブッキング防止） ──
+        practitioner_conflicts = await check_conflict(
+            db, series.practitioner_id, start_dt, end_dt
+        )
+        if practitioner_conflicts:
+            names = [f"{(c.patient.name if c.patient else '不明')}({c.start_time.astimezone(_JST).strftime('%H:%M')}-{c.end_time.astimezone(_JST).strftime('%H:%M')})" for c in practitioner_conflicts]
+            skipped.append({"date": target_date.isoformat(), "reason": f"ダブルブッキング: {', '.join(names)}と時間が重複しています"})
+            continue
+
+        if series.patient_id:
+            patient_conflicts = await check_patient_conflict(db, series.patient_id, start_dt, end_dt)
+            if patient_conflicts:
+                names = [f"{(c.practitioner.name if c.practitioner else '不明')}({c.start_time.astimezone(_JST).strftime('%H:%M')}-{c.end_time.astimezone(_JST).strftime('%H:%M')})" for c in patient_conflicts]
+                skipped.append({"date": target_date.isoformat(), "reason": f"患者ダブルブッキング: {', '.join(names)}と時間が重複しています"})
+                continue
+
         reservation_data = ReservationCreate(
             patient_id=series.patient_id,
             practitioner_id=series.practitioner_id,
@@ -562,24 +640,229 @@ async def cancel_remaining_series(
         raise HTTPException(status_code=404, detail="シリーズが見つかりません")
 
     now = now_jst()
+    # 終端ステータス以外は全て一括キャンセル対象（CANCEL_REQUESTED, CHANGE_REQUESTED も含む）
     future_result = await db.execute(
         select(Reservation).where(
             Reservation.series_id == series_id,
             Reservation.start_time > now,
-            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD", "CANCEL_REQUESTED", "CHANGE_REQUESTED"]),
         )
     )
     future_reservations = future_result.scalars().all()
     cancelled = 0
     for r in future_reservations:
         r.status = "CANCELLED"
+        r.conflict_note = None
         cancelled += 1
+
+    # キャンセルされた予約と競合していた他の予約のconflict_noteを再評価
+    for r in future_reservations:
+        await refresh_conflict_notes_for_overlapping(db, r)
 
     series.is_active = False
     series.remaining_count = 0
     await db.commit()
 
     return {"cancelled_count": cancelled, "series_id": series_id}
+
+
+@router.post("/series/{series_id}/cancel-from/{reservation_id}")
+async def cancel_series_from_reservation(
+    series_id: int, reservation_id: int, db: AsyncSession = Depends(get_db)
+):
+    """シリーズの指定予約以降をすべてキャンセル（指定予約自身も含む）"""
+    result = await db.execute(
+        select(ReservationSeries).where(ReservationSeries.id == series_id)
+    )
+    series = result.scalar_one_or_none()
+    if not series:
+        raise HTTPException(status_code=404, detail="シリーズが見つかりません")
+
+    # 指定予約の開始時刻を取得
+    anchor_result = await db.execute(
+        select(Reservation).where(Reservation.id == reservation_id)
+    )
+    anchor = anchor_result.scalar_one_or_none()
+    if not anchor or anchor.series_id != series_id:
+        raise HTTPException(status_code=400, detail="指定された予約はこのシリーズに属していません")
+
+    # 指定予約以降のアクティブ予約をキャンセル（終端ステータス以外は全て対象）
+    future_result = await db.execute(
+        select(Reservation).where(
+            Reservation.series_id == series_id,
+            Reservation.start_time >= anchor.start_time,
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD", "CANCEL_REQUESTED", "CHANGE_REQUESTED"]),
+        )
+    )
+    future_reservations = future_result.scalars().all()
+    cancelled = 0
+    cancelled_dates = []
+    for r in future_reservations:
+        r.status = "CANCELLED"
+        r.conflict_note = None
+        cancelled += 1
+        cancelled_dates.append(r.start_time.astimezone(_JST).strftime("%Y-%m-%d"))
+
+    # キャンセルされた予約と競合していた他の予約のconflict_noteを再評価
+    for r in future_reservations:
+        await refresh_conflict_notes_for_overlapping(db, r)
+
+    # remaining_count を更新
+    active_result = await db.execute(
+        select(Reservation).where(
+            Reservation.series_id == series_id,
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+        )
+    )
+    active_count = len(active_result.scalars().all())
+    series.remaining_count = active_count
+    if active_count == 0:
+        series.is_active = False
+
+    await db.commit()
+    return {"cancelled_count": cancelled, "cancelled_dates": cancelled_dates, "series_id": series_id}
+
+
+@router.post("/series/{series_id}/edit-from/{reservation_id}")
+async def edit_series_from_reservation(
+    series_id: int, reservation_id: int, body: SeriesBulkEditRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """シリーズの指定予約以降を一括編集（指定予約自身も含む）"""
+    result = await db.execute(
+        select(ReservationSeries).where(ReservationSeries.id == series_id)
+    )
+    series = result.scalar_one_or_none()
+    if not series:
+        raise HTTPException(status_code=404, detail="シリーズが見つかりません")
+
+    anchor_result = await db.execute(
+        select(Reservation).where(Reservation.id == reservation_id)
+    )
+    anchor = anchor_result.scalar_one_or_none()
+    if not anchor or anchor.series_id != series_id:
+        raise HTTPException(status_code=400, detail="指定された予約はこのシリーズに属していません")
+
+    # 指定予約以降のアクティブ予約を取得
+    future_result = await db.execute(
+        select(Reservation)
+        .where(
+            Reservation.series_id == series_id,
+            Reservation.start_time >= anchor.start_time,
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+        )
+        .order_by(Reservation.start_time)
+    )
+    future_reservations = future_result.scalars().all()
+
+    updated_count = 0
+    skipped: list[dict] = []
+
+    update_fields = body.model_dump(exclude_unset=True)
+
+    for r in future_reservations:
+        target_date = r.start_time.astimezone(_JST).date()
+        new_practitioner_id = update_fields.get("practitioner_id", r.practitioner_id)
+        new_start_time = r.start_time
+        new_end_time = r.end_time
+
+        # 時間変更がある場合
+        if "start_time" in update_fields or "duration_minutes" in update_fields:
+            if "start_time" in update_fields:
+                hour, minute = map(int, update_fields["start_time"].split(":"))
+                jst_time = r.start_time.astimezone(_JST)
+                new_start_time = jst_time.replace(hour=hour, minute=minute)
+            dur = update_fields.get("duration_minutes") or int((r.end_time - r.start_time).total_seconds() / 60)
+            new_end_time = new_start_time + timedelta(minutes=dur)
+
+        # 施術者変更の場合、勤務チェック
+        if "practitioner_id" in update_fields:
+            working, reason, _ = await is_practitioner_working(db, new_practitioner_id, target_date)
+            if not working:
+                skipped.append({
+                    "date": target_date.isoformat(),
+                    "reservation_id": r.id,
+                    "reason": f"施術者休み" + (f"（{reason}）" if reason else ""),
+                })
+                continue
+
+        # 営業日チェック
+        bh = await get_business_hours_for_date(db, target_date)
+        if not bh.is_open:
+            skipped.append({
+                "date": target_date.isoformat(),
+                "reservation_id": r.id,
+                "reason": bh.label or "休診日",
+            })
+            continue
+
+        # 時間変更なら競合チェック
+        if "start_time" in update_fields or "duration_minutes" in update_fields or "practitioner_id" in update_fields:
+            conflicts = await check_conflict(
+                db, new_practitioner_id, new_start_time, new_end_time,
+                exclude_reservation_id=r.id,
+            )
+            if conflicts:
+                skipped.append({
+                    "date": target_date.isoformat(),
+                    "reservation_id": r.id,
+                    "reason": "他の予約と競合",
+                })
+                continue
+
+        # 更新適用
+        if "practitioner_id" in update_fields:
+            r.practitioner_id = update_fields["practitioner_id"]
+        if "menu_id" in update_fields:
+            r.menu_id = update_fields["menu_id"]
+        if "color_id" in update_fields:
+            r.color_id = update_fields["color_id"]
+        if "notes" in update_fields:
+            r.notes = update_fields["notes"]
+        if "start_time" in update_fields or "duration_minutes" in update_fields:
+            r.start_time = new_start_time
+            r.end_time = new_end_time
+        updated_count += 1
+
+    # シリーズ設定も更新
+    if "practitioner_id" in update_fields:
+        series.practitioner_id = update_fields["practitioner_id"]
+    if "menu_id" in update_fields:
+        series.menu_id = update_fields["menu_id"]
+    if "color_id" in update_fields:
+        series.color_id = update_fields["color_id"]
+    if "start_time" in update_fields:
+        series.start_time = update_fields["start_time"]
+    if "duration_minutes" in update_fields:
+        series.duration_minutes = update_fields["duration_minutes"]
+    if "notes" in update_fields:
+        series.notes = update_fields["notes"]
+
+    await db.commit()
+    return {
+        "updated_count": updated_count,
+        "skipped": skipped,
+        "series_id": series_id,
+    }
+
+
+@router.get("/series/{series_id}/reservations")
+async def get_series_reservations(series_id: int, db: AsyncSession = Depends(get_db)):
+    """シリーズに属する全予約を取得（日時順）"""
+    result = await db.execute(
+        select(Reservation)
+        .where(Reservation.series_id == series_id)
+        .options(
+            selectinload(Reservation.patient),
+            selectinload(Reservation.practitioner),
+            selectinload(Reservation.menu),
+            selectinload(Reservation.color),
+            selectinload(Reservation.series),
+        )
+        .order_by(Reservation.start_time)
+    )
+    reservations = result.scalars().all()
+    return [build_reservation_response(r) for r in reservations]
 
 
 @router.put("/{reservation_id}")
@@ -614,7 +897,7 @@ async def update_reservation(
             for c in conflicts:
                 name = c.patient.name if c.patient else "不明"
                 conflict_names.append(
-                    f"{name}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})"
+                    f"{name}({c.start_time.astimezone(_JST).strftime('%H:%M')}-{c.end_time.astimezone(_JST).strftime('%H:%M')})"
                 )
             raise HTTPException(
                 status_code=409,

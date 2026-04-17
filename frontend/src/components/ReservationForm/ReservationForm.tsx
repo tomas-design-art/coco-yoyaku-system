@@ -51,6 +51,7 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
   const [repeatEndDate, setRepeatEndDate] = useState('');
   const [repeatCount, setRepeatCount] = useState(4);
   const [bulkResult, setBulkResult] = useState<BulkReservationResult | null>(null);
+  const [skipAlertModal, setSkipAlertModal] = useState<string[] | null>(null);
 
   const resetFormState = () => {
     setPatientId(null);
@@ -199,6 +200,15 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
         setBulkResult(res.data);
         if (res.data.created_count > 0) {
           onSuccess();
+        }
+        // Show skip alert modal if there are skipped dates
+        if ((res.data.skipped ?? []).length > 0) {
+          const messages = (res.data.skipped ?? []).map(s => {
+            const d = new Date(s.date + 'T00:00:00+09:00');
+            const weekday = ['日', '月', '火', '水', '木', '金', '土'][d.getDay()];
+            return `${d.getMonth() + 1}/${d.getDate()}(${weekday}) — ${s.reason}。そのため予約を入れていません。ご注意ください。`;
+          });
+          setSkipAlertModal(messages);
         }
       } else {
         // 通常の単発予約
@@ -527,14 +537,18 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
             <div className={`p-3 rounded text-sm ${bulkResult.created_count > 0 ? 'bg-green-50 border border-green-200 text-green-800' : 'bg-yellow-50 border border-yellow-200 text-yellow-800'}`}>
               <p className="font-medium">{bulkResult.created_count} / {bulkResult.total_requested} 件作成しました</p>
               {(bulkResult.skipped ?? []).length > 0 && (
-                <details className="mt-1">
-                  <summary className="cursor-pointer text-xs">スキップ: {bulkResult.skipped.length}件</summary>
-                  <ul className="mt-1 text-xs space-y-0.5">
-                    {(bulkResult.skipped ?? []).map((s, i) => (
-                      <li key={i}>{s.date}: {s.reason}</li>
-                    ))}
-                  </ul>
-                </details>
+                <div className="mt-2 space-y-1.5">
+                  <p className="text-xs font-bold text-orange-700">⚠ 以下の日程はスキップされました：</p>
+                  {(bulkResult.skipped ?? []).map((s, i) => {
+                    const d = new Date(s.date + 'T00:00:00+09:00');
+                    const weekday = ['日', '月', '火', '水', '木', '金', '土'][d.getDay()];
+                    return (
+                      <div key={i} className="p-2 bg-yellow-50 border border-yellow-300 rounded text-xs text-yellow-800">
+                        ⚠ {d.getMonth() + 1}/{d.getDate()}({weekday}) — {s.reason}。そのため予約を入れていません。ご注意ください。
+                      </div>
+                    );
+                  })}
+                </div>
               )}
             </div>
           )}
@@ -556,6 +570,32 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
           </div>
         </form>
       </div>
+
+      {/* Skip Alert Modal — full-screen prominent warning for skipped dates */}
+      {skipAlertModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-[80]">
+          <div className="bg-white rounded-lg shadow-2xl w-full max-w-lg mx-4 border-2 border-orange-400">
+            <div className="p-4 bg-orange-50 rounded-t-lg border-b border-orange-200">
+              <h3 className="text-base font-bold text-orange-700">⚠ 一部の日程に予約を入れられませんでした</h3>
+            </div>
+            <div className="p-4 space-y-2 max-h-[50vh] overflow-y-auto">
+              {skipAlertModal.map((msg, i) => (
+                <div key={i} className="p-3 bg-yellow-50 rounded border border-yellow-300 text-sm text-yellow-800">
+                  ⚠ {msg}
+                </div>
+              ))}
+            </div>
+            <div className="p-4 border-t flex justify-end">
+              <button
+                onClick={() => setSkipAlertModal(null)}
+                className="px-6 py-2.5 bg-orange-500 text-white text-sm font-medium rounded hover:bg-orange-600"
+              >
+                了解
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

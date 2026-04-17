@@ -623,11 +623,18 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               onClick={(e) => { e.stopPropagation(); if (!isRescheduling) onReservationClick(r); }}
             >
               <div className="flex items-center gap-0.5 truncate">
-                <span>{CHANNEL_ICONS[r.channel]}</span>
+                {r.conflict_note ? <span title="⚠ ダブルブッキング">⚠️</span> : r.series_id ? <span>🔄</span> : <span>{CHANNEL_ICONS[r.channel]}</span>}
                 <span className="font-medium truncate">{r.patient?.name || '飛び込み'}</span>
               </div>
               {height >= slotHeight * 2 && (
-                <div className="truncate opacity-90">{r.menu?.name || ''}</div>
+                <div className="truncate opacity-90">
+                  {r.menu?.name || ''}
+                  {r.series_info && (
+                    <span className="ml-1 text-[9px] opacity-80">
+                      ({r.series_info.total_created - r.series_info.remaining_count + 1}/{r.series_info.total_created})
+                    </span>
+                  )}
+                </div>
               )}
               {/* ⊖ / ⊕ duration adjust buttons on the target bar */}
               {isTarget && onRescheduleDurationChange && (

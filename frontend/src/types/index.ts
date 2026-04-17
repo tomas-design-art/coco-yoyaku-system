@@ -144,6 +144,14 @@ export interface ColorBrief {
   color_code: string;
 }
 
+export interface SeriesInfoBrief {
+  id: number;
+  frequency: string;
+  total_created: number;
+  remaining_count: number;
+  is_active: boolean;
+}
+
 export interface Reservation {
   id: number;
   patient: PatientBrief | null;
@@ -161,6 +169,8 @@ export interface Reservation {
   conflict_note: string | null;
   hotpepper_synced: boolean;
   hold_expires_at: string | null;
+  series_id: number | null;
+  series_info: SeriesInfoBrief | null;
   created_at: string;
   updated_at: string;
 }
@@ -250,6 +260,15 @@ export interface SeriesModifyRequest {
   frequency?: string;
   count?: number;
   cancel_remaining?: boolean;
+}
+
+export interface SeriesBulkEditRequest {
+  practitioner_id?: number;
+  menu_id?: number;
+  color_id?: number;
+  start_time?: string;
+  duration_minutes?: number;
+  notes?: string;
 }
 
 export interface ConflictingReservation {

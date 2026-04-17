@@ -1,5 +1,6 @@
 """職員勤務スケジュールAPI"""
 import logging
+import zoneinfo
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -205,6 +206,7 @@ async def get_affected(
     reservations = await get_affected_reservations(db, practitioner_id, d)
 
     affected = []
+    _JST = zoneinfo.ZoneInfo("Asia/Tokyo")
     for r in reservations:
         candidates = await find_transfer_candidates(
             db, practitioner_id, d, r.start_time, r.end_time
@@ -212,8 +214,8 @@ async def get_affected(
         affected.append({
             "reservation_id": r.id,
             "patient_name": r.patient.name if r.patient else None,
-            "start_time": r.start_time.isoformat(),
-            "end_time": r.end_time.isoformat(),
+            "start_time": r.start_time.astimezone(_JST).isoformat(),
+            "end_time": r.end_time.astimezone(_JST).isoformat(),
             "menu_name": r.menu.name if r.menu else None,
             "transfer_candidates": candidates,
         })

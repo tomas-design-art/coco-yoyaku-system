@@ -21,7 +21,7 @@ class Menu(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     color = relationship("ReservationColor", backref="menus", lazy="joined")
-    price_tiers = relationship("MenuPriceTier", back_populates="menu", lazy="joined",
+    price_tiers = relationship("MenuPriceTier", back_populates="menu", lazy="selectin",
                                order_by="MenuPriceTier.display_order", cascade="all, delete-orphan")
 
 

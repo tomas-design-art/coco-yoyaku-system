@@ -1,12 +1,12 @@
 import { useState, useEffect, useMemo } from 'react';
-import { X, CheckCircle, XCircle, ArrowRightLeft, Clock, Pencil } from 'lucide-react';
+import { X, CheckCircle, XCircle, ArrowRightLeft, Clock, Pencil, Repeat, Trash2 } from 'lucide-react';
 import type { Reservation, Practitioner, Patient, Menu } from '../types';
 import { STATUS_COLORS, CHANNEL_ICONS, CHANNEL_LABELS } from '../types';
 import type { ReservationColor } from '../types';
 import {
   confirmReservation, cancelRequest, cancelApprove, changeApprove,
   rejectReservation, updateReservation, getPractitioners, getPatients, getMenus, getSettings,
-  getReservationColors,
+  getReservationColors, cancelSeriesFrom, editSeriesFrom, getSeriesReservations,
 } from '../api/client';
 import { extractErrorMessage } from '../utils/errorUtils';
 import { generate5MinOptions } from '../utils/timeUtils';
@@ -36,6 +36,21 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
   const [confirmDialog, setConfirmDialog] = useState<{ message: string; action: () => Promise<unknown>; successMessage: string } | null>(null);
   const [successPopup, setSuccessPopup] = useState<string | null>(null);
   const durationMin = (new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 60000;
+
+  // Series state
+  const [seriesReservations, setSeriesReservations] = useState<Reservation[]>([]);
+  const [seriesAlertModal, setSeriesAlertModal] = useState<{ title: string; messages: string[] } | null>(null);
+  const [showSeriesBulkEdit, setShowSeriesBulkEdit] = useState(false);
+  const [bulkEditSaving, setBulkEditSaving] = useState(false);
+  const [bulkEditConfirm, setBulkEditConfirm] = useState(false);
+
+  // Bulk edit form state
+  const [bulkEditPractitionerId, setBulkEditPractitionerId] = useState<number | undefined>(undefined);
+  const [bulkEditMenuId, setBulkEditMenuId] = useState<number | undefined>(undefined);
+  const [bulkEditColorId, setBulkEditColorId] = useState<number | undefined>(undefined);
+  const [bulkEditStartTime, setBulkEditStartTime] = useState<string | undefined>(undefined);
+  const [bulkEditDuration, setBulkEditDuration] = useState<number | undefined>(undefined);
+  const [bulkEditNotes, setBulkEditNotes] = useState<string | undefined>(undefined);
 
   const startTime = new Date(r.start_time).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
   const endTime = new Date(r.end_time).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
@@ -67,7 +82,7 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    if (isEditing) {
+    if (isEditing || showSeriesBulkEdit) {
       getPractitioners().then(res => setPractitioners((res.data ?? []).filter(p => p.is_active && p.is_visible))).catch(() => setPractitioners([]));
       getPatients({ page: 1, per_page: 500 }).then(res => setPatients(res.data?.items ?? [])).catch(() => setPatients([]));
       getMenus().then(res => setMenus((res.data ?? []).filter(m => m.is_active))).catch(() => setMenus([]));
@@ -81,7 +96,7 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
         setTimeOptions(generate5MinOptions(startH, endH));
       }).catch(() => setTimeOptions(generate5MinOptions()));
     }
-  }, [isEditing]);
+  }, [isEditing, showSeriesBulkEdit]);
 
   // Compute edit end time from menu duration
   const selectedMenu = menus.find(m => m.id === editMenuId);
@@ -154,6 +169,7 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
       setTimeout(() => { setSuccessPopup(null); onClose(); }, 1500);
     } catch (err: unknown) {
       setActionError(extractErrorMessage(err, '更新に失敗しました'));
+      onUpdate();
     } finally {
       setSaving(false);
     }
@@ -179,11 +195,110 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
     } catch (err: unknown) {
       setConfirmDialog(null);
       setActionError(extractErrorMessage(err, 'アクションの実行に失敗しました'));
+      // 失敗時もサーバー状態を再取得してUIと同期（二重クリック等で古い状態を参照するのを防ぐ）
+      onUpdate();
     }
   };
 
   // Parse change logs from notes
   const changeLogLines = r.notes?.split('\n').filter(line => line.includes('から予約変更')) || [];
+
+  // Load series reservations if this is a series reservation
+  useEffect(() => {
+    if (r.series_id) {
+      getSeriesReservations(r.series_id).then(res => {
+        setSeriesReservations(res.data ?? []);
+      }).catch(() => setSeriesReservations([]));
+    }
+  }, [r.series_id]);
+
+  // Compute series position info
+  const seriesPosition = useMemo(() => {
+    if (!r.series_id || seriesReservations.length === 0) return null;
+    const activeReservations = seriesReservations.filter(sr => !['CANCELLED', 'REJECTED', 'EXPIRED'].includes(sr.status));
+    const sorted = [...activeReservations].sort((a, b) => new Date(a.start_time).getTime() - new Date(b.start_time).getTime());
+    const currentIndex = sorted.findIndex(sr => sr.id === r.id);
+    const lastRes = sorted[sorted.length - 1];
+    const remainingAfter = currentIndex >= 0 ? sorted.length - currentIndex - 1 : 0;
+    return {
+      current: currentIndex + 1,
+      total: sorted.length,
+      remainingAfter,
+      lastDate: lastRes ? new Date(lastRes.start_time) : null,
+    };
+  }, [r.series_id, r.id, seriesReservations]);
+
+  const FREQ_LABELS: Record<string, string> = { weekly: '毎週', biweekly: '隔週', monthly: '毎月' };
+
+  // Bulk cancel from this reservation
+  const handleBulkCancel = async () => {
+    if (!r.series_id) return;
+    setActionError(null);
+    try {
+      const res = await cancelSeriesFrom(r.series_id, r.id);
+      const data = (res as { data?: { cancelled_count?: number } }).data;
+      const cancelledCount = data?.cancelled_count ?? 0;
+      setConfirmDialog(null);
+      setSuccessPopup(`${cancelledCount}件の予約をキャンセルしました`);
+      onUpdate();
+      setTimeout(() => { setSuccessPopup(null); onClose(); }, 1500);
+    } catch (err: unknown) {
+      setConfirmDialog(null);
+      setActionError(extractErrorMessage(err, '一括キャンセルに失敗しました'));
+      onUpdate();
+    }
+  };
+
+  // Bulk edit from this reservation
+  const handleBulkEdit = async () => {
+    if (!r.series_id) return;
+    setActionError(null);
+    setBulkEditSaving(true);
+    try {
+      const payload: Record<string, unknown> = {};
+      if (bulkEditPractitionerId !== undefined) payload.practitioner_id = bulkEditPractitionerId;
+      if (bulkEditMenuId !== undefined) payload.menu_id = bulkEditMenuId;
+      if (bulkEditColorId !== undefined) payload.color_id = bulkEditColorId;
+      if (bulkEditStartTime !== undefined) payload.start_time = bulkEditStartTime;
+      if (bulkEditDuration !== undefined) payload.duration_minutes = bulkEditDuration;
+      if (bulkEditNotes !== undefined) payload.notes = bulkEditNotes;
+
+      if (Object.keys(payload).length === 0) {
+        setActionError('変更内容を指定してください');
+        setBulkEditSaving(false);
+        return;
+      }
+
+      const res = await editSeriesFrom(r.series_id, r.id, payload);
+      const data = (res as { data?: { updated_count?: number; skipped?: { date: string; reason: string }[] } }).data;
+      const updatedCount = data?.updated_count ?? 0;
+      const skipped = data?.skipped ?? [];
+
+      if (skipped.length > 0) {
+        const messages = skipped.map((s: { date: string; reason: string }) => {
+          const d = new Date(s.date + 'T00:00:00+09:00');
+          const weekday = ['日', '月', '火', '水', '木', '金', '土'][d.getDay()];
+          return `${d.getMonth() + 1}/${d.getDate()}(${weekday}) — ${s.reason}。そのため変更を適用していません。ご注意ください。`;
+        });
+        setSeriesAlertModal({
+          title: `⚠ 一部の予約に変更を適用できませんでした`,
+          messages,
+        });
+      }
+
+      setShowSeriesBulkEdit(false);
+      setSuccessPopup(`${updatedCount}件の予約を更新しました`);
+      onUpdate();
+      if (skipped.length === 0) {
+        setTimeout(() => { setSuccessPopup(null); onClose(); }, 1500);
+      }
+    } catch (err: unknown) {
+      setActionError(extractErrorMessage(err, '一括編集に失敗しました'));
+      onUpdate();
+    } finally {
+      setBulkEditSaving(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
@@ -431,9 +546,28 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
 
               {/* Conflict note */}
               {r.conflict_note && (
-                <div className="p-2 bg-red-50 rounded border border-red-200">
-                  <span className="text-xs text-red-600 font-medium">⚠ 競合情報</span>
-                  <p className="text-sm text-red-700">{r.conflict_note}</p>
+                <div className="p-3 bg-red-50 rounded-lg border-2 border-red-400">
+                  <span className="text-sm text-red-600 font-bold">⚠️ ダブルブッキング警告</span>
+                  <p className="text-sm text-red-700 mt-1">{r.conflict_note}</p>
+                  <p className="text-xs text-red-500 mt-1">予約時間を確認してください。</p>
+                </div>
+              )}
+
+              {/* Series (recurring) info */}
+              {r.series_id && r.series_info && seriesPosition && (
+                <div className="p-3 bg-blue-50 rounded border border-blue-200">
+                  <div className="flex items-center gap-1 mb-1">
+                    <span className="text-base">🔄</span>
+                    <span className="text-xs text-blue-700 font-bold">繰り返し予約</span>
+                  </div>
+                  <div className="text-xs text-blue-800 space-y-0.5">
+                    <p>頻度: {FREQ_LABELS[r.series_info.frequency] || r.series_info.frequency}</p>
+                    <p>現在: {seriesPosition.current}回目 / 全{seriesPosition.total}回</p>
+                    <p>残り: {seriesPosition.remainingAfter}回（この予約以降）</p>
+                    {seriesPosition.lastDate && (
+                      <p>最終予約日: {seriesPosition.lastDate.toLocaleDateString('ja-JP')}</p>
+                    )}
+                  </div>
                 </div>
               )}
             </>
@@ -467,6 +601,12 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
                     className="flex items-center gap-1 px-3 py-1.5 bg-red-500 text-white text-sm rounded hover:bg-red-600"
                   >
                     <XCircle size={14} /> 却下する
+                  </button>
+                  <button
+                    onClick={() => handleConfirmedAction('本当にキャンセル申請しますか？', () => cancelRequest(r.id), 'キャンセル申請しました')}
+                    className="flex items-center gap-1 px-3 py-1.5 bg-red-100 text-red-700 text-sm rounded hover:bg-red-200"
+                  >
+                    <XCircle size={14} /> キャンセル申請
                   </button>
                 </>
               )}
@@ -507,6 +647,31 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
                   <Clock size={14} /> HOLD期限: {new Date(r.hold_expires_at).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}
                 </div>
               )}
+
+              {/* Series bulk actions */}
+              {r.series_id && r.series_info && !['CANCELLED', 'REJECTED', 'EXPIRED'].includes(r.status) && (
+                <div className="w-full pt-2 border-t border-blue-200">
+                  <p className="text-xs text-blue-600 font-medium mb-1.5">🔄 繰り返し予約の一括操作</p>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      onClick={() => setShowSeriesBulkEdit(true)}
+                      className="flex items-center gap-1 px-3 py-1.5 bg-blue-50 text-blue-700 text-sm rounded hover:bg-blue-100 border border-blue-200"
+                    >
+                      <Repeat size={14} /> 以降を一括編集
+                    </button>
+                    <button
+                      onClick={() => handleConfirmedAction(
+                        `この予約以降の繰り返し予約（${seriesPosition ? seriesPosition.remainingAfter + 1 : '?'}件）をすべてキャンセルしますか？\n※この操作は元に戻せません`,
+                        handleBulkCancel,
+                        '一括キャンセルしました'
+                      )}
+                      className="flex items-center gap-1 px-3 py-1.5 bg-red-50 text-red-700 text-sm rounded hover:bg-red-100 border border-red-200"
+                    >
+                      <Trash2 size={14} /> 以降を一括削除
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -514,7 +679,7 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
 
       {/* Confirmation dialog */}
       {confirmDialog && (
-        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-[60]">
+        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-[70]">
           <div className="bg-white rounded-lg shadow-2xl p-6 max-w-xs mx-4">
             <p className="text-sm font-medium mb-4">{confirmDialog.message}</p>
             <div className="flex gap-2 justify-end">
@@ -537,10 +702,192 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
 
       {/* Success popup */}
       {successPopup && (
-        <div className="fixed inset-0 flex items-center justify-center z-[70] pointer-events-none">
+        <div className="fixed inset-0 flex items-center justify-center z-[75] pointer-events-none">
           <div className="bg-green-500 text-white px-6 py-3 rounded-lg shadow-2xl flex items-center gap-2 animate-bounce">
             <CheckCircle size={20} />
             <span className="font-medium">{successPopup}</span>
+          </div>
+        </div>
+      )}
+
+      {/* Series Bulk Edit Modal */}
+      {showSeriesBulkEdit && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[60]">
+          <div className="bg-white rounded-lg shadow-2xl w-full max-w-md mx-4 max-h-[80vh] overflow-y-auto">
+            <div className="flex items-center justify-between p-4 border-b">
+              <h3 className="font-semibold text-sm">🔄 繰り返し予約 一括編集</h3>
+              <button onClick={() => setShowSeriesBulkEdit(false)} className="p-1 hover:bg-gray-100 rounded"><X size={18} /></button>
+            </div>
+            <div className="p-4 space-y-3">
+              <p className="text-xs text-gray-500">この予約以降の{seriesPosition ? seriesPosition.remainingAfter + 1 : '?'}件に変更を適用します。変更したい項目のみ入力してください。</p>
+
+              {/* Practitioner */}
+              <div>
+                <label className="text-xs text-gray-500">施術者</label>
+                <select
+                  value={bulkEditPractitionerId ?? ''}
+                  onChange={(e) => setBulkEditPractitionerId(e.target.value ? Number(e.target.value) : undefined)}
+                  className="w-full border rounded px-2 py-1 text-sm"
+                >
+                  <option value="">変更しない</option>
+                  {practitioners.map(p => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Menu */}
+              <div>
+                <label className="text-xs text-gray-500">メニュー</label>
+                <select
+                  value={bulkEditMenuId ?? ''}
+                  onChange={(e) => setBulkEditMenuId(e.target.value ? Number(e.target.value) : undefined)}
+                  className="w-full border rounded px-2 py-1 text-sm"
+                >
+                  <option value="">変更しない</option>
+                  {menus.map(m => (
+                    <option key={m.id} value={m.id}>{m.name} ({m.duration_minutes}分)</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Color */}
+              <div>
+                <label className="text-xs text-gray-500">予約色</label>
+                <select
+                  value={bulkEditColorId ?? ''}
+                  onChange={(e) => setBulkEditColorId(e.target.value ? Number(e.target.value) : undefined)}
+                  className="w-full border rounded px-2 py-1 text-sm"
+                >
+                  <option value="">変更しない</option>
+                  {reservationColors.map(c => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Start Time */}
+              <div>
+                <label className="text-xs text-gray-500">開始時間</label>
+                <select
+                  value={bulkEditStartTime ?? ''}
+                  onChange={(e) => setBulkEditStartTime(e.target.value || undefined)}
+                  className="w-full border rounded px-2 py-1 text-sm"
+                >
+                  <option value="">変更しない</option>
+                  {timeOptions.map(t => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Duration */}
+              <div>
+                <label className="text-xs text-gray-500">施術時間（分）</label>
+                <select
+                  value={bulkEditDuration ?? ''}
+                  onChange={(e) => setBulkEditDuration(e.target.value ? Number(e.target.value) : undefined)}
+                  className="w-full border rounded px-2 py-1 text-sm"
+                >
+                  <option value="">変更しない</option>
+                  {[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120].map(d => (
+                    <option key={d} value={d}>{d}分</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Notes */}
+              <div>
+                <label className="text-xs text-gray-500">備考</label>
+                <textarea
+                  value={bulkEditNotes ?? ''}
+                  onChange={(e) => setBulkEditNotes(e.target.value || undefined)}
+                  rows={2}
+                  placeholder="変更しない場合は空欄"
+                  className="w-full border rounded px-2 py-1 text-sm"
+                />
+              </div>
+
+              {actionError && (
+                <div className="p-2 bg-red-50 border border-red-200 rounded text-red-700 text-xs">{actionError}</div>
+              )}
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  onClick={() => {
+                    setActionError(null);
+                    // Validate payload before showing confirm
+                    const hasChange = bulkEditPractitionerId !== undefined || bulkEditMenuId !== undefined ||
+                      bulkEditColorId !== undefined || bulkEditStartTime !== undefined ||
+                      bulkEditDuration !== undefined || bulkEditNotes !== undefined;
+                    if (!hasChange) {
+                      setActionError('変更内容を指定してください');
+                      return;
+                    }
+                    setBulkEditConfirm(true);
+                  }}
+                  disabled={bulkEditSaving}
+                  className="flex items-center gap-1 px-4 py-2 bg-blue-500 text-white text-sm rounded hover:bg-blue-600 disabled:opacity-50"
+                >
+                  <CheckCircle size={14} /> {bulkEditSaving ? '更新中...' : '一括変更を実行'}
+                </button>
+                <button
+                  onClick={() => { setShowSeriesBulkEdit(false); setBulkEditConfirm(false); }}
+                  className="px-4 py-2 bg-gray-200 text-gray-700 text-sm rounded hover:bg-gray-300"
+                >
+                  キャンセル
+                </button>
+              </div>
+
+              {/* Inline confirmation for bulk edit */}
+              {bulkEditConfirm && (
+                <div className="mt-3 p-3 bg-blue-50 border border-blue-300 rounded-lg">
+                  <p className="text-sm font-medium text-gray-800 mb-3">
+                    この予約以降の{seriesPosition ? seriesPosition.remainingAfter + 1 : '?'}件に変更を適用しますか？
+                  </p>
+                  <div className="flex gap-2 justify-end">
+                    <button
+                      onClick={() => setBulkEditConfirm(false)}
+                      className="px-4 py-2 bg-gray-200 text-gray-700 text-sm rounded hover:bg-gray-300"
+                    >
+                      いいえ
+                    </button>
+                    <button
+                      onClick={() => { setBulkEditConfirm(false); handleBulkEdit(); }}
+                      className="px-4 py-2 bg-blue-500 text-white text-sm rounded hover:bg-blue-600"
+                    >
+                      はい
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Series Alert Modal (skip/conflict warnings) */}
+      {seriesAlertModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-[80]">
+          <div className="bg-white rounded-lg shadow-2xl w-full max-w-lg mx-4 border-2 border-orange-400">
+            <div className="p-4 bg-orange-50 rounded-t-lg border-b border-orange-200">
+              <h3 className="text-base font-bold text-orange-700">{seriesAlertModal.title}</h3>
+            </div>
+            <div className="p-4 space-y-2 max-h-[50vh] overflow-y-auto">
+              {seriesAlertModal.messages.map((msg, i) => (
+                <div key={i} className="p-3 bg-yellow-50 rounded border border-yellow-300 text-sm text-yellow-800">
+                  ⚠ {msg}
+                </div>
+              ))}
+            </div>
+            <div className="p-4 border-t flex justify-end">
+              <button
+                onClick={() => { setSeriesAlertModal(null); onClose(); }}
+                className="px-6 py-2.5 bg-orange-500 text-white text-sm font-medium rounded hover:bg-orange-600"
+              >
+                了解
+              </button>
+            </div>
           </div>
         </div>
       )}

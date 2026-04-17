@@ -19,13 +19,13 @@ from app.services.notification_service import create_notification
 from app.services.schedule_service import is_practitioner_working, get_practitioner_working_hours
 from app.services.business_hours import get_business_hours_for_date
 from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
-from app.utils.datetime_jst import now_jst
+from app.utils.datetime_jst import now_jst, JST
 
 logger = logging.getLogger(__name__)
 
 VALID_TRANSITIONS = {
-    "PENDING": {"CONFIRMED", "REJECTED", "EXPIRED"},
-    "HOLD": {"CONFIRMED", "EXPIRED"},
+    "PENDING": {"CONFIRMED", "REJECTED", "EXPIRED", "CANCEL_REQUESTED", "CANCELLED"},
+    "HOLD": {"CONFIRMED", "EXPIRED", "CANCELLED"},
     "CONFIRMED": {"CHANGE_REQUESTED", "CANCEL_REQUESTED"},
     "CHANGE_REQUESTED": {"CANCELLED"},
     "CANCEL_REQUESTED": {"CANCELLED"},
@@ -113,9 +113,20 @@ def build_reservation_response(reservation: Reservation) -> dict:
         "conflict_note": reservation.conflict_note,
         "hotpepper_synced": reservation.hotpepper_synced,
         "hold_expires_at": reservation.hold_expires_at,
+        "series_id": reservation.series_id,
+        "series_info": None,
         "created_at": reservation.created_at,
         "updated_at": reservation.updated_at,
     }
+    if reservation.series_id and reservation.series:
+        s = reservation.series
+        resp["series_info"] = {
+            "id": s.id,
+            "frequency": s.frequency,
+            "total_created": s.total_created,
+            "remaining_count": s.remaining_count,
+            "is_active": s.is_active,
+        }
     if reservation.patient:
         resp["patient"] = {
             "id": reservation.patient.id,
@@ -220,7 +231,7 @@ async def create_reservation(
             for c in conflicts:
                 name = c.patient.name if c.patient else "不明"
                 conflict_names.append(
-                    f"{name}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})"
+                    f"{name}({c.start_time.astimezone(JST).strftime('%H:%M')}-{c.end_time.astimezone(JST).strftime('%H:%M')})"
                 )
             conflict_note = "競合: " + ", ".join(conflict_names)
     else:
@@ -236,7 +247,7 @@ async def create_reservation(
         for c in patient_conflicts:
             prac_name = c.practitioner.name if c.practitioner else "不明"
             pc_names.append(
-                f"{prac_name}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})"
+                f"{prac_name}({c.start_time.astimezone(JST).strftime('%H:%M')}-{c.end_time.astimezone(JST).strftime('%H:%M')})"
             )
         patient_conflict_msg = "患者ダブルブッキング: " + ", ".join(pc_names)
         conflict_note = (conflict_note + " / " + patient_conflict_msg) if conflict_note else patient_conflict_msg
@@ -272,8 +283,8 @@ async def create_reservation(
                 conflict_list.append({
                     "id": c.id,
                     "patient_name": c.patient.name if c.patient else None,
-                    "start_time": c.start_time.isoformat(),
-                    "end_time": c.end_time.isoformat(),
+                    "start_time": c.start_time.astimezone(JST).isoformat(),
+                    "end_time": c.end_time.astimezone(JST).isoformat(),
                     "status": c.status,
                 })
             raise HTTPException(
@@ -343,10 +354,80 @@ async def create_reservation(
     return build_reservation_response(reservation)
 
 
+async def refresh_conflict_notes_for_overlapping(
+    db: AsyncSession, reservation: Reservation
+) -> None:
+    """予約がキャンセル/却下等で非アクティブになった際、
+    その予約と時間帯が重なっていた他の予約の conflict_note を再評価してクリアする。"""
+    # この予約と時間が重なり、conflict_noteがある予約を取得
+    result = await db.execute(
+        select(Reservation)
+        .where(
+            Reservation.conflict_note.isnot(None),
+            Reservation.status.in_(ACTIVE_STATUSES),
+            Reservation.id != reservation.id,
+            # 施術者競合 OR 患者競合の可能性がある予約
+            Reservation.start_time < reservation.end_time,
+            Reservation.end_time > reservation.start_time,
+        )
+        .options(selectinload(Reservation.patient), selectinload(Reservation.practitioner))
+    )
+    candidates = result.scalars().all()
+
+    for r in candidates:
+        # 施術者競合を再チェック
+        prac_conflicts = await check_conflict(
+            db, r.practitioner_id, r.start_time, r.end_time,
+            exclude_reservation_id=r.id,
+        )
+        # 患者競合を再チェック
+        pat_conflicts = []
+        if r.patient_id:
+            pat_conflicts = await check_patient_conflict(
+                db, r.patient_id, r.start_time, r.end_time,
+                exclude_reservation_id=r.id,
+            )
+
+        # 新しいconflict_noteを構築
+        parts = []
+        if prac_conflicts:
+            names = [
+                f"{(c.patient.name if c.patient else '不明')}"
+                f"({c.start_time.astimezone(JST).strftime('%H:%M')}-{c.end_time.astimezone(JST).strftime('%H:%M')})"
+                for c in prac_conflicts
+            ]
+            parts.append("競合: " + ", ".join(names))
+        if pat_conflicts:
+            names = [
+                f"{(c.practitioner.name if c.practitioner else '不明')}"
+                f"({c.start_time.astimezone(JST).strftime('%H:%M')}-{c.end_time.astimezone(JST).strftime('%H:%M')})"
+                for c in pat_conflicts
+            ]
+            parts.append("患者ダブルブッキング: " + ", ".join(names))
+
+        r.conflict_note = " / ".join(parts) if parts else None
+
+
+_STATUS_LABELS = {
+    "PENDING": "仮予約",
+    "HOLD": "一時確保",
+    "CONFIRMED": "確定",
+    "CHANGE_REQUESTED": "変更申請中",
+    "CANCEL_REQUESTED": "キャンセル申請中",
+    "CANCELLED": "キャンセル済",
+    "REJECTED": "却下",
+    "EXPIRED": "期限切れ",
+}
+
+
 async def transition_status(
     db: AsyncSession, reservation_id: int, new_status: str
 ) -> Reservation:
-    """ステータス遷移（バリデーション付き）"""
+    """ステータス遷移（バリデーション付き）
+
+    冪等性: 同一ステータスへの遷移はno-op（エラーにしない）。
+    二重クリックやUIの状態ズレによる不要な失敗を防ぐ。
+    """
     result = await db.execute(
         select(Reservation).where(Reservation.id == reservation_id)
     )
@@ -355,20 +436,34 @@ async def transition_status(
         raise HTTPException(status_code=404, detail="予約が見つかりません")
 
     current = reservation.status
+
+    # 冪等: 既に目的のステータスなら何もしない
+    if current == new_status:
+        return reservation
+
     if current in TERMINAL_STATUSES:
+        cur_label = _STATUS_LABELS.get(current, current)
         raise HTTPException(
             status_code=400,
-            detail=f"終端ステータス '{current}' からの遷移はできません",
+            detail=f"この予約は既に「{cur_label}」のため操作できません",
         )
 
     allowed = VALID_TRANSITIONS.get(current, set())
     if new_status not in allowed:
+        cur_label = _STATUS_LABELS.get(current, current)
+        new_label = _STATUS_LABELS.get(new_status, new_status)
         raise HTTPException(
             status_code=400,
-            detail=f"'{current}' → '{new_status}' は不正な遷移です",
+            detail=f"「{cur_label}」状態の予約は「{new_label}」に変更できません",
         )
 
     reservation.status = new_status
+
+    # 非アクティブ化した場合、関連予約のconflict_noteを再評価
+    if new_status in TERMINAL_STATUSES:
+        reservation.conflict_note = None  # 自身のconflict_noteもクリア
+        await refresh_conflict_notes_for_overlapping(db, reservation)
+
     await db.flush()
     return reservation
 
@@ -463,6 +558,8 @@ async def handle_change_approve(db: AsyncSession, reservation_id: int) -> dict:
     hold_reservation = hold_result.scalar_one_or_none()
 
     old_reservation.status = "CANCELLED"
+    old_reservation.conflict_note = None
+    await refresh_conflict_notes_for_overlapping(db, old_reservation)
 
     if hold_reservation:
         hold_reservation.status = "CONFIRMED"
@@ -513,7 +610,7 @@ async def reschedule_reservation(
         for c in conflicts:
             name = c.patient.name if c.patient else "不明"
             conflict_names.append(
-                f"{name}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})"
+                f"{name}({c.start_time.astimezone(JST).strftime('%H:%M')}-{c.end_time.astimezone(JST).strftime('%H:%M')})"
             )
         raise HTTPException(
             status_code=409,
@@ -521,7 +618,7 @@ async def reschedule_reservation(
         )
 
     # 変更ログ作成
-    old_date_str = reservation.start_time.strftime("%Y/%m/%d %H:%M")
+    old_date_str = reservation.start_time.astimezone(JST).strftime("%Y/%m/%d %H:%M")
     change_time_str = now_jst().strftime("%Y/%m/%d %H:%M")
     change_log = f"{old_date_str}から予約変更（{change_time_str}）"
 

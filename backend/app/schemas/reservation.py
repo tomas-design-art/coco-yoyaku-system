@@ -118,6 +118,16 @@ class ColorBrief(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class SeriesInfoBrief(BaseModel):
+    id: int
+    frequency: str
+    total_created: int
+    remaining_count: int
+    is_active: bool
+
+    model_config = {"from_attributes": True}
+
+
 class ReservationResponse(BaseModel):
     id: int
     patient: Optional[PatientBrief] = None
@@ -135,6 +145,8 @@ class ReservationResponse(BaseModel):
     conflict_note: Optional[str] = None
     hotpepper_synced: bool
     hold_expires_at: Optional[datetime] = None
+    series_id: Optional[int] = None
+    series_info: Optional[SeriesInfoBrief] = None
     created_at: datetime
     updated_at: datetime
 
@@ -235,6 +247,16 @@ class SeriesModifyRequest(BaseModel):
     frequency: Optional[str] = None
     count: Optional[int] = None  # 新しい繰り返し回数 (None = 残りをキャンセル)
     cancel_remaining: bool = False  # True = 未来の予約をすべてキャンセル
+
+
+class SeriesBulkEditRequest(BaseModel):
+    """シリーズ一括編集（指定予約以降を変更）"""
+    practitioner_id: Optional[int] = None
+    menu_id: Optional[int] = None
+    color_id: Optional[int] = None
+    start_time: Optional[str] = None  # "HH:MM"
+    duration_minutes: Optional[int] = None
+    notes: Optional[str] = None
 
 
 class ConflictingReservation(BaseModel):
