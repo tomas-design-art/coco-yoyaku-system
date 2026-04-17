@@ -501,12 +501,12 @@ async def modify_series(
 
     now = now_jst()
 
-    # 未来の予約をキャンセル
+    # 未来の予約をキャンセル（終端ステータス以外は全て対象）
     future_result = await db.execute(
         select(Reservation).where(
             Reservation.series_id == series_id,
             Reservation.start_time > now,
-            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD", "CANCEL_REQUESTED", "CHANGE_REQUESTED"]),
         )
     )
     future_reservations = future_result.scalars().all()
@@ -640,11 +640,12 @@ async def cancel_remaining_series(
         raise HTTPException(status_code=404, detail="シリーズが見つかりません")
 
     now = now_jst()
+    # 終端ステータス以外は全て一括キャンセル対象（CANCEL_REQUESTED, CHANGE_REQUESTED も含む）
     future_result = await db.execute(
         select(Reservation).where(
             Reservation.series_id == series_id,
             Reservation.start_time > now,
-            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD", "CANCEL_REQUESTED", "CHANGE_REQUESTED"]),
         )
     )
     future_reservations = future_result.scalars().all()
@@ -685,12 +686,12 @@ async def cancel_series_from_reservation(
     if not anchor or anchor.series_id != series_id:
         raise HTTPException(status_code=400, detail="指定された予約はこのシリーズに属していません")
 
-    # 指定予約以降のアクティブ予約をキャンセル
+    # 指定予約以降のアクティブ予約をキャンセル（終端ステータス以外は全て対象）
     future_result = await db.execute(
         select(Reservation).where(
             Reservation.series_id == series_id,
             Reservation.start_time >= anchor.start_time,
-            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD", "CANCEL_REQUESTED", "CHANGE_REQUESTED"]),
         )
     )
     future_reservations = future_result.scalars().all()

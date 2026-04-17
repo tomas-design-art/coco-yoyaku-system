@@ -169,6 +169,7 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
       setTimeout(() => { setSuccessPopup(null); onClose(); }, 1500);
     } catch (err: unknown) {
       setActionError(extractErrorMessage(err, '更新に失敗しました'));
+      onUpdate();
     } finally {
       setSaving(false);
     }
@@ -194,6 +195,8 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
     } catch (err: unknown) {
       setConfirmDialog(null);
       setActionError(extractErrorMessage(err, 'アクションの実行に失敗しました'));
+      // 失敗時もサーバー状態を再取得してUIと同期（二重クリック等で古い状態を参照するのを防ぐ）
+      onUpdate();
     }
   };
 
@@ -242,6 +245,7 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
     } catch (err: unknown) {
       setConfirmDialog(null);
       setActionError(extractErrorMessage(err, '一括キャンセルに失敗しました'));
+      onUpdate();
     }
   };
 
@@ -290,6 +294,7 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
       }
     } catch (err: unknown) {
       setActionError(extractErrorMessage(err, '一括編集に失敗しました'));
+      onUpdate();
     } finally {
       setBulkEditSaving(false);
     }

@@ -408,10 +408,26 @@ async def refresh_conflict_notes_for_overlapping(
         r.conflict_note = " / ".join(parts) if parts else None
 
 
+_STATUS_LABELS = {
+    "PENDING": "仮予約",
+    "HOLD": "一時確保",
+    "CONFIRMED": "確定",
+    "CHANGE_REQUESTED": "変更申請中",
+    "CANCEL_REQUESTED": "キャンセル申請中",
+    "CANCELLED": "キャンセル済",
+    "REJECTED": "却下",
+    "EXPIRED": "期限切れ",
+}
+
+
 async def transition_status(
     db: AsyncSession, reservation_id: int, new_status: str
 ) -> Reservation:
-    """ステータス遷移（バリデーション付き）"""
+    """ステータス遷移（バリデーション付き）
+
+    冪等性: 同一ステータスへの遷移はno-op（エラーにしない）。
+    二重クリックやUIの状態ズレによる不要な失敗を防ぐ。
+    """
     result = await db.execute(
         select(Reservation).where(Reservation.id == reservation_id)
     )
@@ -420,17 +436,25 @@ async def transition_status(
         raise HTTPException(status_code=404, detail="予約が見つかりません")
 
     current = reservation.status
+
+    # 冪等: 既に目的のステータスなら何もしない
+    if current == new_status:
+        return reservation
+
     if current in TERMINAL_STATUSES:
+        cur_label = _STATUS_LABELS.get(current, current)
         raise HTTPException(
             status_code=400,
-            detail=f"終端ステータス '{current}' からの遷移はできません",
+            detail=f"この予約は既に「{cur_label}」のため操作できません",
         )
 
     allowed = VALID_TRANSITIONS.get(current, set())
     if new_status not in allowed:
+        cur_label = _STATUS_LABELS.get(current, current)
+        new_label = _STATUS_LABELS.get(new_status, new_status)
         raise HTTPException(
             status_code=400,
-            detail=f"'{current}' → '{new_status}' は不正な遷移です",
+            detail=f"「{cur_label}」状態の予約は「{new_label}」に変更できません",
         )
 
     reservation.status = new_status
