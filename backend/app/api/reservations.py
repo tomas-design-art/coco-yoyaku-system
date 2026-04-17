@@ -31,6 +31,7 @@ from app.services.reservation_service import (
     handle_change_approve,
     reschedule_reservation,
     build_reservation_response,
+    refresh_conflict_notes_for_overlapping,
 )
 from app.services.conflict_detector import check_conflict, check_patient_conflict, ACTIVE_STATUSES
 from app.services.notification_service import create_notification
@@ -512,7 +513,12 @@ async def modify_series(
     cancelled_count = 0
     for r in future_reservations:
         r.status = "CANCELLED"
+        r.conflict_note = None
         cancelled_count += 1
+
+    # キャンセルされた予約と競合していた他の予約のconflict_noteを再評価
+    for r in future_reservations:
+        await refresh_conflict_notes_for_overlapping(db, r)
 
     if body.cancel_remaining:
         series.is_active = False
@@ -645,7 +651,12 @@ async def cancel_remaining_series(
     cancelled = 0
     for r in future_reservations:
         r.status = "CANCELLED"
+        r.conflict_note = None
         cancelled += 1
+
+    # キャンセルされた予約と競合していた他の予約のconflict_noteを再評価
+    for r in future_reservations:
+        await refresh_conflict_notes_for_overlapping(db, r)
 
     series.is_active = False
     series.remaining_count = 0
@@ -687,8 +698,13 @@ async def cancel_series_from_reservation(
     cancelled_dates = []
     for r in future_reservations:
         r.status = "CANCELLED"
+        r.conflict_note = None
         cancelled += 1
         cancelled_dates.append(r.start_time.strftime("%Y-%m-%d"))
+
+    # キャンセルされた予約と競合していた他の予約のconflict_noteを再評価
+    for r in future_reservations:
+        await refresh_conflict_notes_for_overlapping(db, r)
 
     # remaining_count を更新
     active_result = await db.execute(

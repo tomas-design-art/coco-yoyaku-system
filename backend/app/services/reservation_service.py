@@ -354,6 +354,60 @@ async def create_reservation(
     return build_reservation_response(reservation)
 
 
+async def refresh_conflict_notes_for_overlapping(
+    db: AsyncSession, reservation: Reservation
+) -> None:
+    """予約がキャンセル/却下等で非アクティブになった際、
+    その予約と時間帯が重なっていた他の予約の conflict_note を再評価してクリアする。"""
+    # この予約と時間が重なり、conflict_noteがある予約を取得
+    result = await db.execute(
+        select(Reservation)
+        .where(
+            Reservation.conflict_note.isnot(None),
+            Reservation.status.in_(ACTIVE_STATUSES),
+            Reservation.id != reservation.id,
+            # 施術者競合 OR 患者競合の可能性がある予約
+            Reservation.start_time < reservation.end_time,
+            Reservation.end_time > reservation.start_time,
+        )
+        .options(selectinload(Reservation.patient), selectinload(Reservation.practitioner))
+    )
+    candidates = result.scalars().all()
+
+    for r in candidates:
+        # 施術者競合を再チェック
+        prac_conflicts = await check_conflict(
+            db, r.practitioner_id, r.start_time, r.end_time,
+            exclude_reservation_id=r.id,
+        )
+        # 患者競合を再チェック
+        pat_conflicts = []
+        if r.patient_id:
+            pat_conflicts = await check_patient_conflict(
+                db, r.patient_id, r.start_time, r.end_time,
+                exclude_reservation_id=r.id,
+            )
+
+        # 新しいconflict_noteを構築
+        parts = []
+        if prac_conflicts:
+            names = [
+                f"{(c.patient.name if c.patient else '不明')}"
+                f"({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})"
+                for c in prac_conflicts
+            ]
+            parts.append("競合: " + ", ".join(names))
+        if pat_conflicts:
+            names = [
+                f"{(c.practitioner.name if c.practitioner else '不明')}"
+                f"({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})"
+                for c in pat_conflicts
+            ]
+            parts.append("患者ダブルブッキング: " + ", ".join(names))
+
+        r.conflict_note = " / ".join(parts) if parts else None
+
+
 async def transition_status(
     db: AsyncSession, reservation_id: int, new_status: str
 ) -> Reservation:
@@ -380,6 +434,12 @@ async def transition_status(
         )
 
     reservation.status = new_status
+
+    # 非アクティブ化した場合、関連予約のconflict_noteを再評価
+    if new_status in TERMINAL_STATUSES:
+        reservation.conflict_note = None  # 自身のconflict_noteもクリア
+        await refresh_conflict_notes_for_overlapping(db, reservation)
+
     await db.flush()
     return reservation
 
@@ -474,6 +534,8 @@ async def handle_change_approve(db: AsyncSession, reservation_id: int) -> dict:
     hold_reservation = hold_result.scalar_one_or_none()
 
     old_reservation.status = "CANCELLED"
+    old_reservation.conflict_note = None
+    await refresh_conflict_notes_for_overlapping(db, old_reservation)
 
     if hold_reservation:
         hold_reservation.status = "CONFIRMED"
