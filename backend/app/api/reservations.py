@@ -744,7 +744,7 @@ async def edit_series_from_reservation(
     update_fields = body.model_dump(exclude_unset=True)
 
     for r in future_reservations:
-        target_date = r.start_time.date()
+        target_date = r.start_time.astimezone(_JST).date()
         new_practitioner_id = update_fields.get("practitioner_id", r.practitioner_id)
         new_start_time = r.start_time
         new_end_time = r.end_time
@@ -753,7 +753,8 @@ async def edit_series_from_reservation(
         if "start_time" in update_fields or "duration_minutes" in update_fields:
             if "start_time" in update_fields:
                 hour, minute = map(int, update_fields["start_time"].split(":"))
-                new_start_time = r.start_time.replace(hour=hour, minute=minute)
+                jst_time = r.start_time.astimezone(_JST)
+                new_start_time = jst_time.replace(hour=hour, minute=minute)
             dur = update_fields.get("duration_minutes") or int((r.end_time - r.start_time).total_seconds() / 60)
             new_end_time = new_start_time + timedelta(minutes=dur)
 
