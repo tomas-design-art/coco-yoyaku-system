@@ -19,7 +19,7 @@ from app.services.notification_service import create_notification
 from app.services.schedule_service import is_practitioner_working, get_practitioner_working_hours
 from app.services.business_hours import get_business_hours_for_date
 from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
-from app.utils.datetime_jst import now_jst
+from app.utils.datetime_jst import now_jst, JST
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +231,7 @@ async def create_reservation(
             for c in conflicts:
                 name = c.patient.name if c.patient else "不明"
                 conflict_names.append(
-                    f"{name}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})"
+                    f"{name}({c.start_time.astimezone(JST).strftime('%H:%M')}-{c.end_time.astimezone(JST).strftime('%H:%M')})"
                 )
             conflict_note = "競合: " + ", ".join(conflict_names)
     else:
@@ -247,7 +247,7 @@ async def create_reservation(
         for c in patient_conflicts:
             prac_name = c.practitioner.name if c.practitioner else "不明"
             pc_names.append(
-                f"{prac_name}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})"
+                f"{prac_name}({c.start_time.astimezone(JST).strftime('%H:%M')}-{c.end_time.astimezone(JST).strftime('%H:%M')})"
             )
         patient_conflict_msg = "患者ダブルブッキング: " + ", ".join(pc_names)
         conflict_note = (conflict_note + " / " + patient_conflict_msg) if conflict_note else patient_conflict_msg
@@ -283,8 +283,8 @@ async def create_reservation(
                 conflict_list.append({
                     "id": c.id,
                     "patient_name": c.patient.name if c.patient else None,
-                    "start_time": c.start_time.isoformat(),
-                    "end_time": c.end_time.isoformat(),
+                    "start_time": c.start_time.astimezone(JST).isoformat(),
+                    "end_time": c.end_time.astimezone(JST).isoformat(),
                     "status": c.status,
                 })
             raise HTTPException(
@@ -393,14 +393,14 @@ async def refresh_conflict_notes_for_overlapping(
         if prac_conflicts:
             names = [
                 f"{(c.patient.name if c.patient else '不明')}"
-                f"({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})"
+                f"({c.start_time.astimezone(JST).strftime('%H:%M')}-{c.end_time.astimezone(JST).strftime('%H:%M')})"
                 for c in prac_conflicts
             ]
             parts.append("競合: " + ", ".join(names))
         if pat_conflicts:
             names = [
                 f"{(c.practitioner.name if c.practitioner else '不明')}"
-                f"({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})"
+                f"({c.start_time.astimezone(JST).strftime('%H:%M')}-{c.end_time.astimezone(JST).strftime('%H:%M')})"
                 for c in pat_conflicts
             ]
             parts.append("患者ダブルブッキング: " + ", ".join(names))
@@ -586,7 +586,7 @@ async def reschedule_reservation(
         for c in conflicts:
             name = c.patient.name if c.patient else "不明"
             conflict_names.append(
-                f"{name}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})"
+                f"{name}({c.start_time.astimezone(JST).strftime('%H:%M')}-{c.end_time.astimezone(JST).strftime('%H:%M')})"
             )
         raise HTTPException(
             status_code=409,
@@ -594,7 +594,7 @@ async def reschedule_reservation(
         )
 
     # 変更ログ作成
-    old_date_str = reservation.start_time.strftime("%Y/%m/%d %H:%M")
+    old_date_str = reservation.start_time.astimezone(JST).strftime("%Y/%m/%d %H:%M")
     change_time_str = now_jst().strftime("%Y/%m/%d %H:%M")
     change_log = f"{old_date_str}から予約変更（{change_time_str}）"
 

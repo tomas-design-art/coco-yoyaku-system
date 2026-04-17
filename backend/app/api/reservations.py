@@ -205,7 +205,7 @@ async def bulk_create_reservations(
             names = []
             for c in practitioner_conflicts:
                 name = c.patient.name if c.patient else "不明"
-                names.append(f"{name}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})")
+                names.append(f"{name}({c.start_time.astimezone(_JST).strftime('%H:%M')}-{c.end_time.astimezone(_JST).strftime('%H:%M')})")
             skipped.append({
                 "date": target_date.isoformat(),
                 "reason": f"ダブルブッキング: {', '.join(names)}と時間が重複しています",
@@ -221,7 +221,7 @@ async def bulk_create_reservations(
                 names = []
                 for c in patient_conflicts:
                     prac_name = c.practitioner.name if c.practitioner else "不明"
-                    names.append(f"{prac_name}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})")
+                    names.append(f"{prac_name}({c.start_time.astimezone(_JST).strftime('%H:%M')}-{c.end_time.astimezone(_JST).strftime('%H:%M')})")
                 skipped.append({
                     "date": target_date.isoformat(),
                     "reason": f"患者ダブルブッキング: {', '.join(names)}と時間が重複しています",
@@ -439,14 +439,14 @@ async def extend_series(
             db, series.practitioner_id, start_dt, end_dt
         )
         if practitioner_conflicts:
-            names = [f"{(c.patient.name if c.patient else '不明')}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})" for c in practitioner_conflicts]
+            names = [f"{(c.patient.name if c.patient else '不明')}({c.start_time.astimezone(_JST).strftime('%H:%M')}-{c.end_time.astimezone(_JST).strftime('%H:%M')})" for c in practitioner_conflicts]
             skipped.append({"date": target_date.isoformat(), "reason": f"ダブルブッキング: {', '.join(names)}と時間が重複しています"})
             continue
 
         if series.patient_id:
             patient_conflicts = await check_patient_conflict(db, series.patient_id, start_dt, end_dt)
             if patient_conflicts:
-                names = [f"{(c.practitioner.name if c.practitioner else '不明')}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})" for c in patient_conflicts]
+                names = [f"{(c.practitioner.name if c.practitioner else '不明')}({c.start_time.astimezone(_JST).strftime('%H:%M')}-{c.end_time.astimezone(_JST).strftime('%H:%M')})" for c in patient_conflicts]
                 skipped.append({"date": target_date.isoformat(), "reason": f"患者ダブルブッキング: {', '.join(names)}と時間が重複しています"})
                 continue
 
@@ -578,14 +578,14 @@ async def modify_series(
             db, series.practitioner_id, start_dt, end_dt
         )
         if practitioner_conflicts:
-            names = [f"{(c.patient.name if c.patient else '不明')}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})" for c in practitioner_conflicts]
+            names = [f"{(c.patient.name if c.patient else '不明')}({c.start_time.astimezone(_JST).strftime('%H:%M')}-{c.end_time.astimezone(_JST).strftime('%H:%M')})" for c in practitioner_conflicts]
             skipped.append({"date": target_date.isoformat(), "reason": f"ダブルブッキング: {', '.join(names)}と時間が重複しています"})
             continue
 
         if series.patient_id:
             patient_conflicts = await check_patient_conflict(db, series.patient_id, start_dt, end_dt)
             if patient_conflicts:
-                names = [f"{(c.practitioner.name if c.practitioner else '不明')}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})" for c in patient_conflicts]
+                names = [f"{(c.practitioner.name if c.practitioner else '不明')}({c.start_time.astimezone(_JST).strftime('%H:%M')}-{c.end_time.astimezone(_JST).strftime('%H:%M')})" for c in patient_conflicts]
                 skipped.append({"date": target_date.isoformat(), "reason": f"患者ダブルブッキング: {', '.join(names)}と時間が重複しています"})
                 continue
 
@@ -700,7 +700,7 @@ async def cancel_series_from_reservation(
         r.status = "CANCELLED"
         r.conflict_note = None
         cancelled += 1
-        cancelled_dates.append(r.start_time.strftime("%Y-%m-%d"))
+        cancelled_dates.append(r.start_time.astimezone(_JST).strftime("%Y-%m-%d"))
 
     # キャンセルされた予約と競合していた他の予約のconflict_noteを再評価
     for r in future_reservations:
@@ -896,7 +896,7 @@ async def update_reservation(
             for c in conflicts:
                 name = c.patient.name if c.patient else "不明"
                 conflict_names.append(
-                    f"{name}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})"
+                    f"{name}({c.start_time.astimezone(_JST).strftime('%H:%M')}-{c.end_time.astimezone(_JST).strftime('%H:%M')})"
                 )
             raise HTTPException(
                 status_code=409,

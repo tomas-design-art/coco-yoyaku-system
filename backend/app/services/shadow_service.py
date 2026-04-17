@@ -713,8 +713,8 @@ async def _shadow_check_and_notify(
             if conflicts:
                 for c in conflicts:
                     pt_name = c.patient.name if c.patient else "不明"
-                    c_start = c.start_time.strftime("%H:%M") if c.start_time else "?"
-                    c_end = c.end_time.strftime("%H:%M") if c.end_time else "?"
+                    c_start = c.start_time.astimezone(JST).strftime("%H:%M") if c.start_time else "?"
+                    c_end = c.end_time.astimezone(JST).strftime("%H:%M") if c.end_time else "?"
                     conflict_info = f"予約済み: {pt_name}様 {c_start}〜{c_end}（{p.name}）"
                     break
             if conflict_info:
