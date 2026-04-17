@@ -38,4 +38,4 @@ class Reservation(Base):
     practitioner = relationship("Practitioner", backref="reservations")
     menu = relationship("Menu", backref="reservations")
     color = relationship("ReservationColor", backref="reservations")
-    series = relationship("ReservationSeries", back_populates="reservations")
+    series = relationship("ReservationSeries", back_populates="reservations", lazy="selectin")
