@@ -11,12 +11,18 @@ logger = logging.getLogger(__name__)
 
 
 def normalize_phone(v: str | None) -> str | None:
-    """電話番号の正規化: ハイフン除去、全角→半角"""
+    """電話番号の正規化: ハイフン除去、全角→半角、+81→0 変換"""
     if not v:
         return None
-    v = v.translate(str.maketrans("０１２３４５６７８９－", "0123456789-"))
+    v = v.translate(str.maketrans("０１２３４５６７８９－＋", "0123456789-+"))
     v = v.replace("-", "").replace("ー", "").replace(" ", "").replace("\u3000", "")
-    return v.strip() or None
+    v = v.strip()
+    # +81 国際番号表記を 0 始まりに変換
+    if v.startswith("+81"):
+        v = "0" + v[3:]
+    elif v.startswith("81") and len(v) >= 12:
+        v = "0" + v[2:]
+    return v or None
 
 
 def normalize_name(v: str | None) -> str:
@@ -60,41 +66,40 @@ async def find_existing_patient(
     phone: str | None = None,
     line_id: str | None = None,
 ) -> Patient | None:
-    """電話番号 → line_id → 名前+電話 の優先度で既存患者を検索する。
+    """名前+電話 → LINE ID → 名前のみ の優先度で既存患者を検索する。
+
+    電話番号だけでは家族共有のケースがあるため単独識別子にしない。
+    名前+電話の両方が一致した場合に同一人物と判定する。
 
     Returns: 見つかった Patient or None
     """
     norm_phone = normalize_phone(phone)
     norm_name = normalize_name(name)
 
-    # 1) 電話番号(正規化)で検索 ─ 最も信頼度が高い
-    if norm_phone:
-        result = await db.execute(
-            select(Patient).where(Patient.phone.isnot(None))
-        )
-        for p in result.scalars().all():
-            if normalize_phone(p.phone) == norm_phone:
-                logger.info("患者マッチ(電話): id=%d name=%s", p.id, p.name)
+    # 全患者を1回だけ取得して以降のチェックで再利用する
+    all_patients = (await db.execute(select(Patient))).scalars().all()
+
+    # 1) 名前 + 電話番号の組み合わせ検索 ─ 最も信頼度が高い
+    #    家族で同じ電話を共有するケースがあるため、電話だけではマッチしない
+    if norm_name and norm_phone:
+        for p in all_patients:
+            if not p.phone or normalize_phone(p.phone) != norm_phone:
+                continue
+            if _name_matches_patient(norm_name, p):
+                logger.info("患者マッチ(名前+電話): id=%d name=%s phone=%s", p.id, p.name, p.phone)
                 return p
 
     # 2) LINE ID で検索
     if line_id:
-        result = await db.execute(
-            select(Patient).where(Patient.line_id == line_id).limit(1)
-        )
-        p = result.scalar_one_or_none()
-        if p:
-            logger.info("患者マッチ(LINE ID): id=%d name=%s", p.id, p.name)
-            return p
+        for p in all_patients:
+            if p.line_id and p.line_id == line_id:
+                logger.info("患者マッチ(LINE ID): id=%d name=%s", p.id, p.name)
+                return p
 
     # 3) 名前の正規化一致 (電話番号なし＋LINE IDなしの場合のフォールバック)
     #    同姓同名リスクがあるため、名前だけでは作成済み患者数1件の場合のみマッチ
     if norm_name:
-        result = await db.execute(select(Patient))
-        candidates = [
-            p for p in result.scalars().all()
-            if normalize_name(p.name) == norm_name
-        ]
+        candidates = [p for p in all_patients if _name_matches_patient(norm_name, p)]
         if len(candidates) == 1:
             logger.info("患者マッチ(名前): id=%d name=%s", candidates[0].id, candidates[0].name)
             return candidates[0]
@@ -109,6 +114,26 @@ async def find_existing_patient(
     return None
 
 
+def _name_matches_patient(norm_name: str, patient: Patient) -> bool:
+    """正規化済みの名前が患者レコードのいずれかの名前列と一致するか判定する。
+
+    比較対象:
+      - name 列 (合成済みフルネーム)
+      - last_name + first_name (姓名分離保存)
+      - last_name のみ / first_name のみ (片方だけ入っている場合)
+    """
+    if normalize_name(patient.name) == norm_name:
+        return True
+    # last_name + first_name の結合比較
+    if patient.last_name or patient.first_name:
+        combined = normalize_name(
+            f"{patient.last_name or ''}{patient.first_name or ''}"
+        )
+        if combined == norm_name:
+            return True
+    return False
+
+
 async def find_name_candidates(db: AsyncSession, name: str, limit: int = 5) -> list[Patient]:
     """正規化した名前一致の候補を返す（同姓同名確認用）。"""
     norm_name = normalize_name(name)
@@ -117,7 +142,7 @@ async def find_name_candidates(db: AsyncSession, name: str, limit: int = 5) -> l
     result = await db.execute(select(Patient).order_by(Patient.id.desc()))
     candidates = [
         p for p in result.scalars().all()
-        if normalize_name(p.name) == norm_name
+        if _name_matches_patient(norm_name, p)
     ]
     return candidates[:limit]
 
