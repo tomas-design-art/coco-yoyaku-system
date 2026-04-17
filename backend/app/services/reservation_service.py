@@ -24,8 +24,8 @@ from app.utils.datetime_jst import now_jst
 logger = logging.getLogger(__name__)
 
 VALID_TRANSITIONS = {
-    "PENDING": {"CONFIRMED", "REJECTED", "EXPIRED"},
-    "HOLD": {"CONFIRMED", "EXPIRED"},
+    "PENDING": {"CONFIRMED", "REJECTED", "EXPIRED", "CANCEL_REQUESTED", "CANCELLED"},
+    "HOLD": {"CONFIRMED", "EXPIRED", "CANCELLED"},
     "CONFIRMED": {"CHANGE_REQUESTED", "CANCEL_REQUESTED"},
     "CHANGE_REQUESTED": {"CANCELLED"},
     "CANCEL_REQUESTED": {"CANCELLED"},

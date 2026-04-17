@@ -32,7 +32,7 @@ from app.services.reservation_service import (
     reschedule_reservation,
     build_reservation_response,
 )
-from app.services.conflict_detector import check_conflict, ACTIVE_STATUSES
+from app.services.conflict_detector import check_conflict, check_patient_conflict, ACTIVE_STATUSES
 from app.services.notification_service import create_notification
 from app.models.reservation_series import ReservationSeries
 from app.services.schedule_service import is_practitioner_working
@@ -194,6 +194,38 @@ async def bulk_create_reservations(
             hour, minute, tzinfo=_JST,
         )
         end_dt = start_dt + timedelta(minutes=data.duration_minutes)
+
+        # ── 事前競合チェック（ダブルブッキング防止） ──
+        # 施術者の時間帯競合
+        practitioner_conflicts = await check_conflict(
+            db, data.practitioner_id, start_dt, end_dt
+        )
+        if practitioner_conflicts:
+            names = []
+            for c in practitioner_conflicts:
+                name = c.patient.name if c.patient else "不明"
+                names.append(f"{name}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})")
+            skipped.append({
+                "date": target_date.isoformat(),
+                "reason": f"ダブルブッキング: {', '.join(names)}と時間が重複しています",
+            })
+            continue
+
+        # 同一患者の時間帯競合
+        if data.patient_id:
+            patient_conflicts = await check_patient_conflict(
+                db, data.patient_id, start_dt, end_dt
+            )
+            if patient_conflicts:
+                names = []
+                for c in patient_conflicts:
+                    prac_name = c.practitioner.name if c.practitioner else "不明"
+                    names.append(f"{prac_name}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})")
+                skipped.append({
+                    "date": target_date.isoformat(),
+                    "reason": f"患者ダブルブッキング: {', '.join(names)}と時間が重複しています",
+                })
+                continue
 
         reservation_data = ReservationCreate(
             patient_id=data.patient_id,
@@ -400,6 +432,23 @@ async def extend_series(
             hour, minute, tzinfo=_JST,
         )
         end_dt = start_dt + timedelta(minutes=series.duration_minutes)
+
+        # ── 事前競合チェック（ダブルブッキング防止） ──
+        practitioner_conflicts = await check_conflict(
+            db, series.practitioner_id, start_dt, end_dt
+        )
+        if practitioner_conflicts:
+            names = [f"{(c.patient.name if c.patient else '不明')}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})" for c in practitioner_conflicts]
+            skipped.append({"date": target_date.isoformat(), "reason": f"ダブルブッキング: {', '.join(names)}と時間が重複しています"})
+            continue
+
+        if series.patient_id:
+            patient_conflicts = await check_patient_conflict(db, series.patient_id, start_dt, end_dt)
+            if patient_conflicts:
+                names = [f"{(c.practitioner.name if c.practitioner else '不明')}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})" for c in patient_conflicts]
+                skipped.append({"date": target_date.isoformat(), "reason": f"患者ダブルブッキング: {', '.join(names)}と時間が重複しています"})
+                continue
+
         reservation_data = ReservationCreate(
             patient_id=series.patient_id,
             practitioner_id=series.practitioner_id,
@@ -517,6 +566,23 @@ async def modify_series(
             hour, minute, tzinfo=_JST,
         )
         end_dt = start_dt + timedelta(minutes=series.duration_minutes)
+
+        # ── 事前競合チェック（ダブルブッキング防止） ──
+        practitioner_conflicts = await check_conflict(
+            db, series.practitioner_id, start_dt, end_dt
+        )
+        if practitioner_conflicts:
+            names = [f"{(c.patient.name if c.patient else '不明')}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})" for c in practitioner_conflicts]
+            skipped.append({"date": target_date.isoformat(), "reason": f"ダブルブッキング: {', '.join(names)}と時間が重複しています"})
+            continue
+
+        if series.patient_id:
+            patient_conflicts = await check_patient_conflict(db, series.patient_id, start_dt, end_dt)
+            if patient_conflicts:
+                names = [f"{(c.practitioner.name if c.practitioner else '不明')}({c.start_time.strftime('%H:%M')}-{c.end_time.strftime('%H:%M')})" for c in patient_conflicts]
+                skipped.append({"date": target_date.isoformat(), "reason": f"患者ダブルブッキング: {', '.join(names)}と時間が重複しています"})
+                continue
+
         reservation_data = ReservationCreate(
             patient_id=series.patient_id,
             practitioner_id=series.practitioner_id,

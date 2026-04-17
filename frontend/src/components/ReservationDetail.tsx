@@ -42,6 +42,7 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
   const [seriesAlertModal, setSeriesAlertModal] = useState<{ title: string; messages: string[] } | null>(null);
   const [showSeriesBulkEdit, setShowSeriesBulkEdit] = useState(false);
   const [bulkEditSaving, setBulkEditSaving] = useState(false);
+  const [bulkEditConfirm, setBulkEditConfirm] = useState(false);
 
   // Bulk edit form state
   const [bulkEditPractitionerId, setBulkEditPractitionerId] = useState<number | undefined>(undefined);
@@ -540,9 +541,10 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
 
               {/* Conflict note */}
               {r.conflict_note && (
-                <div className="p-2 bg-red-50 rounded border border-red-200">
-                  <span className="text-xs text-red-600 font-medium">⚠ 競合情報</span>
-                  <p className="text-sm text-red-700">{r.conflict_note}</p>
+                <div className="p-3 bg-red-50 rounded-lg border-2 border-red-400">
+                  <span className="text-sm text-red-600 font-bold">⚠️ ダブルブッキング警告</span>
+                  <p className="text-sm text-red-700 mt-1">{r.conflict_note}</p>
+                  <p className="text-xs text-red-500 mt-1">予約時間を確認してください。</p>
                 </div>
               )}
 
@@ -594,6 +596,12 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
                     className="flex items-center gap-1 px-3 py-1.5 bg-red-500 text-white text-sm rounded hover:bg-red-600"
                   >
                     <XCircle size={14} /> 却下する
+                  </button>
+                  <button
+                    onClick={() => handleConfirmedAction('本当にキャンセル申請しますか？', () => cancelRequest(r.id), 'キャンセル申請しました')}
+                    className="flex items-center gap-1 px-3 py-1.5 bg-red-100 text-red-700 text-sm rounded hover:bg-red-200"
+                  >
+                    <XCircle size={14} /> キャンセル申請
                   </button>
                 </>
               )}
@@ -666,7 +674,7 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
 
       {/* Confirmation dialog */}
       {confirmDialog && (
-        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-[60]">
+        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-[70]">
           <div className="bg-white rounded-lg shadow-2xl p-6 max-w-xs mx-4">
             <p className="text-sm font-medium mb-4">{confirmDialog.message}</p>
             <div className="flex gap-2 justify-end">
@@ -689,7 +697,7 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
 
       {/* Success popup */}
       {successPopup && (
-        <div className="fixed inset-0 flex items-center justify-center z-[70] pointer-events-none">
+        <div className="fixed inset-0 flex items-center justify-center z-[75] pointer-events-none">
           <div className="bg-green-500 text-white px-6 py-3 rounded-lg shadow-2xl flex items-center gap-2 animate-bounce">
             <CheckCircle size={20} />
             <span className="font-medium">{successPopup}</span>
@@ -801,23 +809,53 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
 
               <div className="flex gap-2 pt-2">
                 <button
-                  onClick={() => handleConfirmedAction(
-                    `この予約以降の${seriesPosition ? seriesPosition.remainingAfter + 1 : '?'}件に変更を適用しますか？`,
-                    handleBulkEdit,
-                    '一括編集しました'
-                  )}
+                  onClick={() => {
+                    setActionError(null);
+                    // Validate payload before showing confirm
+                    const hasChange = bulkEditPractitionerId !== undefined || bulkEditMenuId !== undefined ||
+                      bulkEditColorId !== undefined || bulkEditStartTime !== undefined ||
+                      bulkEditDuration !== undefined || bulkEditNotes !== undefined;
+                    if (!hasChange) {
+                      setActionError('変更内容を指定してください');
+                      return;
+                    }
+                    setBulkEditConfirm(true);
+                  }}
                   disabled={bulkEditSaving}
                   className="flex items-center gap-1 px-4 py-2 bg-blue-500 text-white text-sm rounded hover:bg-blue-600 disabled:opacity-50"
                 >
                   <CheckCircle size={14} /> {bulkEditSaving ? '更新中...' : '一括変更を実行'}
                 </button>
                 <button
-                  onClick={() => setShowSeriesBulkEdit(false)}
+                  onClick={() => { setShowSeriesBulkEdit(false); setBulkEditConfirm(false); }}
                   className="px-4 py-2 bg-gray-200 text-gray-700 text-sm rounded hover:bg-gray-300"
                 >
                   キャンセル
                 </button>
               </div>
+
+              {/* Inline confirmation for bulk edit */}
+              {bulkEditConfirm && (
+                <div className="mt-3 p-3 bg-blue-50 border border-blue-300 rounded-lg">
+                  <p className="text-sm font-medium text-gray-800 mb-3">
+                    この予約以降の{seriesPosition ? seriesPosition.remainingAfter + 1 : '?'}件に変更を適用しますか？
+                  </p>
+                  <div className="flex gap-2 justify-end">
+                    <button
+                      onClick={() => setBulkEditConfirm(false)}
+                      className="px-4 py-2 bg-gray-200 text-gray-700 text-sm rounded hover:bg-gray-300"
+                    >
+                      いいえ
+                    </button>
+                    <button
+                      onClick={() => { setBulkEditConfirm(false); handleBulkEdit(); }}
+                      className="px-4 py-2 bg-blue-500 text-white text-sm rounded hover:bg-blue-600"
+                    >
+                      はい
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
