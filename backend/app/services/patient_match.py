@@ -66,10 +66,7 @@ async def find_existing_patient(
     phone: str | None = None,
     line_id: str | None = None,
 ) -> Patient | None:
-    """名前+電話 → LINE ID → 名前のみ の優先度で既存患者を検索する。
-
-    電話番号だけでは家族共有のケースがあるため単独識別子にしない。
-    名前+電話の両方が一致した場合に同一人物と判定する。
+    """名前+電話 → 電話のみ(単一) → LINE ID → 名前のみ の優先度で既存患者を検索する。
 
     Returns: 見つかった Patient or None
     """
@@ -88,6 +85,40 @@ async def find_existing_patient(
             if _name_matches_patient(norm_name, p):
                 logger.info("患者マッチ(名前+電話): id=%d name=%s phone=%s", p.id, p.name, p.phone)
                 return p
+
+    # 1.5) 電話番号のみマッチ ─ 同一電話番号の患者が1人しかいなければ同一人物と判定
+    #    名前表記ゆれ・チャネル違いでも電話番号が同じなら高確率で本人
+    if norm_phone:
+        phone_candidates = [
+            p for p in all_patients
+            if p.phone and normalize_phone(p.phone) == norm_phone
+        ]
+        if len(phone_candidates) == 1:
+            logger.info(
+                "患者マッチ(電話のみ): id=%d name=%s phone=%s (入力名=%s)",
+                phone_candidates[0].id, phone_candidates[0].name,
+                phone_candidates[0].phone, name,
+            )
+            return phone_candidates[0]
+        if len(phone_candidates) > 1 and norm_name:
+            # 電話が同じ患者が複数 → 名前の部分一致でさらに絞る
+            for p in phone_candidates:
+                p_name = normalize_name(p.name)
+                p_combined = normalize_name(
+                    f"{p.last_name or ''}{p.first_name or ''}"
+                )
+                if (p_name and norm_name in p_name) or (p_combined and norm_name in p_combined):
+                    logger.info(
+                        "患者マッチ(電話+名前部分一致): id=%d name=%s phone=%s",
+                        p.id, p.name, p.phone,
+                    )
+                    return p
+                if (p_name and p_name in norm_name) or (p_combined and p_combined in norm_name):
+                    logger.info(
+                        "患者マッチ(電話+名前部分一致逆方向): id=%d name=%s phone=%s",
+                        p.id, p.name, p.phone,
+                    )
+                    return p
 
     # 2) LINE ID で検索
     if line_id:
