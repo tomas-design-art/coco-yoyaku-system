@@ -28,7 +28,7 @@ async def get_conflicting_reservations(
             Reservation.start_time < end_time,
             Reservation.end_time > start_time,
         )
-    ).options(selectinload(Reservation.patient))
+    ).options(selectinload(Reservation.patient), selectinload(Reservation.practitioner))
     if exclude_reservation_id:
         query = query.where(Reservation.id != exclude_reservation_id)
     result = await db.execute(query)

@@ -217,42 +217,99 @@ async def create_reservation(
                 detail += f"（{ut.reason}）"
             raise HTTPException(status_code=400, detail=detail)
 
-    # HotPepper予約は競合があっても登録する
-    is_hotpepper = data.channel == "HOTPEPPER"
+    # チャネル分類
+    # - オンライン系（HOTPEPPER/LINE/CHATBOT）: タイムラグで競合しうるため登録を許可し、赤帯で警告表示
+    # - 手入力系（PHONE/WALK_IN/その他）: 同一枠の重複予約は絶対に作成させない（409拒否）
+    ONLINE_CHANNELS = ("HOTPEPPER", "LINE", "CHATBOT")
+    is_online = (data.channel or "") in ONLINE_CHANNELS
 
-    if is_hotpepper:
-        status = "CONFIRMED"
-        conflicts = await check_conflict(
-            db, data.practitioner_id, data.start_time, data.end_time
-        )
-        conflict_note = None
-        if conflicts:
-            conflict_names = []
-            for c in conflicts:
-                name = c.patient.name if c.patient else "不明"
-                conflict_names.append(
-                    f"{name}({c.start_time.astimezone(JST).strftime('%H:%M')}-{c.end_time.astimezone(JST).strftime('%H:%M')})"
-                )
-            conflict_note = "競合: " + ", ".join(conflict_names)
-    else:
-        status = await determine_status(db, data)
-        conflict_note = None
-
-    # 同一患者ダブルブッキングチェック（全チャネル共通）
+    # 施術者競合の事前チェック
+    practitioner_conflicts = await check_conflict(
+        db, data.practitioner_id, data.start_time, data.end_time
+    )
+    # 同一患者ダブルブッキングチェック
     patient_conflicts = await check_patient_conflict(
         db, data.patient_id, data.start_time, data.end_time
     )
-    if patient_conflicts:
-        pc_names = []
-        for c in patient_conflicts:
-            prac_name = c.practitioner.name if c.practitioner else "不明"
-            pc_names.append(
-                f"{prac_name}({c.start_time.astimezone(JST).strftime('%H:%M')}-{c.end_time.astimezone(JST).strftime('%H:%M')})"
+
+    if not is_online and (practitioner_conflicts or patient_conflicts):
+        # 手入力予約では競合を決して許さない → 409で拒否
+        from app.services.schedule_service import find_transfer_candidates
+        conflict_list = [
+            {
+                "id": c.id,
+                "patient_name": c.patient.name if c.patient else None,
+                "practitioner_name": c.practitioner.name if getattr(c, "practitioner", None) else None,
+                "start_time": c.start_time.astimezone(JST).isoformat(),
+                "end_time": c.end_time.astimezone(JST).isoformat(),
+                "status": c.status,
+            }
+            for c in practitioner_conflicts
+        ]
+        patient_conflict_list = [
+            {
+                "id": c.id,
+                "patient_name": c.patient.name if c.patient else None,
+                "practitioner_name": c.practitioner.name if c.practitioner else None,
+                "start_time": c.start_time.astimezone(JST).isoformat(),
+                "end_time": c.end_time.astimezone(JST).isoformat(),
+                "status": c.status,
+            }
+            for c in patient_conflicts
+        ]
+        # 別施術者候補（同時間帯で空いている施術者）を検索してスライド提案
+        alternative_practitioners: list[dict] = []
+        try:
+            candidates = await find_transfer_candidates(
+                db,
+                data.practitioner_id,
+                data.start_time.astimezone(JST).date(),
+                data.start_time,
+                data.end_time,
             )
-        patient_conflict_msg = "患者ダブルブッキング: " + ", ".join(pc_names)
-        conflict_note = (conflict_note + " / " + patient_conflict_msg) if conflict_note else patient_conflict_msg
-        if status == "CONFIRMED":
-            status = "PENDING"
+            alternative_practitioners = [c for c in candidates if c.get("is_available")]
+        except Exception:
+            alternative_practitioners = []
+
+        if practitioner_conflicts and patient_conflicts:
+            msg = "同じ枠にすでに予約があり、かつ同一患者が同時間帯に別予約を持っています"
+        elif practitioner_conflicts:
+            msg = "この施術者の同じ時間帯にはすでに予約があります"
+        else:
+            msg = "この患者は同時間帯にすでに別の予約があります"
+
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "detail": msg,
+                "conflicting_reservations": conflict_list,
+                "patient_conflicts": patient_conflict_list,
+                "alternative_practitioners": alternative_practitioners,
+            },
+        )
+
+    # ここから下は is_online、または手入力で競合なしのケース
+    conflict_note: str | None = None
+    if is_online:
+        status = "CONFIRMED"
+        if practitioner_conflicts:
+            conflict_names = [
+                f"{(c.patient.name if c.patient else '不明')}"
+                f"({c.start_time.astimezone(JST).strftime('%H:%M')}-{c.end_time.astimezone(JST).strftime('%H:%M')})"
+                for c in practitioner_conflicts
+            ]
+            conflict_note = "競合: " + ", ".join(conflict_names)
+        if patient_conflicts:
+            pc_names = [
+                f"{(c.practitioner.name if c.practitioner else '不明')}"
+                f"({c.start_time.astimezone(JST).strftime('%H:%M')}-{c.end_time.astimezone(JST).strftime('%H:%M')})"
+                for c in patient_conflicts
+            ]
+            pc_msg = "患者ダブルブッキング: " + ", ".join(pc_names)
+            conflict_note = f"{conflict_note} / {pc_msg}" if conflict_note else pc_msg
+    else:
+        # 手入力で競合なし → 通常フロー
+        status = await determine_status(db, data)
 
     reservation = Reservation(
         patient_id=data.patient_id,
@@ -320,10 +377,11 @@ async def create_reservation(
             f"HotPepper側の {date_str} {time_str} を押さえてください",
             reservation.id,
         )
-    if conflict_note and is_hotpepper:
+    if conflict_note and is_online:
+        channel_label = {"HOTPEPPER": "HotPepper", "LINE": "LINE", "CHATBOT": "Web"}.get(data.channel or "", "オンライン")
         await create_notification(
             db, "conflict_detected",
-            f"HotPepper予約が競合しています: {conflict_note}",
+            f"{channel_label}予約が競合しています: {conflict_note}",
             reservation.id,
         )
     if patient_conflicts:
