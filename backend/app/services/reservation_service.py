@@ -220,7 +220,7 @@ async def create_reservation(
     # チャネル分類
     # - オンライン系（HOTPEPPER/LINE/CHATBOT）: タイムラグで競合しうるため登録を許可し、赤帯で警告表示
     # - 手入力系（PHONE/WALK_IN/その他）: 同一枠の重複予約は絶対に作成させない（409拒否）
-    ONLINE_CHANNELS = ("HOTPEPPER", "LINE", "CHATBOT")
+    ONLINE_CHANNELS = ("HOTPEPPER", "LINE", "CHATBOT", "WEB")
     is_online = (data.channel or "") in ONLINE_CHANNELS
 
     # 施術者競合の事前チェック

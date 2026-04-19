@@ -26,6 +26,7 @@ from app.services.slot_scorer import find_best_practitioner, score_candidates
 
 router = APIRouter(prefix="/api", tags=["web_reserve"])
 
+HOMEPAGE_DEFAULT_MENU_NAME = "ホームページ"
 
 # DB保存しないWebチャット用の一時セッション
 _WEB_CHAT_SESSIONS: dict[str, dict] = {}
@@ -33,11 +34,29 @@ _WEB_CHAT_TTL = timedelta(hours=2)
 
 
 class WebReserveRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200)
+    # 後方互換: 既存の `name` 単一フィールドでも受ける
+    name: Optional[str] = Field(default=None, max_length=400)
+
+    # 姓名分割入力（ホームページ予約フォームの基本形）
+    last_name: Optional[str] = Field(default=None, max_length=100)
+    first_name: Optional[str] = Field(default=None, max_length=100)
+    last_name_kana: Optional[str] = Field(default=None, max_length=100)
+    first_name_kana: Optional[str] = Field(default=None, max_length=100)
+
+    # フルネーム入力（外国人名など長い名前用・姓名分割しない）
+    full_name: Optional[str] = Field(default=None, max_length=400)
+
+    # HP側から送られる登録モード ("full" or "split")
+    # "full" → full_name フィールドを使用、"split" → last_name/first_name を使用
+    registration_mode: Optional[str] = Field(default=None, pattern="^(full|split)$")
+
     phone: str = Field(..., min_length=6, max_length=30)
-    menu_id: int
+    email: Optional[str] = Field(default=None, max_length=200)
+    menu_id: Optional[int] = None
+    channel: Optional[str] = Field(default=None, max_length=30)
     desired_datetime: str = Field(..., description="YYYY-MM-DDTHH:MM[:SS][+09:00]")
     duration: Optional[int] = Field(default=None, description="可変時間メニューの指定分")
+    notes: Optional[str] = Field(default=None, max_length=2000, description="備考欄（患者からの伝達事項）")
 
 
 class WebReserveSuccess(BaseModel):
@@ -103,9 +122,38 @@ def _build_duration_actions(min_minutes: int, max_minutes: int) -> list[dict]:
 
 @router.post("/web_reserve", response_model=WebReserveSuccess | WebReserveConflict)
 async def web_reserve(body: WebReserveRequest, db: AsyncSession = Depends(get_db)):
-    menu = (await db.execute(select(Menu).where(Menu.id == body.menu_id, Menu.is_active == True))).scalar_one_or_none()
+    # メニュー未指定時は「ホームページ」メニュー (ID:25) をデフォルトに
+    if body.menu_id:
+        menu = (await db.execute(select(Menu).where(Menu.id == body.menu_id, Menu.is_active == True))).scalar_one_or_none()
+    else:
+        menu = (await db.execute(
+            select(Menu).where(Menu.name == HOMEPAGE_DEFAULT_MENU_NAME, Menu.is_active == True)
+        )).scalar_one_or_none()
     if not menu:
         raise HTTPException(status_code=404, detail="メニューが見つかりません")
+
+    # 氏名バリデーション: full_name / (last_name+first_name) / name のいずれかが必須
+    # registration_mode が明示されていれば、それに基づいてフィールドを優先
+    reg_mode = (body.registration_mode or "").strip()
+
+    # registration_mode="full" のとき full_name を name として扱い、姓名分割を無効化
+    effective_full_name = body.full_name
+    effective_last_name = body.last_name
+    effective_first_name = body.first_name
+    if reg_mode == "full":
+        # full_name が入っていなくても name で代替
+        if not (effective_full_name or "").strip() and (body.name or "").strip():
+            effective_full_name = body.name
+        effective_last_name = None
+        effective_first_name = None
+    elif reg_mode == "split":
+        effective_full_name = None
+
+    has_split = bool((effective_last_name or "").strip()) and bool((effective_first_name or "").strip())
+    has_full = bool((effective_full_name or "").strip())
+    has_legacy = bool((body.name or "").strip())
+    if not (has_split or has_full or has_legacy):
+        raise HTTPException(status_code=400, detail="お名前を入力してください（姓名またはフルネーム）")
 
     try:
         desired_dt = datetime.fromisoformat(body.desired_datetime)
@@ -142,7 +190,27 @@ async def web_reserve(body: WebReserveRequest, db: AsyncSession = Depends(get_db
 
     # 患者を検索 or 作成（電話番号 → LINE ID → 名前 のフォールバックマッチ）
     from app.services.patient_match import find_or_create_patient
-    patient = await find_or_create_patient(db, name=body.name, phone=body.phone)
+    patient = await find_or_create_patient(
+        db,
+        name=body.name,
+        phone=body.phone,
+        last_name=effective_last_name,
+        first_name=effective_first_name,
+        last_name_kana=body.last_name_kana,
+        first_name_kana=body.first_name_kana,
+        full_name=effective_full_name,
+        email=body.email,
+    )
+
+    reservation_notes = "Web予約フォームから登録"
+    if body.notes and body.notes.strip():
+        reservation_notes += f" / 備考: {body.notes.strip()}"
+
+    # channel: HP側が指定してきたら尊重（"CHATBOT"等）、未指定時はデフォルト"CHATBOT"
+    ALLOWED_CHANNELS = {"CHATBOT", "WEB"}
+    channel = (body.channel or "").strip().upper() if body.channel else "CHATBOT"
+    if channel not in ALLOWED_CHANNELS:
+        channel = "CHATBOT"
 
     reservation = await create_reservation(
         db,
@@ -152,8 +220,8 @@ async def web_reserve(body: WebReserveRequest, db: AsyncSession = Depends(get_db
             menu_id=menu.id,
             start_time=start_dt,
             end_time=end_dt,
-            channel="CHATBOT",
-            notes="Web予約フォームから登録",
+            channel=channel,
+            notes=reservation_notes,
         ),
     )
     return WebReserveSuccess(status="success", reservation_id=reservation["id"])
@@ -164,8 +232,17 @@ async def web_chatbot_session(body: WebChatSessionRequest, db: AsyncSession = De
     session_id = body.session_id or uuid.uuid4().hex
     state = _touch_session(session_id)
 
-    if body.menu_id:
-        menu = (await db.execute(select(Menu).where(Menu.id == body.menu_id, Menu.is_active == True))).scalar_one_or_none()
+    # 明示指定があればそれを使い、なければ「ホームページ」メニューを自動プリセット
+    target_menu_id = body.menu_id
+    if not target_menu_id:
+        hp_menu = (await db.execute(
+            select(Menu).where(Menu.name == HOMEPAGE_DEFAULT_MENU_NAME, Menu.is_active == True)
+        )).scalar_one_or_none()
+        if hp_menu:
+            target_menu_id = hp_menu.id
+
+    if target_menu_id:
+        menu = (await db.execute(select(Menu).where(Menu.id == target_menu_id, Menu.is_active == True))).scalar_one_or_none()
         if menu:
             duration = int(body.duration or menu.duration_minutes)
             if menu.is_duration_variable and not _is_valid_duration_for_menu(menu, duration):
@@ -173,7 +250,7 @@ async def web_chatbot_session(body: WebChatSessionRequest, db: AsyncSession = De
             state["draft"].update({"menu_id": menu.id, "menu_name": menu.name, "duration_minutes": duration})
             state["current_step"] = "waiting_datetime"
             state["messages"] = [
-                {"role": "assistant", "content": f"{menu.name}ですね。ご希望日時を教えてください。"}
+                {"role": "assistant", "content": "こんにちは！ご希望の日時を教えてください（例: 4/25 15:00）"}
             ]
 
     return {"session_id": session_id, "messages": state["messages"], "status": "active"}

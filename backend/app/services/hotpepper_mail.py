@@ -35,6 +35,7 @@ MAX_PROCESSED_HASHES = 1000
 MAX_FAILED_TRACKED = 2000
 DEAD_LETTER_RETRY_LIMIT = 3
 HOTPEPPER_FIXED_COLOR_CODE = "#f2740d"
+HOTPEPPER_MENU_NAME = "ホットペッパー"
 
 
 @dataclass
@@ -432,6 +433,12 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
             "reservation_number": parsed["reservation_number"],
         }
 
+    # ── メニュー解決 & 施術時間スナップ ──
+    hp_menu_id, snapped_duration = await _resolve_hotpepper_menu(db, parsed["duration_minutes"])
+    if snapped_duration != parsed["duration_minutes"]:
+        parsed["end_time"] = parsed["start_time"] + timedelta(minutes=snapped_duration)
+        parsed["duration_minutes"] = snapped_duration
+
     menu_note = f"HPメニュー名: {parsed['menu_name']}" if parsed.get("menu_name") else None
     practitioner_id, prac_note = await _assign_practitioner(
         db,
@@ -445,7 +452,7 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
     reservation = Reservation(
         patient_id=patient.id,
         practitioner_id=practitioner_id,
-        menu_id=None,
+        menu_id=hp_menu_id,
         color_id=hotpepper_color_id,
         start_time=parsed["start_time"],
         end_time=parsed["end_time"],
@@ -542,9 +549,16 @@ async def _handle_changed(db: AsyncSession, parsed: dict) -> dict:
         return await _handle_created(db, parsed)
 
     # 変更内容を更新
+    # ── メニュー解決 & 施術時間スナップ ──
+    hp_menu_id, snapped_duration = await _resolve_hotpepper_menu(db, parsed["duration_minutes"])
+    if snapped_duration != parsed["duration_minutes"]:
+        parsed["end_time"] = parsed["start_time"] + timedelta(minutes=snapped_duration)
+        parsed["duration_minutes"] = snapped_duration
+
     reservation.start_time = parsed["start_time"]
     reservation.end_time = parsed["end_time"]
     reservation.color_id = await _resolve_hotpepper_color_id(db)
+    reservation.menu_id = hp_menu_id
 
     menu_note = f"HPメニュー名: {parsed['menu_name']}" if parsed.get("menu_name") else None
 
@@ -680,6 +694,40 @@ async def _resolve_hotpepper_color_id(db: AsyncSession) -> Optional[int]:
         return color.id
     logger.warning("HotPepper固定色が見つかりません: %s", HOTPEPPER_FIXED_COLOR_CODE)
     return None
+
+
+async def _resolve_hotpepper_menu(
+    db: AsyncSession, duration_minutes: int
+) -> tuple[Optional[int], int]:
+    """HotPepper専用メニュー（"ホットペッパー"）を検索し、price_tier から最適な施術時間を返す。
+
+    Returns:
+        (menu_id or None, snapped_duration_minutes)
+        メニューが見つからない場合は (None, 元の duration_minutes) をそのまま返す。
+    """
+    from sqlalchemy.orm import selectinload
+
+    result = await db.execute(
+        select(Menu)
+        .options(selectinload(Menu.price_tiers))
+        .where(Menu.name == HOTPEPPER_MENU_NAME, Menu.is_active == True)
+    )
+    menu = result.unique().scalar_one_or_none()
+    if not menu:
+        logger.warning("HotPepper専用メニュー '%s' が見つかりません", HOTPEPPER_MENU_NAME)
+        return None, duration_minutes
+
+    # price_tiers がある場合、最も近い tier の duration にスナップ
+    if menu.price_tiers:
+        tier_durations = [t.duration_minutes for t in menu.price_tiers]
+        best = min(tier_durations, key=lambda d: abs(d - duration_minutes))
+        logger.info(
+            "HotPepperメニュー duration snap: %d分 → %d分 (tiers=%s)",
+            duration_minutes, best, tier_durations,
+        )
+        return menu.id, best
+
+    return menu.id, duration_minutes
 
 
 async def _match_menu(db: AsyncSession, menu_name: Optional[str]) -> tuple[Optional[int], Optional[int], Optional[str]]:

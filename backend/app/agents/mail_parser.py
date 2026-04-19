@@ -202,14 +202,60 @@ def _parse_visit_datetime(section_val: str, raw: str) -> Optional[datetime]:
     return None
 
 
+def _parse_coupon_duration(raw: str) -> Optional[int]:
+    """クーポンセクションから施術時間（分）を抽出する。
+
+    例: 「【土日祝限定】深層筋整体 90分12000円→8500円」→ 90
+    """
+    m = re.search(r'クーポン.*?(\d+)\s*分', raw, re.DOTALL)
+    if m:
+        val = int(m.group(1))
+        if 20 <= val <= 180:
+            return val
+    return None
+
+
 def _parse_duration(raw: str) -> tuple[int, bool]:
-    """所要時間をメール全文から抽出。見つからない場合はデフォルト60分。"""
-    m = re.search(r'所要時間[^\d]*?(\d+)\s*時間', raw)
+    """所要時間をメール全文から抽出。見つからない場合はデフォルト60分。
+
+    1. 「所要時間目安」から時間を読み取る
+    2. クーポン名にも分数があればダブルチェック
+       - クーポン側のほうが大きい場合はクーポン側を採用
+         （所要時間目安が端数切捨てされるケースへの対策）
+    3. どちらも見つからなければデフォルト60分
+    """
+    duration: Optional[int] = None
+
+    # パターン1: X時間Y分
+    m = re.search(r'所要時間[^\d]*?(\d+)\s*時間\s*(\d+)\s*分', raw)
     if m:
-        return int(m.group(1)) * 60, True
-    m = re.search(r'所要時間[^\d]*?(\d+)\s*分', raw)
-    if m:
-        return int(m.group(1)), True
+        duration = int(m.group(1)) * 60 + int(m.group(2))
+    # パターン2: X時間（分なし）
+    if duration is None:
+        m = re.search(r'所要時間[^\d]*?(\d+)\s*時間', raw)
+        if m:
+            duration = int(m.group(1)) * 60
+    # パターン3: X分（時間なし）
+    if duration is None:
+        m = re.search(r'所要時間[^\d]*?(\d+)\s*分', raw)
+        if m:
+            duration = int(m.group(1))
+
+    # ── クーポン側のダブルチェック ──
+    coupon_dur = _parse_coupon_duration(raw)
+
+    if duration is not None and coupon_dur is not None:
+        # クーポン側が大きい場合はクーポンを優先（目安が丸められているケース）
+        if coupon_dur > duration:
+            return coupon_dur, True
+        return duration, True
+
+    if duration is not None:
+        return duration, True
+
+    if coupon_dur is not None:
+        return coupon_dur, True
+
     return 60, False  # デフォルト
 
 

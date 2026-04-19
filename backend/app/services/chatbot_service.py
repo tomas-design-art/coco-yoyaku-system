@@ -244,6 +244,7 @@ async def tool_create_reservation(
         patient_id=patient.id,
         practitioner_id=chosen_practitioner.id,
         menu_id=menu_id,
+        color_id=menu.color_id,
         start_time=start_dt,
         end_time=end_dt,
         status="CONFIRMED",

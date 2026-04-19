@@ -174,16 +174,30 @@ async def find_or_create_patient(
     line_id: str | None = None,
     reading: str | None = None,
     auto_number: bool = True,
+    last_name: str | None = None,
+    first_name: str | None = None,
+    last_name_kana: str | None = None,
+    first_name_kana: str | None = None,
+    full_name: str | None = None,
+    email: str | None = None,
+    notes: str | None = None,
 ) -> Patient:
     """既存患者を検索し、なければ新規作成。見つかった場合は不足フィールドを補完する。"""
 
-    patient = await find_existing_patient(db, name=name, phone=phone, line_id=line_id)
+    # 検索用の name を合成（full_name または 姓+名 または name）
+    search_name = (
+        full_name
+        or (f"{last_name or ''} {first_name or ''}".strip() if (last_name or first_name) else None)
+        or name
+    )
+
+    patient = await find_existing_patient(db, name=search_name, phone=phone, line_id=line_id)
 
     if patient:
         # 既存患者の不足フィールドを補完
         updated = False
-        if name and patient.name in {None, "", "不明", "LINE患者"}:
-            patient.name = name
+        if search_name and patient.name in {None, "", "不明", "LINE患者"}:
+            patient.name = search_name
             updated = True
         if phone and not patient.phone:
             patient.phone = normalize_phone(phone)
@@ -193,6 +207,21 @@ async def find_or_create_patient(
             updated = True
         if reading and not patient.reading:
             patient.reading = reading
+            updated = True
+        if last_name and not patient.last_name:
+            patient.last_name = last_name.strip()
+            updated = True
+        if first_name and not patient.first_name:
+            patient.first_name = first_name.strip()
+            updated = True
+        if last_name_kana and not patient.last_name_kana:
+            patient.last_name_kana = last_name_kana.strip()
+            updated = True
+        if first_name_kana and not patient.first_name_kana:
+            patient.first_name_kana = first_name_kana.strip()
+            updated = True
+        if email and not patient.email:
+            patient.email = email.strip()
             updated = True
         if not patient.patient_number and auto_number:
             patient.patient_number = await _generate_patient_number(db)
@@ -204,11 +233,18 @@ async def find_or_create_patient(
     # 新規作成
     return await create_new_patient(
         db,
-        name=name,
+        name=search_name,
         phone=phone,
         line_id=line_id,
         reading=reading,
         auto_number=auto_number,
+        last_name=last_name,
+        first_name=first_name,
+        last_name_kana=last_name_kana,
+        first_name_kana=first_name_kana,
+        full_name=full_name,
+        email=email,
+        notes=notes,
     )
 
 
@@ -220,25 +256,67 @@ async def create_new_patient(
     line_id: str | None = None,
     reading: str | None = None,
     auto_number: bool = True,
+    last_name: str | None = None,
+    first_name: str | None = None,
+    last_name_kana: str | None = None,
+    first_name_kana: str | None = None,
+    full_name: str | None = None,
+    email: str | None = None,
+    notes: str | None = None,
 ) -> Patient:
-    """既存照合せずに患者を新規作成する。"""
+    """既存照合せずに患者を新規作成する。
+
+    姓名分割入力 (last_name/first_name) が指定されていればそれを優先。
+    full_name が指定されていれば full_name モードで登録（外国人名・長い名前用）。
+    name だけの場合は従来通り区切りで分割試行する。
+    """
     norm_phone = normalize_phone(phone)
     patient_number = await _generate_patient_number(db) if auto_number else None
 
-    last_name, first_name = split_name_if_delimited(name)
-    registration_mode = "split" if (last_name and first_name) else "full_name"
+    # ── 名前フィールドの解決 ──
+    if full_name and full_name.strip():
+        # フルネームモード（外国人名など）: 分割せず name のみ保持
+        resolved_name = full_name.strip()
+        resolved_last = None
+        resolved_first = None
+        registration_mode = "full_name"
+    elif last_name or first_name:
+        # 姓名分割モード
+        resolved_last = (last_name or "").strip() or None
+        resolved_first = (first_name or "").strip() or None
+        resolved_name = " ".join(filter(None, [resolved_last, resolved_first])) or (name or "不明")
+        registration_mode = "split"
+    else:
+        # name 文字列のみ: 既存動作
+        resolved_last, resolved_first = split_name_if_delimited(name)
+        resolved_name = name or "不明"
+        registration_mode = "split" if (resolved_last and resolved_first) else "full_name"
+
+    # ── フリガナの解決 ──
+    resolved_last_kana = (last_name_kana or "").strip() or None
+    resolved_first_kana = (first_name_kana or "").strip() or None
+    resolved_reading = reading
+    if not resolved_reading and (resolved_last_kana or resolved_first_kana):
+        resolved_reading = "".join(filter(None, [resolved_last_kana, resolved_first_kana]))
 
     patient = Patient(
-        name=name or "不明",
-        last_name=last_name,
-        first_name=first_name,
-        reading=reading,
+        name=resolved_name,
+        last_name=resolved_last,
+        first_name=resolved_first,
+        last_name_kana=resolved_last_kana,
+        first_name_kana=resolved_first_kana,
+        reading=resolved_reading,
         phone=norm_phone,
+        email=(email.strip() if email else None) or None,
         line_id=line_id,
+        notes=(notes.strip() if notes else None) or None,
         patient_number=patient_number,
         registration_mode=registration_mode,
     )
     db.add(patient)
     await db.flush()
-    logger.info("患者新規作成: id=%d name=%s phone=%s line_id=%s", patient.id, patient.name, norm_phone, line_id)
+    logger.info(
+        "患者新規作成: id=%d name=%s mode=%s phone=%s line_id=%s",
+        patient.id, patient.name, registration_mode, norm_phone, line_id,
+    )
     return patient

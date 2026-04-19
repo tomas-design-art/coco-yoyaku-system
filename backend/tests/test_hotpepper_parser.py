@@ -582,5 +582,120 @@ class TestPatientNameReading:
             assert result["patient_reading"] is None, f"Failed for {result['patient_name']}"
 
 
+# ===========================================================================
+# 所要時間パース — 複合パターン（X時間Y分）
+# ===========================================================================
+
+class TestDurationCompound:
+    """_parse_duration の複合パターンテスト"""
+
+    def test_1hour_30min(self):
+        """1時間30分 → 90分"""
+        body = (
+            "差出人: SALON BOARD <yoyaku_system@salonboard.com>\n"
+            "件名: 予約連絡\n\n"
+            "coco整骨院様\nご予約が入りました。\n"
+            "◇ご予約内容\n"
+            "■予約番号\n　BE99999999\n"
+            "■氏名\n　テスト花子\n"
+            "■来店日時\n　2026年05月01日（金）14:00\n"
+            "■メニュー\n　ボディケア＋ヘッド＋整体＋接骨・整骨\n"
+            "　（所要時間目安：1時間30分）\n"
+            "■ご利用クーポン\n"
+            "　【土日祝限定　人気No.2】深層筋整体　30％off 90分12000円→8500円\n"
+        )
+        result = parse_hotpepper_mail(body)
+        assert result["duration_minutes"] == 90
+        assert result["duration_extracted"] is True
+
+    def test_2hours(self):
+        """2時間 → 120分"""
+        body = (
+            "差出人: SALON BOARD <yoyaku_system@salonboard.com>\n"
+            "件名: 予約連絡\n\n"
+            "coco整骨院様\nご予約が入りました。\n"
+            "◇ご予約内容\n"
+            "■予約番号\n　BE88888888\n"
+            "■氏名\n　テスト次郎\n"
+            "■来店日時\n　2026年05月02日（土）10:00\n"
+            "■メニュー\n　フルコース\n"
+            "　（所要時間目安：2時間）\n"
+        )
+        result = parse_hotpepper_mail(body)
+        assert result["duration_minutes"] == 120
+        assert result["duration_extracted"] is True
+
+    def test_45min_only(self):
+        """45分 → 45分"""
+        body = (
+            "差出人: SALON BOARD <yoyaku_system@salonboard.com>\n"
+            "件名: 予約連絡\n\n"
+            "coco整骨院様\nご予約が入りました。\n"
+            "◇ご予約内容\n"
+            "■予約番号\n　BE77777777\n"
+            "■氏名\n　テスト三郎\n"
+            "■来店日時\n　2026年05月03日（日）16:00\n"
+            "■メニュー\n　お試しコース\n"
+            "　（所要時間目安：45分）\n"
+        )
+        result = parse_hotpepper_mail(body)
+        assert result["duration_minutes"] == 45
+        assert result["duration_extracted"] is True
+
+    def test_coupon_fallback_duration(self):
+        """所要時間なし + クーポンに90分 → 90分"""
+        body = (
+            "差出人: SALON BOARD <yoyaku_system@salonboard.com>\n"
+            "件名: 予約連絡\n\n"
+            "coco整骨院様\nご予約が入りました。\n"
+            "◇ご予約内容\n"
+            "■予約番号\n　BE66666666\n"
+            "■氏名\n　テスト四郎\n"
+            "■来店日時\n　2026年05月04日（月）11:00\n"
+            "■メニュー\n　ボディケア\n"
+            "■ご利用クーポン\n"
+            "　【全員】深層筋整体90分8500円\n"
+        )
+        result = parse_hotpepper_mail(body)
+        assert result["duration_minutes"] == 90
+        assert result["duration_extracted"] is True
+
+    def test_coupon_crosscheck_overrides_shorter_estimate(self):
+        """所要時間目安1時間 + クーポン90分 → クーポン側の90分を採用"""
+        body = (
+            "差出人: SALON BOARD <yoyaku_system@salonboard.com>\n"
+            "件名: 予約連絡\n\n"
+            "coco整骨院様\nご予約が入りました。\n"
+            "◇ご予約内容\n"
+            "■予約番号\n　BE55555555\n"
+            "■氏名\n　テスト五郎\n"
+            "■来店日時\n　2026年05月05日（火）13:00\n"
+            "■メニュー\n　ボディケア＋ヘッド＋整体＋接骨・整骨\n"
+            "　（所要時間目安：1時間）\n"
+            "■ご利用クーポン\n"
+            "　【土日祝限定　人気No.2】深層筋整体　30％off 90分12000円→8500円\n"
+        )
+        result = parse_hotpepper_mail(body)
+        assert result["duration_minutes"] == 90
+
+    def test_coupon_crosscheck_keeps_longer_estimate(self):
+        """所要時間目安2時間 + クーポン60分 → 目安側の120分を維持"""
+        body = (
+            "差出人: SALON BOARD <yoyaku_system@salonboard.com>\n"
+            "件名: 予約連絡\n\n"
+            "coco整骨院様\nご予約が入りました。\n"
+            "◇ご予約内容\n"
+            "■予約番号\n　BE44444444\n"
+            "■氏名\n　テスト六郎\n"
+            "■来店日時\n　2026年05月06日（水）15:00\n"
+            "■メニュー\n　フルコース\n"
+            "　（所要時間目安：2時間）\n"
+            "■ご利用クーポン\n"
+            "　【全員】お試し60分5000円\n"
+        )
+        result = parse_hotpepper_mail(body)
+        assert result["duration_minutes"] == 120
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
