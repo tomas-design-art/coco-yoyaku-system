@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.api.auth import require_admin, require_staff  # transfer still needs admin
+from app.api.auth import require_admin  # transfer still needs admin
 from app.models.practitioner_schedule import PractitionerSchedule, ScheduleOverride
 from app.models.practitioner import Practitioner
 from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
@@ -60,9 +60,8 @@ async def update_default_schedules(
     practitioner_id: int,
     data: PractitionerScheduleBulkUpdate,
     db: AsyncSession = Depends(get_db),
-    _auth: dict = Depends(require_staff),
 ):
-    """施術者の曜日別デフォルトスケジュールを一括更新"""
+    """施術者の曜日別デフォルトスケジュールを一括更新（スタッフ共通・権限不要）"""
     # 既存を削除して再作成
     await db.execute(
         delete(PractitionerSchedule).where(
@@ -117,9 +116,8 @@ async def list_overrides(
 async def create_override(
     data: ScheduleOverrideCreate,
     db: AsyncSession = Depends(get_db),
-    _auth: dict = Depends(require_staff),
 ):
-    """臨時休み/出勤を登録"""
+    """臨時休み/出勤を登録（スタッフ共通・権限不要）"""
     # 同一施術者・同日のオーバーライドがあれば更新
     result = await db.execute(
         select(ScheduleOverride).where(
@@ -153,9 +151,8 @@ async def create_override(
 async def delete_override(
     override_id: int,
     db: AsyncSession = Depends(get_db),
-    _auth: dict = Depends(require_staff),
 ):
-    """臨時休み/出勤を削除"""
+    """臨時休み/出勤を削除（スタッフ共通・権限不要）"""
     result = await db.execute(
         select(ScheduleOverride).where(ScheduleOverride.id == override_id)
     )
@@ -329,9 +326,8 @@ async def list_unavailable_times(
 async def create_unavailable_time(
     data: UnavailableTimeCreate,
     db: AsyncSession = Depends(get_db),
-    _auth: dict = Depends(require_staff),
 ):
-    """時間帯休みを登録"""
+    """時間帯休みを登録（スタッフ共通・権限不要）"""
     ut = PractitionerUnavailableTime(
         practitioner_id=data.practitioner_id,
         date=data.date,
@@ -349,9 +345,8 @@ async def create_unavailable_time(
 async def delete_unavailable_time(
     ut_id: int,
     db: AsyncSession = Depends(get_db),
-    _auth: dict = Depends(require_staff),
 ):
-    """時間帯休みを削除"""
+    """時間帯休みを削除（スタッフ共通・権限不要）"""
     result = await db.execute(
         select(PractitionerUnavailableTime).where(PractitionerUnavailableTime.id == ut_id)
     )
