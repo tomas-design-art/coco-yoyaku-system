@@ -16,6 +16,7 @@ from app.services.schedule_service import (
     get_practitioner_working_hours,
     is_practitioner_working,
 )
+from app.services.slot_scorer import find_best_practitioner
 from app.utils.datetime_jst import JST
 
 router = APIRouter(prefix="/api/public", tags=["public"])
@@ -243,7 +244,15 @@ async def get_public_available_slots(
     cur = bh_start_min
     while cur + dur <= bh_end_min:
         if cur >= min_start_min and _slot_available(cur, cur + dur):
-            slots.append(f"{cur // 60:02d}:{cur % 60:02d}")
+            slot_time = time(cur // 60, cur % 60)
+            practitioner, _, _, _, _ = await find_best_practitioner(
+                db,
+                parsed_date,
+                slot_time,
+                dur,
+            )
+            if practitioner is not None:
+                slots.append(f"{cur // 60:02d}:{cur % 60:02d}")
         cur += interval
 
     return PublicSlotResponse(date=parsed_date.isoformat(), is_open=True, slots=slots)

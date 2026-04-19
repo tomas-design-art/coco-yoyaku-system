@@ -409,32 +409,26 @@ async def find_best_practitioner(
     day_infos = await _load_day_infos(db, target_date, practitioners)
     max_load = max((di.load for di in day_infos if di.is_working), default=0)
 
-    best_prac: Practitioner | None = None
-    best_score = float("-inf")
-    best_gap_before = 0
-    best_gap_after = 0
+    ranked_candidates: list[tuple[float, Practitioner, int, int]] = []
 
     for info in day_infos:
         if not _is_slot_available(info, slot_start, slot_end):
             continue
         gb, ga = _calc_gaps(info, slot_start, slot_end, bh_start, bh_end)
         sc = _score(slot_start, slot_start, 0, gb, ga, info.load, max_load)
-        if sc > best_score:
-            best_score = sc
-            best_prac = info.practitioner
-            best_gap_before = gb
-            best_gap_after = ga
+        ranked_candidates.append((sc, info.practitioner, gb, ga))
+
+    ranked_candidates.sort(key=lambda item: item[0], reverse=True)
 
     # ── DB直接問合せによる最終安全チェック ──
-    if best_prac:
-        conflicts = await check_conflict(db, best_prac.id, start_dt, end_dt)
+    for _, candidate_prac, gap_before, gap_after in ranked_candidates:
+        conflicts = await check_conflict(db, candidate_prac.id, start_dt, end_dt)
         if conflicts:
             logger.warning(
                 "slot_scorer safety net caught conflict! prac=%s slot=%s-%s conflicts=%d",
-                best_prac.id, start_dt, end_dt, len(conflicts),
+                candidate_prac.id, start_dt, end_dt, len(conflicts),
             )
-            best_prac = None
-            best_gap_before = 0
-            best_gap_after = 0
+            continue
+        return candidate_prac, start_dt, end_dt, gap_before, gap_after
 
-    return best_prac, start_dt, end_dt, best_gap_before, best_gap_after
+    return None, start_dt, end_dt, 0, 0
