@@ -220,6 +220,93 @@ class TestPatientNumberFormat(unittest.TestCase):
         num = f"P{100:06d}"
         assert num == "P000100"
 
+
+class TestPatientMatchFindOrCreate(unittest.TestCase):
+    """patient_match の回帰テスト"""
+
+    def _make_db(self):
+        import asyncio
+        from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from app.database import Base
+        import app.models.patient  # noqa: F401
+        import app.models.practitioner  # noqa: F401
+        import app.models.menu  # noqa: F401
+        import app.models.reservation_color  # noqa: F401
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        Session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+        async def setup():
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            return Session
+
+        loop = asyncio.new_event_loop()
+        SessionLocal = loop.run_until_complete(setup())
+        return loop, SessionLocal, engine
+
+    def test_find_or_create_reuses_existing_patient_for_same_name_and_phone(self):
+        from app.services.patient_match import find_or_create_patient
+
+        loop, Session, engine = self._make_db()
+
+        async def _run():
+            async with Session() as db:
+                first = await find_or_create_patient(
+                    db,
+                    name="tokita makoto",
+                    phone="0120117117",
+                    auto_number=False,
+                )
+                await db.commit()
+
+            async with Session() as db:
+                second = await find_or_create_patient(
+                    db,
+                    name="tokita makoto",
+                    phone="0120117117",
+                    auto_number=False,
+                )
+                await db.commit()
+                return first.id, second.id
+
+        first_id, second_id = loop.run_until_complete(_run())
+        assert first_id == second_id
+
+        loop.run_until_complete(engine.dispose())
+
+    def test_find_or_create_reuses_existing_patient_for_single_phone_candidate(self):
+        from app.services.patient_match import find_or_create_patient
+
+        loop, Session, engine = self._make_db()
+
+        async def _run():
+            async with Session() as db:
+                first = await find_or_create_patient(
+                    db,
+                    name="tokita makoto",
+                    phone="0120-117-117",
+                    auto_number=False,
+                )
+                await db.commit()
+
+            async with Session() as db:
+                second = await find_or_create_patient(
+                    db,
+                    name="tokita  makoto",
+                    phone="0120117117",
+                    auto_number=False,
+                )
+                await db.commit()
+                return first.id, second.id
+
+        first_id, second_id = loop.run_until_complete(_run())
+        assert first_id == second_id
+
+        loop.run_until_complete(engine.dispose())
+
     def test_format_sequential(self):
         nums = [f"P{i:06d}" for i in range(1, 4)]
         assert nums == ["P000001", "P000002", "P000003"]

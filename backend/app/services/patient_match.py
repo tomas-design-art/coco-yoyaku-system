@@ -10,6 +10,35 @@ from app.models.patient import Patient
 logger = logging.getLogger(__name__)
 
 
+async def _acquire_patient_match_lock(
+    db: AsyncSession,
+    *,
+    name: str | None,
+    phone: str | None,
+    line_id: str | None,
+) -> None:
+    """同一患者候補の並行find-or-createを直列化する。
+
+    本番PostgreSQLでは advisory transaction lock を使い、
+    同じキーの同時POSTで重複患者が作られる競合を防ぐ。
+    SQLite等のテストDBでは何もしない。
+    """
+    bind = db.get_bind()
+    dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
+    if dialect_name != "postgresql":
+        return
+
+    lock_name = "|".join([
+        normalize_phone(phone) or "",
+        normalize_name(name),
+        (line_id or "").strip(),
+    ])
+    if not lock_name.strip("|"):
+        return
+
+    await db.execute(select(func.pg_advisory_xact_lock(func.hashtext(lock_name))))
+
+
 def normalize_phone(v: str | None) -> str | None:
     """電話番号の正規化: ハイフン除去、全角→半角、+81→0 変換"""
     if not v:
@@ -220,6 +249,13 @@ async def find_or_create_patient(
         full_name
         or (f"{last_name or ''} {first_name or ''}".strip() if (last_name or first_name) else None)
         or name
+    )
+
+    await _acquire_patient_match_lock(
+        db,
+        name=search_name,
+        phone=phone,
+        line_id=line_id,
     )
 
     patient = await find_existing_patient(db, name=search_name, phone=phone, line_id=line_id)
