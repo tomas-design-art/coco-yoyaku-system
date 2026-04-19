@@ -215,6 +215,12 @@ export const modifySeries = (seriesId: number, data: SeriesModifyRequest) =>
 export const cancelRemainingSeries = (seriesId: number) =>
   api.post(`/reservations/series/${seriesId}/cancel-remaining`);
 
+export const declineSeriesExtension = (seriesId: number) =>
+  api.post(`/reservations/series/${seriesId}/decline-extension`);
+
+export const dismissSeriesAlert = (seriesId: number) =>
+  api.post(`/reservations/series/${seriesId}/dismiss-alert`);
+
 export const cancelSeriesFrom = (seriesId: number, reservationId: number) =>
   api.post(`/reservations/series/${seriesId}/cancel-from/${reservationId}`);
 

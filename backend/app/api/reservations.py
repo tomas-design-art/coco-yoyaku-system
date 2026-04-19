@@ -378,6 +378,50 @@ async def get_series(series_id: int, db: AsyncSession = Depends(get_db)):
 
 
 
+@router.post("/series/{series_id}/decline-extension")
+async def decline_series_extension(
+    series_id: int, db: AsyncSession = Depends(get_db)
+):
+    """シリーズ延長アラートを『このまま終了』で確定する。
+
+    - 既存の未消化予約は触らず、シリーズ自体を非アクティブにする
+    - `pending-alerts` / `check_series_expiration` のフィルタはともに
+      `is_active == True` なので、以降アラートは再掲されない
+    """
+    result = await db.execute(
+        select(ReservationSeries).where(ReservationSeries.id == series_id)
+    )
+    series = result.scalar_one_or_none()
+    if not series:
+        raise HTTPException(status_code=404, detail="シリーズが見つかりません")
+
+    series.is_active = False
+    # 残予約は維持（自然消化させる）
+    await db.commit()
+    return {"series_id": series_id, "is_active": series.is_active}
+
+
+@router.post("/series/{series_id}/dismiss-alert")
+async def dismiss_series_alert(
+    series_id: int, db: AsyncSession = Depends(get_db)
+):
+    """アラートを一時的に閉じる（✕ボタン）。
+
+    notified_at を NULL に戻すことで pending-alerts から消える。
+    次回 9:00 のスケジューラで remaining_count ≤ 3 なら再通知される。
+    """
+    result = await db.execute(
+        select(ReservationSeries).where(ReservationSeries.id == series_id)
+    )
+    series = result.scalar_one_or_none()
+    if not series:
+        raise HTTPException(status_code=404, detail="シリーズが見つかりません")
+
+    series.notified_at = None
+    await db.commit()
+    return {"series_id": series_id, "dismissed": True}
+
+
 @router.post("/series/{series_id}/extend", response_model=BulkReservationResult)
 async def extend_series(
     series_id: int, body: SeriesExtendRequest, db: AsyncSession = Depends(get_db)

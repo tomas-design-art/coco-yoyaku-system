@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { X, RefreshCw, XCircle, Settings } from 'lucide-react';
-import { extendSeries, cancelRemainingSeries } from '../../api/client';
+import { extendSeries, cancelRemainingSeries, declineSeriesExtension, dismissSeriesAlert } from '../../api/client';
 import type { SeriesResponse } from '../../types';
 
 interface SeriesExtensionModalProps {
@@ -34,9 +34,21 @@ export default function SeriesExtensionModal({
         }
     };
 
-    const handleDecline = () => {
-        // そのまま閉じる（残りの予約は維持）
-        onClose();
+    const handleDecline = async () => {
+        // 「いいえ（そのまま）」= このシリーズは延長しない旨を確定。
+        // バックエンドで is_active=false にして、以降アラートが再掲されないようにする。
+        setLoading(true);
+        setError(null);
+        try {
+            await declineSeriesExtension(series.id);
+            onAction();
+            onClose();
+        } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : '確定に失敗しました';
+            setError(msg);
+        } finally {
+            setLoading(false);
+        }
     };
 
     const handleCancelAll = async () => {
@@ -54,6 +66,12 @@ export default function SeriesExtensionModal({
         }
     };
 
+    const handleDismiss = () => {
+        // ✕ボタン: notified_at を NULL に戻し、次回9:00スケジューラまで非表示にする
+        dismissSeriesAlert(series.id).catch(() => { /* best-effort */ });
+        onClose();
+    };
+
     return (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
             <div className="bg-white rounded-lg shadow-xl w-full max-w-md mx-4">
@@ -62,7 +80,7 @@ export default function SeriesExtensionModal({
                     <h3 className="font-bold text-gray-800">
                         繰り返し予約 — 残り{series.remaining_count}回
                     </h3>
-                    <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
+                    <button onClick={handleDismiss} className="text-gray-400 hover:text-gray-600" title="閉じる（翌朝9時に再表示）">
                         <X size={20} />
                     </button>
                 </div>
@@ -119,7 +137,8 @@ export default function SeriesExtensionModal({
                             {/* Option 2: Decline */}
                             <button
                                 onClick={handleDecline}
-                                className="w-full flex items-center gap-3 px-4 py-3 rounded-lg border-2 border-gray-200 bg-gray-50 hover:bg-gray-100 transition text-left"
+                                disabled={loading}
+                                className="w-full flex items-center gap-3 px-4 py-3 rounded-lg border-2 border-gray-200 bg-gray-50 hover:bg-gray-100 transition text-left disabled:opacity-50"
                             >
                                 <XCircle size={20} className="text-gray-500 shrink-0" />
                                 <div>
