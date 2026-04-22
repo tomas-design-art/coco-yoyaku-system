@@ -53,7 +53,13 @@ api.interceptors.request.use((config) => {
     config.headers.Authorization = `Bearer ${token}`;
   }
   if (operator) {
-    config.headers['X-Operator'] = operator;
+    // X-Operator は非ASCII（日本語）を含む可能性があるため URL エンコードして送る
+    // （XHR の setRequestHeader は ISO-8859-1 しか許可しない）
+    try {
+      config.headers['X-Operator'] = encodeURIComponent(operator);
+    } catch {
+      // 失敗しても致命的にしない
+    }
   }
   return config;
 });

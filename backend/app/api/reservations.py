@@ -50,10 +50,19 @@ router = APIRouter(prefix="/api/reservations", tags=["reservations"])
 def _operator_label(x_operator: Optional[str]) -> str:
     if not x_operator:
         return "unknown"
-    normalized = x_operator.strip()
-    if not normalized:
+    raw = x_operator.strip()
+    if not raw:
         return "unknown"
-    return normalized[:64]
+    # フロントは非ASCII（日本語）を含む可能性があるため URL エンコードして送ってくる。
+    # デコードに失敗しても元の文字列を使う。
+    try:
+        from urllib.parse import unquote
+        decoded = unquote(raw)
+        if decoded:
+            raw = decoded
+    except Exception:
+        pass
+    return raw[:64]
 
 
 async def _safe_log_action(
