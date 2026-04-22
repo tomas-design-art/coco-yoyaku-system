@@ -63,14 +63,12 @@ export function formatDate(date: Date): string {
 }
 
 export function getWeekDates(baseDate: Date): Date[] {
-  const day = baseDate.getDay();
-  const monday = new Date(baseDate);
-  monday.setDate(baseDate.getDate() - ((day + 6) % 7));
+  const start = new Date(baseDate);
 
   const dates: Date[] = [];
   for (let i = 0; i < 7; i++) {
-    const d = new Date(monday);
-    d.setDate(monday.getDate() + i);
+    const d = new Date(start);
+    d.setDate(start.getDate() + i);
     dates.push(d);
   }
   return dates;
