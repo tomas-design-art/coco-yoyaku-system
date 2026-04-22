@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
-import { Save, KeyRound, Lock, Upload, FileDown, Trash2, AlertTriangle } from 'lucide-react';
+import { Save, Lock, Upload, FileDown, Trash2, AlertTriangle } from 'lucide-react';
 import type { Setting } from '../../types';
-import { getSettings, updateSetting, changePin, changePassword, resetOperationalData, apiBaseURL } from '../../api/client';
+import { getSettings, updateSetting, changePassword, resetOperationalData, apiBaseURL } from '../../api/client';
 import { extractErrorMessage } from '../../utils/errorUtils';
 import PatientImport from '../PatientImport';
 
@@ -16,7 +16,7 @@ const SETTING_LABELS: Record<string, string> = {
 };
 
 // 認証系の設定キーは汎用リストから除外
-const AUTH_KEYS = ['staff_pin', 'admin_username', 'admin_password_hash'];
+const AUTH_KEYS = ['admin_username', 'admin_password_hash'];
 
 export default function SystemSettings() {
   const [settings, setSettings] = useState<Setting[]>([]);
@@ -32,7 +32,6 @@ export default function SystemSettings() {
   const [resetDone, setResetDone] = useState(false);
 
   // Auth settings
-  const [newPin, setNewPin] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [authSaving, setAuthSaving] = useState(false);
 
@@ -55,22 +54,6 @@ export default function SystemSettings() {
       setError(extractErrorMessage(err, '設定の保存に失敗しました'));
     } finally {
       setSaving(null);
-    }
-  };
-
-  const handleChangePin = async () => {
-    if (newPin.length !== 4) { setError('PINは4桁で入力してください'); return; }
-    setAuthSaving(true);
-    setError(null);
-    try {
-      await changePin(newPin);
-      setNewPin('');
-      setSuccess('スタッフPINを変更しました');
-      setTimeout(() => setSuccess(null), 3000);
-    } catch (err) {
-      setError(extractErrorMessage(err, 'PIN変更に失敗しました'));
-    } finally {
-      setAuthSaving(false);
     }
   };
 
@@ -127,27 +110,6 @@ export default function SystemSettings() {
           <Lock size={18} /> 認証設定
         </h2>
         <div className="space-y-4">
-          <div className="flex items-center gap-4">
-            <label className="w-48 text-sm font-medium text-gray-700 flex items-center gap-1">
-              <KeyRound size={14} /> スタッフPIN変更
-            </label>
-            <input
-              type="text"
-              inputMode="numeric"
-              maxLength={4}
-              value={newPin}
-              onChange={(e) => setNewPin(e.target.value.replace(/\D/g, ''))}
-              placeholder="新しい4桁PIN"
-              className="flex-1 border rounded px-3 py-2 text-sm"
-            />
-            <button
-              onClick={handleChangePin}
-              disabled={authSaving || newPin.length !== 4}
-              className="px-3 py-2 bg-blue-500 text-white text-sm rounded hover:bg-blue-600 disabled:opacity-50"
-            >
-              変更
-            </button>
-          </div>
           <div className="flex items-center gap-4">
             <label className="w-48 text-sm font-medium text-gray-700 flex items-center gap-1">
               <Lock size={14} /> 管理者パスワード変更

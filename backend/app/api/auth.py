@@ -69,10 +69,6 @@ class TokenResponse(BaseModel):
     role: str
 
 
-class ChangePinRequest(BaseModel):
-    new_pin: str = Field(..., min_length=4, max_length=4)
-
-
 class ChangePasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=4)
 
@@ -144,17 +140,6 @@ async def me(authorization: Optional[str] = Header(None)):
         return {"authenticated": True, "role": payload.get("role")}
     except HTTPException:
         return {"authenticated": False, "role": None}
-
-
-@router.put("/change-pin")
-async def change_pin(
-    body: ChangePinRequest,
-    db: AsyncSession = Depends(get_db),
-    _auth: dict = Depends(require_admin),
-):
-    await _set_setting(db, "staff_pin", body.new_pin)
-    await db.commit()
-    return {"status": "ok"}
 
 
 @router.put("/change-password")

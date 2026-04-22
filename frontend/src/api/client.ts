@@ -330,8 +330,6 @@ export const adminLogin = (username: string, password: string) =>
   api.post<{ token: string; role: string }>('/auth/admin-login', { username, password });
 export const authMe = () =>
   api.get<{ authenticated: boolean; role: string | null }>('/auth/me');
-export const changePin = (new_pin: string) =>
-  api.put('/auth/change-pin', { new_pin });
 export const changePassword = (new_password: string) =>
   api.put('/auth/change-password', { new_password });
 // legacy compat

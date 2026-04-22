@@ -96,7 +96,6 @@ def _staging_settings() -> list[tuple[str, str]]:
         ("holiday_mode", "closed"),
         ("holiday_start_time", "09:00"),
         ("holiday_end_time", "13:00"),
-        ("staff_pin", "1234"),
         ("admin_username", ADMIN_USERNAME),
         ("admin_password_hash", pwd_context.hash(ADMIN_PASSWORD)),
     ]
