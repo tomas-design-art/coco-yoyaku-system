@@ -31,6 +31,7 @@ import type {
   WebReserveRequest,
   WebReserveSuccess,
   WebReserveConflict,
+  AuditLog,
 } from '../types';
 
 // @ts-ignore
@@ -42,11 +43,17 @@ const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 });
 
+const OPERATOR_STORAGE_KEY = 'operator';
+
 // Auth interceptor
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('auth_token');
+  const operator = localStorage.getItem(OPERATOR_STORAGE_KEY)?.trim();
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
+  }
+  if (operator) {
+    config.headers['X-Operator'] = operator;
   }
   return config;
 });
@@ -322,6 +329,8 @@ export const deleteUnavailableTime = (id: number) =>
 export const getNotifications = () => api.get<Notification[]>('/notifications/');
 export const markNotificationRead = (id: number) =>
   api.put<Notification>(`/notifications/${id}/read`);
+export const getAuditLogs = (limit = 200) =>
+  api.get<AuditLog[]>('/audit-logs/', { params: { limit } });
 
 // ---- Auth ----
 export const staffLogin = (pin: string) =>

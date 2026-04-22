@@ -4,7 +4,7 @@ from typing import Optional
 import zoneinfo
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -38,12 +38,36 @@ from app.services.notification_service import create_notification
 from app.models.reservation_series import ReservationSeries
 from app.services.schedule_service import is_practitioner_working
 from app.services.business_hours import get_business_hours_for_date
+from app.services.audit_log_service import log_action
 from app.utils.datetime_jst import now_jst
 
 _JST = zoneinfo.ZoneInfo("Asia/Tokyo")
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/reservations", tags=["reservations"])
+
+
+def _operator_label(x_operator: Optional[str]) -> str:
+    if not x_operator:
+        return "unknown"
+    normalized = x_operator.strip()
+    if not normalized:
+        return "unknown"
+    return normalized[:64]
+
+
+async def _safe_log_action(
+    db: AsyncSession,
+    x_operator: Optional[str],
+    action: str,
+    target_id: int | None = None,
+    detail: dict | None = None,
+) -> None:
+    operator = _operator_label(x_operator)
+    try:
+        await log_action(db, operator=operator, action=action, target_id=target_id, detail=detail)
+    except Exception as e:
+        logger.warning("audit_log_write_failed operator=%s action=%s err=%s", operator, action, e)
 
 
 @router.get("/conflicts")
@@ -117,9 +141,18 @@ async def get_reservation(reservation_id: int, db: AsyncSession = Depends(get_db
 
 @router.post("/", status_code=201)
 async def create_reservation_endpoint(
-    data: ReservationCreate, db: AsyncSession = Depends(get_db)
+    data: ReservationCreate,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
-    return await create_reservation(db, data)
+    created = await create_reservation(db, data)
+    logger.info(
+        "operator=%s action=create_reservation reservation_id=%s",
+        _operator_label(x_operator),
+        created.get("id"),
+    )
+    await _safe_log_action(db, x_operator, "CREATE_RESERVATION", created.get("id"))
+    return created
 
 
 def _generate_dates(start_date: date, frequency: str, end_date: date | None, count: int | None) -> list[date]:
@@ -152,7 +185,9 @@ def _generate_dates(start_date: date, frequency: str, end_date: date | None, cou
 
 @router.post("/bulk", status_code=201)
 async def bulk_create_reservations(
-    data: BulkReservationCreate, db: AsyncSession = Depends(get_db)
+    data: BulkReservationCreate,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
     """繰り返し予約一括生成（シリーズ管理付き）"""
     if not data.end_date and not data.count:
@@ -257,12 +292,27 @@ async def bulk_create_reservations(
     series.remaining_count = created_count
     await db.commit()
 
-    return BulkReservationResult(
+    result_payload = BulkReservationResult(
         total_requested=len(dates),
         created_count=created_count,
         skipped=skipped,
         series_id=series.id,
     )
+    logger.info(
+        "operator=%s action=bulk_create_reservations series_id=%s created_count=%s skipped_count=%s",
+        _operator_label(x_operator),
+        series.id,
+        created_count,
+        len(skipped),
+    )
+    await _safe_log_action(
+        db,
+        x_operator,
+        "BULK_CREATE_RESERVATIONS",
+        series.id,
+        {"created_count": created_count, "skipped_count": len(skipped)},
+    )
+    return result_payload
 
 
 # ─── シリーズ管理エンドポイント ────────────────────────
@@ -380,7 +430,9 @@ async def get_series(series_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.post("/series/{series_id}/decline-extension")
 async def decline_series_extension(
-    series_id: int, db: AsyncSession = Depends(get_db)
+    series_id: int,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
     """シリーズ延長アラートを『このまま終了』で確定する。
 
@@ -398,12 +450,20 @@ async def decline_series_extension(
     series.is_active = False
     # 残予約は維持（自然消化させる）
     await db.commit()
+    logger.info(
+        "operator=%s action=decline_series_extension series_id=%s",
+        _operator_label(x_operator),
+        series_id,
+    )
+    await _safe_log_action(db, x_operator, "DECLINE_SERIES_EXTENSION", series_id)
     return {"series_id": series_id, "is_active": series.is_active}
 
 
 @router.post("/series/{series_id}/dismiss-alert")
 async def dismiss_series_alert(
-    series_id: int, db: AsyncSession = Depends(get_db)
+    series_id: int,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
     """アラートを一時的に閉じる（✕ボタン）。
 
@@ -419,12 +479,21 @@ async def dismiss_series_alert(
 
     series.notified_at = None
     await db.commit()
+    logger.info(
+        "operator=%s action=dismiss_series_alert series_id=%s",
+        _operator_label(x_operator),
+        series_id,
+    )
+    await _safe_log_action(db, x_operator, "DISMISS_SERIES_ALERT", series_id)
     return {"series_id": series_id, "dismissed": True}
 
 
 @router.post("/series/{series_id}/extend", response_model=BulkReservationResult)
 async def extend_series(
-    series_id: int, body: SeriesExtendRequest, db: AsyncSession = Depends(get_db)
+    series_id: int,
+    body: SeriesExtendRequest,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
     """シリーズ延長（同じ設定で追加予約を生成）"""
     result = await db.execute(
@@ -523,17 +592,35 @@ async def extend_series(
     series.notified_at = None  # 通知済みフラグをリセット
     await db.commit()
 
-    return BulkReservationResult(
+    result_payload = BulkReservationResult(
         total_requested=len(dates),
         created_count=created_count,
         skipped=skipped,
         series_id=series.id,
     )
+    logger.info(
+        "operator=%s action=extend_series series_id=%s created_count=%s skipped_count=%s",
+        _operator_label(x_operator),
+        series_id,
+        created_count,
+        len(skipped),
+    )
+    await _safe_log_action(
+        db,
+        x_operator,
+        "EXTEND_SERIES",
+        series_id,
+        {"created_count": created_count, "skipped_count": len(skipped)},
+    )
+    return result_payload
 
 
 @router.post("/series/{series_id}/modify")
 async def modify_series(
-    series_id: int, body: SeriesModifyRequest, db: AsyncSession = Depends(get_db)
+    series_id: int,
+    body: SeriesModifyRequest,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
     """シリーズ変更（未来の予約をキャンセルし、新しい設定で再生成 or 全キャンセル）"""
     result = await db.execute(
@@ -568,6 +655,13 @@ async def modify_series(
         series.is_active = False
         series.remaining_count = 0
         await db.commit()
+        await _safe_log_action(
+            db,
+            x_operator,
+            "MODIFY_SERIES_CANCEL_REMAINING",
+            series_id,
+            {"cancelled_count": cancelled_count},
+        )
         return {
             "action": "cancelled",
             "cancelled_count": cancelled_count,
@@ -661,6 +755,20 @@ async def modify_series(
     series.total_created += created_count
     series.notified_at = None
     await db.commit()
+    logger.info(
+        "operator=%s action=modify_series series_id=%s cancelled_count=%s created_count=%s",
+        _operator_label(x_operator),
+        series_id,
+        cancelled_count,
+        created_count,
+    )
+    await _safe_log_action(
+        db,
+        x_operator,
+        "MODIFY_SERIES",
+        series_id,
+        {"cancelled_count": cancelled_count, "created_count": created_count},
+    )
 
     return {
         "action": "modified",
@@ -673,7 +781,9 @@ async def modify_series(
 
 @router.post("/series/{series_id}/cancel-remaining")
 async def cancel_remaining_series(
-    series_id: int, db: AsyncSession = Depends(get_db)
+    series_id: int,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
     """シリーズの残りの予約をすべてキャンセルし、シリーズを非アクティブにする"""
     result = await db.execute(
@@ -706,13 +816,29 @@ async def cancel_remaining_series(
     series.is_active = False
     series.remaining_count = 0
     await db.commit()
+    logger.info(
+        "operator=%s action=cancel_remaining_series series_id=%s cancelled_count=%s",
+        _operator_label(x_operator),
+        series_id,
+        cancelled,
+    )
+    await _safe_log_action(
+        db,
+        x_operator,
+        "CANCEL_REMAINING_SERIES",
+        series_id,
+        {"cancelled_count": cancelled},
+    )
 
     return {"cancelled_count": cancelled, "series_id": series_id}
 
 
 @router.post("/series/{series_id}/cancel-from/{reservation_id}")
 async def cancel_series_from_reservation(
-    series_id: int, reservation_id: int, db: AsyncSession = Depends(get_db)
+    series_id: int,
+    reservation_id: int,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
     """シリーズの指定予約以降をすべてキャンセル（指定予約自身も含む）"""
     result = await db.execute(
@@ -764,6 +890,20 @@ async def cancel_series_from_reservation(
         series.is_active = False
 
     await db.commit()
+    logger.info(
+        "operator=%s action=cancel_series_from_reservation series_id=%s reservation_id=%s cancelled_count=%s",
+        _operator_label(x_operator),
+        series_id,
+        reservation_id,
+        cancelled,
+    )
+    await _safe_log_action(
+        db,
+        x_operator,
+        "CANCEL_SERIES_FROM_RESERVATION",
+        reservation_id,
+        {"series_id": series_id, "cancelled_count": cancelled},
+    )
     return {"cancelled_count": cancelled, "cancelled_dates": cancelled_dates, "series_id": series_id}
 
 
@@ -771,6 +911,7 @@ async def cancel_series_from_reservation(
 async def edit_series_from_reservation(
     series_id: int, reservation_id: int, body: SeriesBulkEditRequest,
     db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
     """シリーズの指定予約以降を一括編集（指定予約自身も含む）"""
     result = await db.execute(
@@ -883,6 +1024,21 @@ async def edit_series_from_reservation(
         series.notes = update_fields["notes"]
 
     await db.commit()
+    logger.info(
+        "operator=%s action=edit_series_from_reservation series_id=%s reservation_id=%s updated_count=%s skipped_count=%s",
+        _operator_label(x_operator),
+        series_id,
+        reservation_id,
+        updated_count,
+        len(skipped),
+    )
+    await _safe_log_action(
+        db,
+        x_operator,
+        "EDIT_SERIES_FROM_RESERVATION",
+        reservation_id,
+        {"series_id": series_id, "updated_count": updated_count, "skipped_count": len(skipped)},
+    )
     return {
         "updated_count": updated_count,
         "skipped": skipped,
@@ -911,7 +1067,10 @@ async def get_series_reservations(series_id: int, db: AsyncSession = Depends(get
 
 @router.put("/{reservation_id}")
 async def update_reservation(
-    reservation_id: int, data: ReservationUpdate, db: AsyncSession = Depends(get_db)
+    reservation_id: int,
+    data: ReservationUpdate,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
     result = await db.execute(
         select(Reservation).where(Reservation.id == reservation_id)
@@ -962,11 +1121,21 @@ async def update_reservation(
         )
     )
     reservation = result2.scalar_one()
+    logger.info(
+        "operator=%s action=update_reservation reservation_id=%s",
+        _operator_label(x_operator),
+        reservation_id,
+    )
+    await _safe_log_action(db, x_operator, "UPDATE_RESERVATION", reservation_id)
     return build_reservation_response(reservation)
 
 
 @router.post("/{reservation_id}/confirm")
-async def confirm_reservation(reservation_id: int, db: AsyncSession = Depends(get_db)):
+async def confirm_reservation(
+    reservation_id: int,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
+):
     reservation = await transition_status(db, reservation_id, "CONFIRMED")
     await create_notification(
         db, "reservation_confirmed",
@@ -985,11 +1154,21 @@ async def confirm_reservation(reservation_id: int, db: AsyncSession = Depends(ge
         )
     )
     reservation = result.scalar_one()
+    logger.info(
+        "operator=%s action=confirm_reservation reservation_id=%s",
+        _operator_label(x_operator),
+        reservation_id,
+    )
+    await _safe_log_action(db, x_operator, "CONFIRM_RESERVATION", reservation_id)
     return build_reservation_response(reservation)
 
 
 @router.post("/{reservation_id}/reject")
-async def reject_reservation(reservation_id: int, db: AsyncSession = Depends(get_db)):
+async def reject_reservation(
+    reservation_id: int,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
+):
     reservation = await transition_status(db, reservation_id, "REJECTED")
     await create_notification(
         db, "reservation_rejected",
@@ -1008,11 +1187,21 @@ async def reject_reservation(reservation_id: int, db: AsyncSession = Depends(get
         )
     )
     reservation = result.scalar_one()
+    logger.info(
+        "operator=%s action=reject_reservation reservation_id=%s",
+        _operator_label(x_operator),
+        reservation_id,
+    )
+    await _safe_log_action(db, x_operator, "REJECT_RESERVATION", reservation_id)
     return build_reservation_response(reservation)
 
 
 @router.post("/{reservation_id}/cancel-request")
-async def cancel_request(reservation_id: int, db: AsyncSession = Depends(get_db)):
+async def cancel_request(
+    reservation_id: int,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
+):
     reservation = await transition_status(db, reservation_id, "CANCEL_REQUESTED")
     await create_notification(
         db, "cancel_requested",
@@ -1031,11 +1220,21 @@ async def cancel_request(reservation_id: int, db: AsyncSession = Depends(get_db)
         )
     )
     reservation = result.scalar_one()
+    logger.info(
+        "operator=%s action=cancel_request reservation_id=%s",
+        _operator_label(x_operator),
+        reservation_id,
+    )
+    await _safe_log_action(db, x_operator, "CANCEL_REQUEST", reservation_id)
     return build_reservation_response(reservation)
 
 
 @router.post("/{reservation_id}/cancel-approve")
-async def cancel_approve(reservation_id: int, db: AsyncSession = Depends(get_db)):
+async def cancel_approve(
+    reservation_id: int,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
+):
     reservation = await transition_status(db, reservation_id, "CANCELLED")
     is_hotpepper = reservation.channel == "HOTPEPPER"
     await create_notification(
@@ -1061,6 +1260,12 @@ async def cancel_approve(reservation_id: int, db: AsyncSession = Depends(get_db)
         )
     )
     reservation = result.scalar_one()
+    logger.info(
+        "operator=%s action=cancel_approve reservation_id=%s",
+        _operator_label(x_operator),
+        reservation_id,
+    )
+    await _safe_log_action(db, x_operator, "CANCEL_APPROVE", reservation_id)
     return build_reservation_response(reservation)
 
 
@@ -1069,23 +1274,54 @@ async def change_request(
     reservation_id: int,
     body: ChangeRequestBody,
     db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
-    return await handle_change_request(
+    response = await handle_change_request(
         db, reservation_id,
         body.new_start_time, body.new_end_time,
         body.new_practitioner_id,
     )
+    logger.info(
+        "operator=%s action=change_request reservation_id=%s",
+        _operator_label(x_operator),
+        reservation_id,
+    )
+    await _safe_log_action(db, x_operator, "CHANGE_REQUEST", reservation_id)
+    return response
 
 
 @router.post("/{reservation_id}/change-approve")
-async def change_approve(reservation_id: int, db: AsyncSession = Depends(get_db)):
-    return await handle_change_approve(db, reservation_id)
+async def change_approve(
+    reservation_id: int,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
+):
+    response = await handle_change_approve(db, reservation_id)
+    logger.info(
+        "operator=%s action=change_approve reservation_id=%s",
+        _operator_label(x_operator),
+        reservation_id,
+    )
+    await _safe_log_action(db, x_operator, "CHANGE_APPROVE", reservation_id)
+    return response
 
 
 @router.post("/{reservation_id}/reschedule")
-async def reschedule(reservation_id: int, body: RescheduleBody, db: AsyncSession = Depends(get_db)):
-    return await reschedule_reservation(
+async def reschedule(
+    reservation_id: int,
+    body: RescheduleBody,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
+):
+    response = await reschedule_reservation(
         db, reservation_id,
         body.new_start_time, body.new_end_time,
         body.new_practitioner_id,
     )
+    logger.info(
+        "operator=%s action=reschedule reservation_id=%s",
+        _operator_label(x_operator),
+        reservation_id,
+    )
+    await _safe_log_action(db, x_operator, "RESCHEDULE_RESERVATION", reservation_id)
+    return response

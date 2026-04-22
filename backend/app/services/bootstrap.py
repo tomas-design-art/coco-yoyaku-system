@@ -13,6 +13,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 def _import_all_models() -> None:
     # Ensure SQLAlchemy metadata is fully populated before create_all.
     model_modules = [
+        "app.models.audit_log",
         "app.models.chat_session",
         "app.models.date_override",
         "app.models.line_user_state",

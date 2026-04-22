@@ -203,6 +203,15 @@ export interface Notification {
   created_at: string;
 }
 
+export interface AuditLog {
+  id: number;
+  timestamp: string;
+  operator: string;
+  action: string;
+  target_id: number | null;
+  detail: Record<string, unknown> | null;
+}
+
 // --- Bulk Reservation ---
 
 export interface BulkReservationCreate {

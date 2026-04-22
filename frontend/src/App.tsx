@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useMemo } from 'react';
-import { BrowserRouter, Routes, Route, Link, useLocation, useNavigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { Calendar, Users, Settings, Stethoscope, Menu as MenuIcon, Volume2, VolumeX, Palette, Bot, CalendarDays, CheckCircle, Lock, Unlock, LogOut, X } from 'lucide-react';
 import TimeTable from './components/TimeTable/TimeTable';
 import ReservationForm from './components/ReservationForm/ReservationForm';
@@ -11,6 +11,7 @@ import ChatbotSettings from './components/Settings/ChatbotSettings';
 import WeeklyScheduleManager from './components/Settings/WeeklyScheduleManager';
 import PractitionerScheduleManager from './components/Settings/PractitionerScheduleManager';
 import SystemSettings from './components/Settings/SystemSettings';
+import AuditLogViewer from './components/Settings/AuditLogViewer';
 import PatientList from './components/PatientList';
 import NotificationBell from './components/Notification/NotificationBell';
 import AlertPopup from './components/Notification/AlertPopup';
@@ -32,6 +33,9 @@ type PendingRescheduleTarget = {
   date: Date;
 };
 
+const OPERATOR_STORAGE_KEY = 'operator';
+const OPERATOR_CANDIDATES = ['上田', '出口', '時田'];
+
 function NavLink({ to, children, locked }: { to: string; children: React.ReactNode; locked?: boolean }) {
   const location = useLocation();
   const active = location.pathname === to || (to !== '/' && location.pathname.startsWith(to));
@@ -44,10 +48,11 @@ function NavLink({ to, children, locked }: { to: string; children: React.ReactNo
 }
 
 function AppContent() {
-  const { role, adminLogout, logout } = useAuth();
+  const { role, adminLogout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const isAdmin = role === 'admin';
+  const operatorName = localStorage.getItem(OPERATOR_STORAGE_KEY) ?? '';
 
   const [showReservationForm, setShowReservationForm] = useState(false);
   const [showNotificationPanel, setShowNotificationPanel] = useState(false);
@@ -223,12 +228,18 @@ function AppContent() {
   };
 
   useEffect(() => {
-    if (location.pathname !== '/' && isTimeTableFullscreen) {
+    if (location.pathname !== '/timetable' && isTimeTableFullscreen) {
       setIsTimeTableFullscreen(false);
     }
   }, [location.pathname, isTimeTableFullscreen]);
 
-  const showAppHeader = !(location.pathname === '/' && isTimeTableFullscreen);
+  const showAppHeader = !(location.pathname === '/timetable' && isTimeTableFullscreen);
+
+  const handleOperatorSwitch = () => {
+    localStorage.removeItem(OPERATOR_STORAGE_KEY);
+    adminLogout();
+    navigate('/');
+  };
 
   return (
     <div className="flex flex-col h-screen">
@@ -239,7 +250,7 @@ function AppContent() {
             <div className="flex items-center gap-4">
               <h1 className="text-lg font-bold text-gray-900">🦴 予約管理</h1>
               <nav className="flex items-center gap-1">
-                <NavLink to="/"><Calendar size={16} className="inline mr-1" />タイムテーブル</NavLink>
+                <NavLink to="/timetable"><Calendar size={16} className="inline mr-1" />タイムテーブル</NavLink>
                 <NavLink to="/patients"><Users size={16} className="inline mr-1" />患者</NavLink>
                 <AdminNavLink to="/settings/practitioners" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
                   <Stethoscope size={16} className="inline mr-1" />施術者
@@ -257,6 +268,9 @@ function AppContent() {
                   <CalendarDays size={16} className="inline mr-1" />院営業スケジュール
                 </AdminNavLink>
                 <NavLink to="/settings/practitioner-schedules"><CalendarDays size={16} className="inline mr-1" />職員勤務スケジュール</NavLink>
+                <AdminNavLink to="/settings/audit-logs" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
+                  <Settings size={16} className="inline mr-1" />監査ログ
+                </AdminNavLink>
                 <AdminNavLink to="/settings" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
                   <Settings size={16} className="inline mr-1" />設定
                 </AdminNavLink>
@@ -264,16 +278,14 @@ function AppContent() {
               </nav>
             </div>
             <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1 text-sm text-gray-700 bg-gray-100 px-2 py-1 rounded">
+                <Users size={14} />
+                <span>{operatorName || '未選択'}</span>
+              </div>
               {isAdmin && (
                 <div className="flex items-center gap-1 text-sm text-green-700 bg-green-50 px-2 py-1 rounded">
                   <Unlock size={14} />
                   <span>管理者</span>
-                  <button
-                    onClick={adminLogout}
-                    className="ml-1 text-xs text-green-600 hover:text-green-800 underline"
-                  >
-                    戻る
-                  </button>
                 </div>
               )}
               <button
@@ -288,9 +300,9 @@ function AppContent() {
                 onClick={() => { setShowNotificationPanel(!showNotificationPanel); clearUnread(); }}
               />
               <button
-                onClick={() => { logout(); }}
+                onClick={handleOperatorSwitch}
                 className="p-2 rounded-full text-gray-400 hover:text-red-500"
-                title="ログアウト"
+                title="操作者を切り替え"
               >
                 <LogOut size={18} />
               </button>
@@ -302,7 +314,7 @@ function AppContent() {
       {/* Main */}
       <main className="flex-1 overflow-auto bg-gray-50">
         <Routes>
-          <Route path="/" element={
+          <Route path="/timetable" element={
             <TimeTable
               onSlotClick={handleSlotClick}
               onDragSelect={handleDragSelect}
@@ -344,9 +356,11 @@ function AppContent() {
           <Route path="/settings/chatbot" element={<ChatbotSettings />} />
           <Route path="/settings/schedule" element={<WeeklyScheduleManager />} />
           <Route path="/settings/practitioner-schedules" element={<PractitionerScheduleManager />} />
+          <Route path="/settings/audit-logs" element={<AuditLogViewer />} />
           <Route path="/settings" element={<SystemSettings />} />
           <Route path="/hotpepper" element={<HotPepperSync />} />
           <Route path="/reserve" element={<PublicReserve />} />
+          <Route path="*" element={<Navigate to="/timetable" replace />} />
         </Routes>
       </main>
 
@@ -456,10 +470,41 @@ function App() {
   );
 }
 
+function UserSelectPage() {
+  const navigate = useNavigate();
+
+  const handleSelect = (name: string) => {
+    localStorage.setItem(OPERATOR_STORAGE_KEY, name);
+    navigate('/timetable');
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50 flex items-center justify-center px-4">
+      <div className="w-full max-w-xl bg-white rounded-2xl shadow-sm border p-6 md:p-10">
+        <h1 className="text-2xl md:text-3xl font-bold text-center text-gray-900 mb-2">操作者を選択してください</h1>
+        <p className="text-center text-gray-500 mb-8">選択後に予約管理画面へ進みます</p>
+        <div className="flex flex-col gap-4">
+          {OPERATOR_CANDIDATES.map((name) => (
+            <button
+              key={name}
+              onClick={() => handleSelect(name)}
+              className="w-full h-20 rounded-xl bg-green-700 hover:bg-green-800 active:scale-[0.99] text-white text-2xl font-semibold transition"
+            >
+              {name}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AuthGate() {
   const location = useLocation();
   if (location.pathname.startsWith('/reserve')) return <PublicReserve />;
-  // PIN認証を無効化: 常にメイン画面を表示
+  if (location.pathname === '/') return <UserSelectPage />;
+  const operator = localStorage.getItem(OPERATOR_STORAGE_KEY);
+  if (!operator) return <Navigate to="/" replace />;
   return <AppContent />;
 }
 
