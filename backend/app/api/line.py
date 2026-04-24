@@ -1177,6 +1177,10 @@ async def line_webhook(
     x_line_signature: Optional[str] = Header(None),
 ):
     """LINE Webhook受信（予約意図抽出 -> 空き照会 -> 管理者確認通知）"""
+    if not settings.line_channel_access_token or settings.line_channel_access_token == "xxx":
+        logger.info("LINE_CHANNEL_ACCESS_TOKEN が未設定のため Webhook をスキップします")
+        return {"status": "skipped"}
+
     body = await request.body()
     _verify_signature(body, x_line_signature)
 
