@@ -103,6 +103,31 @@ def has_reservation_intent(text: str) -> bool:
     return bool(date_val or time_val)
 
 
+# LINE公式アカウントの定型テンプレ（ボタン押下で送信される文言）
+_TEMPLATE_ONLY_PATTERNS = [
+    r"^\s*予約\s*[／/・]\s*変更\s*$",
+    r"^\s*予約\s*$",
+    r"^\s*変更\s*$",
+    r"^\s*キャンセル\s*$",
+    r"^\s*遅刻\s*$",
+    r"^\s*相談\s*$",
+    r"^\s*問い?合わせ\s*$",
+]
+
+
+def is_template_only_message(text: str) -> bool:
+    """LINEテンプレートボタンからの定型文のみかを判定（具体内容が無い）"""
+    if not text:
+        return False
+    # 50文字超なら通常メッセージ扱い
+    if len(text.strip()) > 20:
+        return False
+    for pattern in _TEMPLATE_ONLY_PATTERNS:
+        if re.match(pattern, text):
+            return True
+    return False
+
+
 def _extract_intent_rule(text: str) -> str:
     if re.search(r"キャンセル|取り消|取消|なしで|やめ|辞退", text):
         return "キャンセル"
@@ -619,6 +644,15 @@ async def handle_shadow_message(
         # ── LLM解析 ──
         analysis = await analyze_with_llm(msg)
         intent = analysis.get("intent") or ""
+
+        # ── LINEテンプレ単独（「予約／変更」等）の場合は、続くメッセージを待つために
+        #    intent を強制的に "予約希望" 扱いとし shadow_drafting を継続する ──
+        template_only = is_template_only_message(msg)
+        if template_only:
+            logger.info("Shadow: detected template-only message → waiting for content (user=%s)", user_id[:12])
+            intent = "予約希望"
+            analysis["intent"] = intent
+            analysis["_template_only"] = True
 
         # ── デバッグモード: LLM解析直後のフルダンプ ──
         if _is_debug_mode():
@@ -1169,9 +1203,9 @@ def _build_shadow_available_flex(
                     "color": "#16A34A",
                     "action": {
                         "type": "postback",
-                        "label": "はい・予約確定",
+                        "label": "予約ボードを押さえる",
                         "data": f"action=shadow_approve&rid={request_id}{uid_suffix}",
-                        "displayText": "はい・予約確定",
+                        "displayText": "予約ボードを押さえる",
                     },
                 },
                 {
