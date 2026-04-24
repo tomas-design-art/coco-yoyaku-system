@@ -123,6 +123,6 @@ async def root():
     return {"message": f"{app_settings_early.app_title} API"}
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"status": "ok"}

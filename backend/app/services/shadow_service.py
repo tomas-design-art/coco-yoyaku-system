@@ -39,29 +39,54 @@ _RESERVATION_KEYWORDS = [
 
 # ── LLMプロンプト ──
 _SHADOW_PARSE_PROMPT = """\
-あなたは接骨院のLINE予約アシスタントです。
-以下の患者メッセージから予約に関する情報を抽出し、必ず**JSONのみ**で返してください。
-説明文は禁止。今日の日付は {today} です。
+あなたは接骨院のLINE予約アシスタントです。患者のメッセージから「希望する新しい予約日時」を抽出してください。
+今日の日付は {today}（{today_weekday}曜日）です。必ず**JSONのみ**で返してください。説明文は禁止。
 
 出力JSON形式（必ず全キーを含めること）:
 {{
     "intent": "予約希望 | 変更 | キャンセル | 遅刻 | 相談 | その他",
-    "content": "患者の要望を1〜2文で簡潔に要約",
-    "name": "患者名 or null",
+    "content": "患者の要望を1〜2文で簡潔に要約（例: '4/29午前中への変更を希望'）",
+    "name": "患者が自分の氏名を名乗った場合のみ抽出、それ以外は null",
     "menu": null,
-    "date": "YYYY-MM-DD or null",
-    "time": "HH:MM or null",
+    "current_date": "既存予約の日付 YYYY-MM-DD or null（変更時のみ）",
+    "current_time": "既存予約の時刻 HH:MM or null（変更時のみ）",
+    "date": "希望する新しい予約日 YYYY-MM-DD or null",
+    "time": "希望する新しい予約時刻 HH:MM or null",
     "duration_minutes": 整数 or null,
     "confidence": "high | medium | low"
 }}
 
-重要:
-- メニューの推定は不要。`menu` は常に null で良い。
-- 最優先で `date` と `time` を抽出する。
-- 意図は必ず6分類から1つを選ぶ。
-- 「遅刻」は遅れる旨の報告。
-- 施術時間に言及があれば `duration_minutes` に分数を入れる。
-- `content` は患者の要望を簡潔に日本語で要約する（例: "明日14時に60分の予約を希望"）。
+重要ルール:
+1. **変更依頼の場合、`date`/`time` には「希望する新しい日時」を入れる**。
+   例: 「4/25 10:00の予約を4/29の午前中に変更したい」
+   → current_date=2026-04-25, current_time=10:00, date=2026-04-29, time=10:00
+2. **あいまいな時間表現はデフォルト値にマッピング**:
+   - 朝 → 09:00
+   - 午前中 / 午前 → 10:00
+   - 昼 / お昼 → 12:00
+   - 午後 → 14:00
+   - 夕方 → 17:00
+   - 夜 / 晩 → 19:00
+   - 「19時以降」のような境界条件 → 19:00
+3. **曜日表現は今日の日付を基準に解決する**:
+   - 「今日」→ 今日の日付
+   - 「明日」「明後日」
+   - 「今週◯曜日」→ 今週のその曜日（既に過ぎていれば来週）
+   - 「来週◯曜日」→ 翌週のその曜日
+   - 「◯曜日」単独 → 直近の未来のその曜日
+4. **相対日時の例**:
+   - 「水曜日19時以降」（今日が月曜なら）→ date=今週水曜, time=19:00
+   - 「来週日曜日16時頃」→ date=来週日曜, time=16:00
+5. **意図分類**:
+   - 予約希望: 新規予約
+   - 変更: 既存予約の日時変更
+   - キャンセル: 予約取消
+   - 遅刻: 当日到着が遅れる報告
+   - 相談: 問い合わせ
+   - その他: 上記以外・テンプレだけで内容なし
+6. メッセージがテンプレート文（例: 「予約／変更」のみ）で具体的内容がない場合、全フィールド null で intent のみ推定。
+7. 施術時間への言及（「30分コース」等）があれば duration_minutes に入れる。推測はしない。
+8. `name` は患者が「〜です」「〇〇と申します」等で自ら名乗った場合のみ。メッセージ内容の話題に出た第三者の名前は入れない。
 
 患者メッセージ:
 {message}
@@ -102,7 +127,7 @@ def _extract_date_time_rule(text: str) -> tuple[str | None, str | None]:
         dval = (now.date() + timedelta(days=2)).isoformat()
     elif "明日" in text:
         dval = (now.date() + timedelta(days=1)).isoformat()
-    elif "今日" in text:
+    elif "今日" in text or "本日" in text:
         dval = now.date().isoformat()
 
     # Absolute date (YYYY/MM/DD, YYYY-MM-DD)
@@ -117,6 +142,35 @@ def _extract_date_time_rule(text: str) -> tuple[str | None, str | None]:
             mo, da = int(m_md.group(1)), int(m_md.group(2))
             y = now.year + (1 if mo < now.month else 0)
             dval = f"{y:04d}-{mo:02d}-{da:02d}"
+
+    # 曜日ベースの相対日付 (今週◯曜 / 来週◯曜 / 単独の◯曜日)
+    if not dval:
+        weekday_map = {"月": 0, "火": 1, "水": 2, "木": 3, "金": 4, "土": 5, "日": 6}
+        # 「来週X曜」
+        m_next = re.search(r"来週\s*([月火水木金土日])曜", text)
+        # 「今週X曜」
+        m_this = re.search(r"今週\s*([月火水木金土日])曜", text)
+        # 単独の「X曜日」
+        m_solo = re.search(r"([月火水木金土日])曜日?", text)
+        target_char = None
+        add_week = False
+        if m_next:
+            target_char = m_next.group(1)
+            add_week = True
+        elif m_this:
+            target_char = m_this.group(1)
+            add_week = False
+        elif m_solo:
+            target_char = m_solo.group(1)
+        if target_char:
+            target_wd = weekday_map[target_char]
+            current_wd = now.weekday()
+            days_ahead = (target_wd - current_wd) % 7
+            if days_ahead == 0 and not m_this:
+                days_ahead = 7  # 今日と同じ曜日 → 来週扱い
+            if add_week:
+                days_ahead += 7
+            dval = (now.date() + timedelta(days=days_ahead)).isoformat()
 
     # Time: HH:MM
     m_hm = re.search(r"(\d{1,2})\s*[:：]\s*(\d{1,2})", text)
@@ -136,6 +190,21 @@ def _extract_date_time_rule(text: str) -> tuple[str | None, str | None]:
                 hh += 12
             tval = f"{hh:02d}:{mm:02d}"
 
+    # あいまい時間帯（時刻未抽出の場合のみフォールバック）
+    if not tval:
+        if "午前中" in text or "午前" in text:
+            tval = "10:00"
+        elif "お昼" in text or re.search(r"(?<!\d)昼(?!食)", text):
+            tval = "12:00"
+        elif "午後" in text:
+            tval = "14:00"
+        elif "夕方" in text:
+            tval = "17:00"
+        elif "夜" in text or "晩" in text:
+            tval = "19:00"
+        elif re.search(r"(?<!深)朝(?!ご飯)", text):
+            tval = "09:00"
+
     return dval, tval
 
 
@@ -152,6 +221,12 @@ def _normalize_analysis(analysis: dict, message: str) -> dict:
     parsed["date"] = parsed.get("date") or rule_date
     parsed["time"] = parsed.get("time") or rule_time
     parsed["menu"] = None
+
+    # current_date/current_time（変更意図時の既存予約日時）— 文字列"null"を除去
+    for key in ("current_date", "current_time"):
+        val = parsed.get(key)
+        if not val or val == "null":
+            parsed[key] = None
 
     # duration
     dur = parsed.get("duration_minutes")
@@ -190,6 +265,8 @@ def _rule_based_shadow_parse(message: str) -> dict:
         "content": None,
         "name": None,
         "menu": None,
+        "current_date": None,
+        "current_time": None,
         "date": date_val,
         "time": time_val,
         "duration_minutes": duration,
@@ -232,12 +309,17 @@ def flush_debounce(user_id: str) -> str | None:
 
 async def analyze_with_llm(message: str) -> dict:
     """Gemini APIでシャドーモード用JSON解析"""
-    today = now_jst().date().isoformat()
-    prompt = _SHADOW_PARSE_PROMPT.format(today=today, message=message)
+    now = now_jst()
+    today = now.date().isoformat()
+    today_weekday = _WEEKDAY_JP[now.weekday()] if 0 <= now.weekday() < 7 else "?"
+    prompt = _SHADOW_PARSE_PROMPT.format(today=today, today_weekday=today_weekday, message=message)
 
     if not settings.gemini_api_key:
         logger.warning("GEMINI_API_KEY not set; using rule-based shadow analysis")
-        return _rule_based_shadow_parse(message)
+        result = _rule_based_shadow_parse(message)
+        result["_source"] = "rule(no_api_key)"
+        result["_llm_raw"] = None
+        return result
 
     model = settings.gemini_model
     url = (
@@ -254,6 +336,8 @@ async def analyze_with_llm(message: str) -> dict:
         "generationConfig": {"temperature": 0, "maxOutputTokens": 512},
     }
 
+    raw_text: str | None = None
+    error_detail: str | None = None
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(url, json=payload, timeout=30)
@@ -264,13 +348,21 @@ async def analyze_with_llm(message: str) -> dict:
             if json_match:
                 parsed = json.loads(json_match.group())
                 # 必要キーの保証
-                for key in ("intent", "name", "menu", "date", "time", "confidence"):
+                for key in ("intent", "name", "menu", "date", "time", "confidence", "current_date", "current_time"):
                     parsed.setdefault(key, None)
-                return _normalize_analysis(parsed, message)
+                normalized = _normalize_analysis(parsed, message)
+                normalized["_source"] = "llm"
+                normalized["_llm_raw"] = raw_text
+                return normalized
+            error_detail = "no_json_in_response"
     except Exception as e:
+        error_detail = f"{type(e).__name__}: {e}"
         logger.error("Shadow LLM analysis failed: %s", e)
 
-    return _rule_based_shadow_parse(message)
+    fallback = _rule_based_shadow_parse(message)
+    fallback["_source"] = f"rule(fallback:{error_detail or 'unknown'})"
+    fallback["_llm_raw"] = raw_text
+    return fallback
 
 
 def _empty_result() -> dict:
@@ -346,14 +438,23 @@ def format_admin_notification(
     user_id: str,
     raw_message: str,
     analysis: dict,
+    current_reservation_text: str | None = None,
 ) -> str:
     """管理者向け通知テキストを整形"""
     ts = now_jst().strftime("%Y-%m-%d %H:%M")
-    name = display_name or "不明"
+    name = display_name or analysis.get("name") or "不明"
     content = _generate_content_summary(analysis)
     date_str = analysis.get("date") or "未抽出"
     time_str = analysis.get("time") or "未抽出"
     desired_time = f"{date_str} {time_str}" if date_str != "未抽出" else "未抽出"
+
+    # LLMが抽出した既存予約日時（変更依頼時）
+    llm_current_date = analysis.get("current_date")
+    llm_current_time = analysis.get("current_time")
+    llm_current_text = None
+    if llm_current_date or llm_current_time:
+        llm_current_text = f"{llm_current_date or '?'} {llm_current_time or '?'}"
+
     lines = [
         f"📩 {name}さんからのメッセージ ({ts})",
         "",
@@ -362,8 +463,12 @@ def format_admin_notification(
         "",
         f"【分類】{analysis.get('intent') or '不明'}",
         f"【内容】{content}",
-        f"【患者希望の予約時間】{desired_time}",
     ]
+    if current_reservation_text:
+        lines.append(f"【現在の予約(DB)】{current_reservation_text}")
+    if llm_current_text:
+        lines.append(f"【文面中の既存予約】{llm_current_text}")
+    lines.append(f"【患者希望の予約時間】{desired_time}")
     return "\n".join(lines)
 
 
@@ -373,6 +478,7 @@ async def notify_admin_shadow(
     user_id: str,
     raw_message: str,
     analysis: dict,
+    db: AsyncSession | None = None,
 ) -> bool:
     """管理者（ADMIN_LINE_DEVELOPER_USER_ID）にPush通知"""
     target = settings.admin_line_developer_user_id
@@ -385,13 +491,48 @@ async def notify_admin_shadow(
         logger.warning("Shadow notify skipped: no admin user ID or token configured")
         return False
 
+    # 変更・キャンセル・遅刻意図の場合、患者の直近予約をDBから取得
+    current_reservation_text: str | None = None
+    if db is not None and analysis.get("intent") in {"変更", "キャンセル", "遅刻"}:
+        try:
+            current_reservation_text = await _find_patient_upcoming_reservation(db, user_id)
+        except Exception as e:
+            logger.warning("Failed to fetch current reservation for shadow notify: %s", e)
+
     text = format_admin_notification(
         display_name=display_name,
         user_id=user_id,
         raw_message=raw_message,
         analysis=analysis,
+        current_reservation_text=current_reservation_text,
     )
     return await push_message_with_access_token(target, text, token)
+
+
+async def _find_patient_upcoming_reservation(db: AsyncSession, line_user_id: str) -> str | None:
+    """LINEユーザーIDから直近の有効な予約を検索して整形文字列を返す"""
+    from app.models.reservation import Reservation
+    patient = await _find_line_patient(db, line_user_id)
+    if not patient:
+        return None
+    now = now_jst()
+    result = await db.execute(
+        select(Reservation)
+        .where(Reservation.patient_id == patient.id)
+        .where(Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD", "CHANGE_REQUESTED"]))
+        .where(Reservation.start_time >= now - timedelta(hours=1))
+        .order_by(Reservation.start_time.asc())
+        .limit(1)
+    )
+    res = result.scalar_one_or_none()
+    if not res:
+        return None
+    st = res.start_time.astimezone(JST)
+    et = res.end_time.astimezone(JST) if res.end_time else None
+    date_label = _format_date_with_weekday(st.date())
+    time_label = st.strftime("%H:%M")
+    end_label = et.strftime("%H:%M") if et else "?"
+    return f"{date_label} {time_label}〜{end_label}"
 
 
 async def handle_shadow_message(
@@ -426,10 +567,25 @@ async def handle_shadow_message(
         prev_draft = user_state.get("draft") or {}
         is_shadow_drafting = current_mode == "shadow_drafting"
 
+        # ── デモ用フルデバッグ通知（入口） ──
+        if _is_debug_mode():
+            await _push_admin_text(
+                _format_debug_dump(
+                    stage="着信",
+                    display_name=display_name,
+                    user_id=user_id,
+                    raw_message=msg,
+                    intent_detected=intent_detected,
+                    mode=current_mode,
+                    draft=prev_draft,
+                    analysis=None,
+                )
+            )
+
         # 管理者対応待ち or 手動モード → 追加メッセージを管理者へ転送のみ
         if current_mode in {"shadow_pending_admin", "manual"}:
             await _push_admin_text(
-                f"📨 {display_name or '不明'}さんから追加メッセージ:\n{msg[:200]}"
+                f"📨 {display_name or '不明'}さんから追加メッセージ:\n── 原文 ──\n{msg}"
             )
             await save_shadow_log(
                 db,
@@ -443,6 +599,11 @@ async def handle_shadow_message(
             continue
 
         if not intent_detected and not is_shadow_drafting:
+            # デバッグモードでも「意図なし」はLLMを呼ばずに済ませるが、受信記録は必ず送る
+            if not _is_debug_mode():
+                await _push_admin_text(
+                    f"📭 {display_name or '不明'}さんから（予約意図なしと判定）:\n── 原文 ──\n{msg}"
+                )
             await save_shadow_log(
                 db,
                 line_user_id=user_id,
@@ -450,14 +611,29 @@ async def handle_shadow_message(
                 raw_message=msg,
                 has_intent=False,
                 analysis=None,
-                notified=False,
+                notified=True,
             )
-            logger.info("Shadow: no reservation intent, logged only (user=%s)", user_id[:12])
+            logger.info("Shadow: no reservation intent, logged (user=%s)", user_id[:12])
             continue
 
         # ── LLM解析 ──
         analysis = await analyze_with_llm(msg)
         intent = analysis.get("intent") or ""
+
+        # ── デバッグモード: LLM解析直後のフルダンプ ──
+        if _is_debug_mode():
+            await _push_admin_text(
+                _format_debug_dump(
+                    stage="AI解析後",
+                    display_name=display_name,
+                    user_id=user_id,
+                    raw_message=msg,
+                    intent_detected=intent_detected,
+                    mode=current_mode,
+                    draft=prev_draft,
+                    analysis=analysis,
+                )
+            )
 
         # 予約希望以外の意図（変更・キャンセル・遅刻・相談）は手動対応へ切替
         if intent in {"変更", "キャンセル", "遅刻", "相談"}:
@@ -466,6 +642,7 @@ async def handle_shadow_message(
                 user_id=user_id,
                 raw_message=msg,
                 analysis=analysis,
+                db=db,
             )
             await clear_user_draft(db, user_id)
             await set_user_mode(db, user_id, "manual", user_state.get("request_id"))
@@ -658,12 +835,67 @@ def _format_draft_progress(
 
 
 async def _push_admin_text(text: str) -> bool:
-    """管理者にテキスト通知"""
-    target = settings.line_admin_user_id
-    token = settings.line_channel_access_token
+    """管理者にテキスト通知（開発者用トークンを優先、無ければ通常管理者へ）"""
+    target = settings.admin_line_developer_user_id
+    token = settings.line_channel_developer_access_token
     if not target or not token:
+        target = settings.line_admin_user_id
+        token = settings.line_channel_access_token
+    if not target or not token:
+        logger.warning("push_admin_text skipped: no admin token configured")
         return False
     return await push_message_with_access_token(target, text, token)
+
+
+def _is_debug_mode() -> bool:
+    """シャドーデモ用フルデバッグ出力のON/OFF"""
+    return getattr(settings, "shadow_debug_dump", False) or settings.environment != "production"
+
+
+def _format_debug_dump(
+    *,
+    stage: str,
+    display_name: str | None,
+    user_id: str,
+    raw_message: str,
+    intent_detected: bool | None = None,
+    mode: str | None = None,
+    draft: dict | None = None,
+    analysis: dict | None = None,
+) -> str:
+    """デモ検証用：全状態をダンプする通知テキスト"""
+    ts = now_jst().strftime("%Y-%m-%d %H:%M:%S")
+    name = display_name or "（display_name取得失敗）"
+    lines = [
+        f"🧪【DEBUG/{stage}】{ts}",
+        f"user_id: {user_id}",
+        f"display_name: {name}",
+        f"mode: {mode or '-'}",
+        f"キーワード意図検出: {intent_detected}",
+        "─ 原文（全文）─",
+        raw_message if raw_message else "（空）",
+    ]
+    if draft:
+        lines.append("─ 既存ドラフト ─")
+        for k, v in draft.items():
+            lines.append(f"  {k}: {v}")
+    if analysis:
+        lines.append("─ AI解析結果 ─")
+        lines.append(f"  source: {analysis.get('_source')}")
+        lines.append(f"  intent: {analysis.get('intent')}")
+        lines.append(f"  name: {analysis.get('name')}")
+        lines.append(f"  content: {analysis.get('content')}")
+        lines.append(f"  current_date: {analysis.get('current_date')}")
+        lines.append(f"  current_time: {analysis.get('current_time')}")
+        lines.append(f"  date: {analysis.get('date')}")
+        lines.append(f"  time: {analysis.get('time')}")
+        lines.append(f"  duration_minutes: {analysis.get('duration_minutes')}")
+        lines.append(f"  confidence: {analysis.get('confidence')}")
+        llm_raw = analysis.get("_llm_raw")
+        if llm_raw:
+            lines.append("─ LLM rawレスポンス ─")
+            lines.append(str(llm_raw)[:600])
+    return "\n".join(lines)[:4800]  # LINE文字数制限考慮
 
 
 async def _shadow_check_and_notify(
