@@ -452,6 +452,12 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     if not user_id:
         return
 
+    # ── 管理者コマンド: Botくん1号 DM から「押さえる」「確定」で最新 pending を承認 ──
+    admin_dev_uid = settings.admin_line_developer_user_id
+    if admin_dev_uid and user_id == admin_dev_uid:
+        if await _handle_admin_text_command(db, text, reply_token):
+            return
+
     # ── シャドーモード: 既存フロー完全バイパス ──
     if settings.shadow_mode:
         display_name = await _get_line_display_name(user_id)
@@ -1168,6 +1174,44 @@ async def _handle_postback(event: dict, db: AsyncSession):
         await set_user_mode(db, user_id, "manual", rid)
         if reply_token:
             await reply_to_line(reply_token, "手動対応に切り替えました。患者へ直接ご連絡ください。")
+
+
+async def _handle_admin_text_command(db: AsyncSession, text: str, reply_token: str | None) -> bool:
+    """Botくん1号へのDMで管理コマンドを処理。処理したら True を返す。"""
+    from app.services.line_state import find_latest_pending_shadow_request
+
+    stripped = (text or "").strip()
+    approve_patterns = ["押さえる", "予約ボードを押さえる", "予約ボード押さえる", "確定", "OK", "ok", "承認"]
+    reject_patterns = ["保留", "手動", "却下", "NG", "ng"]
+
+    matched_approve = any(stripped == p or stripped.startswith(p) for p in approve_patterns)
+    matched_reject = any(stripped == p or stripped.startswith(p) for p in reject_patterns)
+
+    if not (matched_approve or matched_reject):
+        return False
+
+    found = await find_latest_pending_shadow_request(db)
+    if not found:
+        if reply_token:
+            await reply_to_line(reply_token, "確定待ちの予約依頼が見つかりません。")
+        return True
+
+    patient_uid, rid, req = found
+
+    if matched_reject:
+        await update_request(db, rid, line_user_id=patient_uid, status="manual_reply")
+        await set_user_mode(db, patient_uid, "manual", rid)
+        if reply_token:
+            await reply_to_line(reply_token, f"RID:{rid} を手動対応に切り替えました。")
+        return True
+
+    # 承認: 仮想 postback イベントを作って既存処理を再利用
+    fake_event = {
+        "replyToken": reply_token,
+        "postback": {"data": f"action=shadow_approve&rid={rid}&uid={patient_uid}"},
+    }
+    await _handle_postback(fake_event, db)
+    return True
 
 
 @router.post("/webhook")
