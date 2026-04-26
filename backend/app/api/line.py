@@ -90,6 +90,68 @@ async def _get_line_display_name(user_id: str) -> str | None:
     return None
 
 
+def _line_mirror_is_configured() -> bool:
+    return bool(
+        settings.line_mirror_enabled
+        and settings.line_mirror_url
+        and settings.line_mirror_shared_secret
+    )
+
+
+async def _forward_line_webhook_to_mirror(payload: dict) -> None:
+    """本番LINE Webhookイベントをstagingへ複製転送する。
+
+    転送失敗は本番Webhook処理へ影響させない。
+    """
+    if not _line_mirror_is_configured():
+        return
+
+    try:
+        mirror_payload = json.loads(json.dumps(payload))
+        events = mirror_payload.get("events", [])
+        if not isinstance(events, list) or not events:
+            return
+
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            source = event.get("source") if isinstance(event.get("source"), dict) else {}
+            user_id = source.get("userId")
+            display_name = await _get_line_display_name(user_id) if user_id else None
+            event["_mirror"] = {
+                "displayName": display_name,
+                "sourceEnvironment": settings.environment,
+                "label": settings.line_mirror_label,
+                "mirroredAt": now_jst().isoformat(),
+            }
+
+        mirror_payload["mirror"] = {
+            "sourceEnvironment": settings.environment,
+            "label": settings.line_mirror_label,
+            "mirroredAt": now_jst().isoformat(),
+        }
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                settings.line_mirror_url,
+                json=mirror_payload,
+                headers={"X-Line-Mirror-Secret": settings.line_mirror_shared_secret},
+                timeout=settings.line_mirror_timeout_seconds,
+            )
+            if resp.status_code >= 300:
+                logger.warning("LINE mirror forward failed: %s %s", resp.status_code, resp.text[:300])
+    except Exception as e:
+        logger.warning("LINE mirror forward error: %s", e)
+
+
+def _mirror_display_name(event: dict, label: str) -> str:
+    mirror = event.get("_mirror") if isinstance(event.get("_mirror"), dict) else {}
+    source = event.get("source") if isinstance(event.get("source"), dict) else {}
+    user_id = source.get("userId") or "unknown"
+    base_name = mirror.get("displayName") or user_id[:12]
+    return f"[{label}] {base_name}"
+
+
 def _build_missing_info_message(missing: list[str]) -> str:
     jp_map = {
         "customer_name": "お名前",
@@ -1221,10 +1283,17 @@ async def line_webhook(
     x_line_signature: Optional[str] = Header(None),
 ):
     """LINE Webhook受信（予約意図抽出 -> 空き照会 -> 管理者確認通知）"""
+    if not settings.line_channel_access_token or settings.line_channel_access_token == "xxx":
+        logger.info("LINE_CHANNEL_ACCESS_TOKEN が未設定のため Webhook をスキップします")
+        return {"status": "skipped"}
+
     body = await request.body()
     _verify_signature(body, x_line_signature)
 
-    events = json.loads(body).get("events", [])
+    payload = json.loads(body)
+    await _forward_line_webhook_to_mirror(payload)
+
+    events = payload.get("events", [])
     for event in events:
         if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
             await _handle_text_message(event, db)
@@ -1233,6 +1302,43 @@ async def line_webhook(
 
     await db.commit()
     return {"status": "ok"}
+
+
+@router.post("/mirror-webhook")
+async def line_mirror_webhook(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_line_mirror_secret: Optional[str] = Header(None),
+):
+    """本番LINE Webhookの複製をstagingで受ける内部専用エンドポイント。"""
+    if not settings.line_mirror_shared_secret:
+        raise HTTPException(status_code=404, detail="LINE mirror is not configured")
+    if not x_line_mirror_secret or not hmac.compare_digest(x_line_mirror_secret, settings.line_mirror_shared_secret):
+        raise HTTPException(status_code=403, detail="LINE mirror secret is invalid")
+
+    payload = await request.json()
+    label = payload.get("mirror", {}).get("label") if isinstance(payload.get("mirror"), dict) else None
+    label = label or settings.line_mirror_label or "STAGING-MIRROR"
+
+    processed = 0
+    for event in payload.get("events", []):
+        if event.get("type") != "message" or event.get("message", {}).get("type") != "text":
+            continue
+        source = event.get("source", {})
+        user_id = source.get("userId", "")
+        text = event.get("message", {}).get("text", "")
+        if not user_id:
+            continue
+        await handle_shadow_message(
+            db,
+            user_id=user_id,
+            text=text,
+            display_name=_mirror_display_name(event, label),
+        )
+        processed += 1
+
+    await db.commit()
+    return {"status": "ok", "processed": processed, "label": label}
 
 
 @router.post("/parse-message")
