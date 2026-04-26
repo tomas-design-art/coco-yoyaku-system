@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     environment: str = "development"  # development | production
     shadow_mode: bool = False  # True: LINE自動返信を停止し、管理者にのみ解析結果を通知
     shadow_debug_dump: bool = False  # True: シャドー処理の全状態（原文・AI生レス）を管理者LINEへ送る（デモ/検証用）
+    line_mirror_enabled: bool = False  # True: 本番LINE Webhookイベントを検証用stagingへ複製転送
+    line_mirror_url: str = ""  # staging側の /api/line/mirror-webhook URL
+    line_mirror_shared_secret: str = ""  # 本番→stagingミラー転送用の共有シークレット
+    line_mirror_timeout_seconds: float = 3.0
+    line_mirror_label: str = "STAGING-MIRROR"
 
     class Config:
         env_file = str(_ENV_FILE)

@@ -178,6 +178,63 @@ def test_missing_info_message_contains_required_labels():
     assert "ご希望メニュー" in text
 
 
+def test_line_mirror_requires_all_config_values():
+    from app.api.line import _line_mirror_is_configured
+
+    with patch("app.api.line.settings.line_mirror_enabled", True), patch(
+        "app.api.line.settings.line_mirror_url", "https://staging.example/api/line/mirror-webhook"
+    ), patch("app.api.line.settings.line_mirror_shared_secret", "secret"):
+        assert _line_mirror_is_configured() is True
+
+    with patch("app.api.line.settings.line_mirror_enabled", False), patch(
+        "app.api.line.settings.line_mirror_url", "https://staging.example/api/line/mirror-webhook"
+    ), patch("app.api.line.settings.line_mirror_shared_secret", "secret"):
+        assert _line_mirror_is_configured() is False
+
+
+def test_mirror_display_name_includes_environment_label():
+    from app.api.line import _mirror_display_name
+
+    event = {
+        "source": {"userId": "Uabcdef123456"},
+        "_mirror": {"displayName": "山田太郎"},
+    }
+
+    assert _mirror_display_name(event, "STAGING-MIRROR") == "[STAGING-MIRROR] 山田太郎"
+
+
+@pytest.mark.asyncio
+async def test_line_mirror_webhook_runs_shadow_handler_with_secret():
+    from app.api.line import line_mirror_webhook
+
+    class DummyRequest:
+        async def json(self):
+            return {
+                "mirror": {"label": "STAGING-MIRROR"},
+                "events": [
+                    {
+                        "type": "message",
+                        "source": {"userId": "U-customer"},
+                        "message": {"type": "text", "text": "明日の10時に予約したいです"},
+                        "_mirror": {"displayName": "顧客A"},
+                    }
+                ],
+            }
+
+    db = AsyncMock()
+    with patch("app.api.line.settings.line_mirror_shared_secret", "mirror-secret"), patch(
+        "app.api.line.handle_shadow_message", new=AsyncMock(return_value=None)
+    ) as mock_shadow:
+        result = await line_mirror_webhook(DummyRequest(), db, x_line_mirror_secret="mirror-secret")
+
+    assert result == {"status": "ok", "processed": 1, "label": "STAGING-MIRROR"}
+    mock_shadow.assert_awaited_once()
+    assert mock_shadow.await_args.kwargs["user_id"] == "U-customer"
+    assert mock_shadow.await_args.kwargs["text"] == "明日の10時に予約したいです"
+    assert mock_shadow.await_args.kwargs["display_name"] == "[STAGING-MIRROR] 顧客A"
+    db.commit.assert_awaited_once()
+
+
 def test_extract_full_name_for_first_time_registration():
     from app.agents.line_parser import extract_full_name
 
