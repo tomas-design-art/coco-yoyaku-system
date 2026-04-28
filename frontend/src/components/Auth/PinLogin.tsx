@@ -1,14 +1,16 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../../hooks/useAuth';
+import { staffLogin } from '../../api/client';
 
 interface PinLoginProps {
     onSuccess?: () => void;
     title?: string;
     subtitle?: string;
+    verifyOnly?: boolean;
 }
 
-export default function PinLogin({ onSuccess, title = '予約管理システム', subtitle = 'PINを入力してください' }: PinLoginProps) {
+export default function PinLogin({ onSuccess, title = '予約管理システム', subtitle = 'PINを入力してください', verifyOnly = false }: PinLoginProps) {
     const [pin, setPin] = useState('');
     const [error, setError] = useState('');
     const [loading, setLoading] = useState(false);
@@ -32,7 +34,10 @@ export default function PinLogin({ onSuccess, title = '予約管理システム'
     useEffect(() => {
         if (pin.length === 4 && !loading) {
             setLoading(true);
-            staffLoginAction(pin).then((ok) => {
+            const authPromise = verifyOnly
+                ? staffLogin(pin).then(() => true).catch(() => false)
+                : staffLoginAction(pin);
+            authPromise.then((ok) => {
                 if (ok) {
                     if (onSuccess) onSuccess();
                     else navigate('/', { replace: true });
@@ -43,7 +48,7 @@ export default function PinLogin({ onSuccess, title = '予約管理システム'
                 setLoading(false);
             });
         }
-    }, [pin, loading, staffLoginAction, navigate, onSuccess]);
+    }, [pin, loading, staffLoginAction, navigate, onSuccess, verifyOnly]);
 
     // Keyboard input
     useEffect(() => {

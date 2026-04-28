@@ -435,11 +435,7 @@ function AppContent() {
 
 function PatientAccessGate() {
   const { role, loading } = useAuth();
-  const [unlocked, setUnlocked] = useState(role === 'staff' || role === 'admin');
-
-  useEffect(() => {
-    if (role === 'staff' || role === 'admin') setUnlocked(true);
-  }, [role]);
+  const [unlocked, setUnlocked] = useState(false);
 
   if (loading) {
     return <div className="p-6 text-sm text-gray-500">認証状態を確認しています...</div>;
@@ -451,6 +447,7 @@ function PatientAccessGate() {
         <PinLogin
           title="患者情報ロック"
           subtitle="患者ページを開くにはスタッフPINを入力してください"
+          verifyOnly={role === 'admin'}
           onSuccess={() => setUnlocked(true)}
         />
       </div>
