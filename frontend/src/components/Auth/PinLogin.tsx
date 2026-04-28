@@ -2,7 +2,13 @@ import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../../hooks/useAuth';
 
-export default function PinLogin() {
+interface PinLoginProps {
+    onSuccess?: () => void;
+    title?: string;
+    subtitle?: string;
+}
+
+export default function PinLogin({ onSuccess, title = '予約管理システム', subtitle = 'PINを入力してください' }: PinLoginProps) {
     const [pin, setPin] = useState('');
     const [error, setError] = useState('');
     const [loading, setLoading] = useState(false);
@@ -28,15 +34,16 @@ export default function PinLogin() {
             setLoading(true);
             staffLoginAction(pin).then((ok) => {
                 if (ok) {
-                    navigate('/', { replace: true });
+                    if (onSuccess) onSuccess();
+                    else navigate('/', { replace: true });
                 } else {
-                    setError('PINが正しくありません');
+                    setError('PINが正しくないか、一時的に制限されています');
                     setPin('');
                 }
                 setLoading(false);
             });
         }
-    }, [pin, loading, staffLoginAction, navigate]);
+    }, [pin, loading, staffLoginAction, navigate, onSuccess]);
 
     // Keyboard input
     useEffect(() => {
@@ -68,8 +75,8 @@ export default function PinLogin() {
             <div className="bg-white rounded-2xl shadow-xl p-8 w-80">
                 <div className="text-center mb-6">
                     <div className="text-4xl mb-2">🦴</div>
-                    <h1 className="text-lg font-bold text-gray-800">予約管理システム</h1>
-                    <p className="text-sm text-gray-500 mt-1">PINを入力してください</p>
+                    <h1 className="text-lg font-bold text-gray-800">{title}</h1>
+                    <p className="text-sm text-gray-500 mt-1">{subtitle}</p>
                 </div>
 
                 {/* PIN dots */}
