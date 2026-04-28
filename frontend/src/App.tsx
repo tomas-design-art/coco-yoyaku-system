@@ -20,6 +20,7 @@ import SeriesExtensionModal from './components/Notification/SeriesExtensionModal
 import HotPepperSync from './components/HotPepperSync';
 import PublicReserve from './components/PublicReserve';
 import AdminLoginModal from './components/Auth/AdminLoginModal';
+import PinLogin from './components/Auth/PinLogin';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { useSSE } from './hooks/useSSE';
 import { useNotification } from './hooks/useNotification';
@@ -251,7 +252,7 @@ function AppContent() {
               <h1 className="text-lg font-bold text-gray-900">🦴 予約管理</h1>
               <nav className="flex items-center gap-1">
                 <NavLink to="/timetable"><Calendar size={16} className="inline mr-1" />タイムテーブル</NavLink>
-                <NavLink to="/patients"><Users size={16} className="inline mr-1" />患者</NavLink>
+                <NavLink to="/patients" locked={role !== 'staff' && role !== 'admin'}><Users size={16} className="inline mr-1" />患者</NavLink>
                 <AdminNavLink to="/settings/practitioners" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
                   <Stethoscope size={16} className="inline mr-1" />施術者
                 </AdminNavLink>
@@ -349,7 +350,7 @@ function AppContent() {
               ) : null}
             />
           } />
-          <Route path="/patients" element={<PatientList />} />
+          <Route path="/patients" element={<PatientAccessGate />} />
           <Route path="/settings/practitioners" element={<PractitionerManager />} />
           <Route path="/settings/menus" element={<MenuManager />} />
           <Route path="/settings/colors" element={<ColorManager />} />
@@ -430,6 +431,33 @@ function AppContent() {
       />
     </div>
   );
+}
+
+function PatientAccessGate() {
+  const { role, loading } = useAuth();
+  const [unlocked, setUnlocked] = useState(role === 'staff' || role === 'admin');
+
+  useEffect(() => {
+    if (role === 'staff' || role === 'admin') setUnlocked(true);
+  }, [role]);
+
+  if (loading) {
+    return <div className="p-6 text-sm text-gray-500">認証状態を確認しています...</div>;
+  }
+
+  if (!unlocked) {
+    return (
+      <div className="min-h-full flex items-center justify-center p-6">
+        <PinLogin
+          title="患者情報ロック"
+          subtitle="患者ページを開くにはスタッフPINを入力してください"
+          onSuccess={() => setUnlocked(true)}
+        />
+      </div>
+    );
+  }
+
+  return <PatientList />;
 }
 
 function AdminNavLink({ to, isAdmin, onRequireAdmin, children }: {
