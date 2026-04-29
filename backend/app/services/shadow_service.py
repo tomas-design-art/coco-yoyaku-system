@@ -18,6 +18,7 @@ from app.services.line_reply import push_message_with_access_token
 from app.services.line_state import (
     clear_user_draft,
     create_pending_request,
+    get_request,
     get_user_state,
     merge_user_draft,
     set_user_mode,
@@ -29,6 +30,10 @@ logger = logging.getLogger(__name__)
 # ── デバウンス用バッファ（user_id → {text, ts}) ──
 _DEBOUNCE_BUFFER: dict[str, dict] = {}
 _DEBOUNCE_SECONDS = 10
+
+# ミラー転送と通常Webhookが同時に届く構成では、同一LINEイベントが数秒差で二重処理される。
+_RECENT_SHADOW_MESSAGES: dict[tuple[str, str], float] = {}
+_DEDUP_SECONDS = 8
 
 # ── 予約意図キーワード ──
 _RESERVATION_KEYWORDS = [
@@ -128,21 +133,31 @@ def is_template_only_message(text: str) -> bool:
     return False
 
 
+def _strip_courtesy_phrases(text: str) -> str:
+    """予約意図・日時抽出の邪魔になる挨拶表現を除去する。"""
+    cleaned = text or ""
+    cleaned = re.sub(r"夜分\s*遅く(?:に)?\s*(?:失礼(?:します|いたします)?|すみません|申し訳ありません)?", "", cleaned)
+    cleaned = re.sub(r"夜分(?:に)?\s*(?:失礼(?:します|いたします)?|すみません|申し訳ありません)", "", cleaned)
+    return cleaned
+
+
 def _extract_intent_rule(text: str) -> str:
-    if re.search(r"キャンセル|取り消|取消|なしで|やめ|辞退", text):
+    target = _strip_courtesy_phrases(text)
+    if re.search(r"キャンセル|取り消|取消|なしで|やめ|辞退", target):
         return "キャンセル"
-    if re.search(r"変更|変え|ずら|移動|リスケ|別日", text):
+    if re.search(r"変更|変え|ずら|移動|リスケ|別日", target):
         return "変更"
-    if re.search(r"遅れ|遅刻|遅く|間に合わ|少し遅れ", text):
+    if re.search(r"遅刻|遅れ(?:ます|る|そう|そうです)|遅く(?:なり|なっ|到着|行き)|間に合わ|少し遅れ", target):
         return "遅刻"
-    if re.search(r"相談|そうだん|問合せ|問い合わせ|確認したい|聞きたい", text):
+    if re.search(r"相談|そうだん|問合せ|問い合わせ|確認したい|聞きたい", target):
         return "相談"
-    if re.search(r"予約|よやく|空き|あき|取りたい|お願い|受診|見てもら|診てもら", text):
+    if re.search(r"予約|よやく|空き|あき|空いて|取りたい|お願い|受診|見てもら|診てもら", target):
         return "予約希望"
     return "その他"
 
 
 def _extract_date_time_rule(text: str) -> tuple[str | None, str | None]:
+    text = _strip_courtesy_phrases(text)
     now = now_jst()
     dval: str | None = None
     tval: str | None = None
@@ -324,6 +339,23 @@ def debounce_message(user_id: str, text: str) -> str | None:
     _DEBOUNCE_BUFFER[user_id] = {"text": text, "ts": now}
 
     return flushed
+
+
+def _is_duplicate_shadow_message(user_id: str, text: str) -> bool:
+    """短時間に同じユーザー・同じ本文が二重到着した場合は後続を捨てる。"""
+    now = _time.time()
+    normalized = re.sub(r"\s+", "", text or "")
+    if not normalized:
+        return False
+
+    expired = [key for key, ts in _RECENT_SHADOW_MESSAGES.items() if now - ts > _DEDUP_SECONDS]
+    for key in expired:
+        _RECENT_SHADOW_MESSAGES.pop(key, None)
+
+    key = (user_id, normalized)
+    last_seen = _RECENT_SHADOW_MESSAGES.get(key)
+    _RECENT_SHADOW_MESSAGES[key] = now
+    return last_seen is not None and now - last_seen <= _DEDUP_SECONDS
 
 
 def flush_debounce(user_id: str) -> str | None:
@@ -584,6 +616,10 @@ async def handle_shadow_message(
         messages_to_process.append(current)
 
     for msg in messages_to_process:
+        if _is_duplicate_shadow_message(user_id, msg):
+            logger.info("Shadow: duplicate message skipped (user=%s)", user_id[:12])
+            continue
+
         intent_detected = has_reservation_intent(msg)
 
         # ── 既存ドラフトがあるか確認 ──
@@ -591,6 +627,16 @@ async def handle_shadow_message(
         current_mode = user_state.get("mode")
         prev_draft = user_state.get("draft") or {}
         is_shadow_drafting = current_mode == "shadow_drafting"
+
+        if current_mode == "shadow_pending_admin" and intent_detected:
+            request_id = user_state.get("request_id")
+            pending = await get_request(db, request_id, line_user_id=user_id) if request_id else None
+            seed_draft = _draft_from_pending_request(pending or {})
+            if seed_draft:
+                prev_draft = await merge_user_draft(db, user_id, seed_draft)
+            await set_user_mode(db, user_id, "shadow_drafting", request_id)
+            current_mode = "shadow_drafting"
+            is_shadow_drafting = True
 
         # ── デモ用フルデバッグ通知（入口） ──
         if _is_debug_mode():
@@ -607,8 +653,8 @@ async def handle_shadow_message(
                 )
             )
 
-        # 管理者対応待ち or 手動モード → 追加メッセージを管理者へ転送のみ
-        if current_mode in {"shadow_pending_admin", "manual"}:
+        # 手動モード、または予約確認待ち中の非予約メッセージは原文だけ転送する。
+        if current_mode == "manual" or (current_mode == "shadow_pending_admin" and not intent_detected):
             await _push_admin_text(
                 f"📨 {display_name or '不明'}さんから追加メッセージ:\n── 原文 ──\n{msg}"
             )
@@ -868,6 +914,23 @@ def _format_draft_progress(
     return "\n".join(lines)
 
 
+def _draft_from_pending_request(request: dict) -> dict:
+    """確認待ちリクエストから、追加メッセージ再解析用のドラフトを復元する。"""
+    if not request:
+        return {}
+    keys = [
+        "customer_name",
+        "date",
+        "time",
+        "menu_name",
+        "menu_id",
+        "duration_minutes",
+        "practitioner_id",
+        "practitioner_name",
+    ]
+    return {key: request.get(key) for key in keys if request.get(key) not in (None, "")}
+
+
 async def _push_admin_text(text: str) -> bool:
     """管理者にテキスト通知（開発者用トークンを優先、無ければ通常管理者へ）"""
     target = settings.admin_line_developer_user_id
@@ -883,7 +946,7 @@ async def _push_admin_text(text: str) -> bool:
 
 def _is_debug_mode() -> bool:
     """シャドーデモ用フルデバッグ出力のON/OFF"""
-    return getattr(settings, "shadow_debug_dump", False) or settings.environment != "production"
+    return bool(getattr(settings, "shadow_debug_dump", False))
 
 
 def _format_debug_dump(
