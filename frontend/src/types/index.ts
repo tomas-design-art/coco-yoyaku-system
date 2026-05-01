@@ -418,7 +418,7 @@ export interface PractitionerDayStatus {
   start_time: string | null;
   end_time: string | null;
   reason: string | null;
-  source: 'override' | 'default' | 'fallback';
+  source: 'override' | 'default' | 'fallback' | 'clinic' | 'holiday' | 'holiday_default';
   unavailable_times?: { id: number; start_time: string; end_time: string; reason: string | null }[];
 }
 

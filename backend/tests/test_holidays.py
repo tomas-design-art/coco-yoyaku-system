@@ -61,13 +61,36 @@ class TestBusinessHoursForDate(unittest.TestCase):
         from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
         from sqlalchemy.orm import sessionmaker
         from app.database import Base
+        from app.models.date_override import DateOverride
+        from app.models.menu import Menu
+        from app.models.patient import Patient
+        from app.models.practitioner import Practitioner
+        from app.models.practitioner_schedule import PractitionerSchedule, ScheduleOverride
+        from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
+        from app.models.reservation import Reservation
+        from app.models.reservation_color import ReservationColor
+        from app.models.reservation_series import ReservationSeries
+        from app.models.setting import Setting
+        from app.models.weekly_schedule import WeeklySchedule
+
+        # Imported for SQLAlchemy relationship name resolution in schedule_service.
+        _ = (Menu, Patient, Reservation, ReservationColor, ReservationSeries)
 
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         Session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        tables = [
+            Practitioner.__table__,
+            Setting.__table__,
+            WeeklySchedule.__table__,
+            DateOverride.__table__,
+            PractitionerSchedule.__table__,
+            ScheduleOverride.__table__,
+            PractitionerUnavailableTime.__table__,
+        ]
 
         async def setup():
             async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+                await conn.run_sync(Base.metadata.create_all, tables=tables)
             return Session
 
         loop = asyncio.new_event_loop()
@@ -90,6 +113,21 @@ class TestBusinessHoursForDate(unittest.TestCase):
         async def _seed():
             async with Session() as db:
                 db.add(WeeklySchedule(day_of_week=day_of_week, is_open=is_open, open_time=open_time, close_time=close_time))
+                await db.commit()
+        loop.run_until_complete(_seed())
+
+    def _seed_practitioner_schedule(self, loop, Session, practitioner_id, day_of_week, is_working, start_time, end_time):
+        from app.models.practitioner_schedule import PractitionerSchedule
+
+        async def _seed():
+            async with Session() as db:
+                db.add(PractitionerSchedule(
+                    practitioner_id=practitioner_id,
+                    day_of_week=day_of_week,
+                    is_working=is_working,
+                    start_time=start_time,
+                    end_time=end_time,
+                ))
                 await db.commit()
         loop.run_until_complete(_seed())
 
@@ -244,6 +282,66 @@ class TestBusinessHoursForDate(unittest.TestCase):
                 assert bh.open_time == "10:00"
                 assert bh.close_time == "18:00"
                 assert bh.source == "fallback"
+        loop.run_until_complete(_test())
+        loop.run_until_complete(engine.dispose())
+        loop.close()
+
+    def test_holiday_custom_controls_practitioner_hours(self):
+        """祝日専用時間は通常曜日の施術者勤務時間より優先される"""
+        from app.services.schedule_service import get_practitioner_day_status
+        loop, Session, engine = self._make_db()
+        self._seed_settings(loop, Session, {
+            "holiday_mode": "custom",
+            "holiday_start_time": "09:00",
+            "holiday_end_time": "18:00",
+        })
+        self._seed_practitioner_schedule(loop, Session, 1, 1, True, "10:00", "20:00")
+
+        async def _test():
+            async with Session() as db:
+                status = await get_practitioner_day_status(db, 1, date(2026, 5, 4))
+                assert status["is_working"] is True
+                assert status["start_time"] == "09:00"
+                assert status["end_time"] == "18:00"
+                assert status["source"] == "holiday"
+        loop.run_until_complete(_test())
+        loop.run_until_complete(engine.dispose())
+        loop.close()
+
+    def test_holiday_same_as_sunday_controls_practitioner_pattern(self):
+        """祝日=日曜扱いなら施術者側も日曜パターンを使う"""
+        from app.services.schedule_service import get_practitioner_day_status
+        loop, Session, engine = self._make_db()
+        self._seed_settings(loop, Session, {"holiday_mode": "same_as_sunday"})
+        self._seed_weekly(loop, Session, 0, True, "09:00", "18:00")
+        self._seed_practitioner_schedule(loop, Session, 1, 0, False, "09:00", "18:00")
+        self._seed_practitioner_schedule(loop, Session, 1, 1, True, "10:00", "20:00")
+
+        async def _test():
+            async with Session() as db:
+                status = await get_practitioner_day_status(db, 1, date(2026, 5, 4))
+                assert status["is_working"] is False
+                assert status["source"] == "holiday_default"
+        loop.run_until_complete(_test())
+        loop.run_until_complete(engine.dispose())
+        loop.close()
+
+    def test_holiday_same_as_saturday_controls_practitioner_hours(self):
+        """祝日=土曜扱いなら施術者側も土曜勤務時間を使う"""
+        from app.services.schedule_service import get_practitioner_day_status
+        loop, Session, engine = self._make_db()
+        self._seed_settings(loop, Session, {"holiday_mode": "same_as_saturday"})
+        self._seed_weekly(loop, Session, 6, True, "09:00", "15:00")
+        self._seed_practitioner_schedule(loop, Session, 1, 6, True, "09:30", "14:30")
+        self._seed_practitioner_schedule(loop, Session, 1, 4, True, "10:00", "20:00")
+
+        async def _test():
+            async with Session() as db:
+                status = await get_practitioner_day_status(db, 1, date(2026, 1, 1))
+                assert status["is_working"] is True
+                assert status["start_time"] == "09:30"
+                assert status["end_time"] == "14:30"
+                assert status["source"] == "holiday_default"
         loop.run_until_complete(_test())
         loop.run_until_complete(engine.dispose())
         loop.close()

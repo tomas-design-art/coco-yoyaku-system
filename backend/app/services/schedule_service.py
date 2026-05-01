@@ -10,11 +10,46 @@ from app.models.practitioner_schedule import PractitionerSchedule, ScheduleOverr
 from app.models.practitioner import Practitioner
 from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
 from app.models.reservation import Reservation
-from app.models.weekly_schedule import WeeklySchedule
+from app.models.setting import Setting
 from app.services.conflict_detector import ACTIVE_STATUSES
 from app.services.business_hours import get_business_hours_for_date
+from app.utils.holidays import is_japanese_holiday
 
 logger = logging.getLogger(__name__)
+
+
+async def _get_setting(db: AsyncSession, key: str, default: str = "") -> str:
+    result = await db.execute(select(Setting).where(Setting.key == key))
+    setting = result.scalar_one_or_none()
+    return setting.value if setting else default
+
+
+async def _get_holiday_practitioner_dow(db: AsyncSession, target_date: date) -> int | None:
+    if not is_japanese_holiday(target_date):
+        return None
+
+    holiday_mode = await _get_setting(db, "holiday_mode", "closed")
+    if holiday_mode == "same_as_saturday":
+        return 6
+    if holiday_mode == "same_as_sunday":
+        return 0
+    return None
+
+
+async def _get_practitioner_schedule(
+    db: AsyncSession,
+    practitioner_id: int,
+    day_of_week: int,
+) -> PractitionerSchedule | None:
+    result = await db.execute(
+        select(PractitionerSchedule).where(
+            and_(
+                PractitionerSchedule.practitioner_id == practitioner_id,
+                PractitionerSchedule.day_of_week == day_of_week,
+            )
+        )
+    )
+    return result.scalar_one_or_none()
 
 
 async def is_practitioner_working(
@@ -40,23 +75,29 @@ async def is_practitioner_working(
     if override:
         return override.is_working, override.reason, "override"
 
-    # 2. デフォルトパターン
+    # 2. 院の個別営業日/祝日設定を優先
+    bh = await get_business_hours_for_date(db, target_date)
+    if bh.source in {"override", "holiday"}:
+        if not bh.is_open:
+            reason = bh.label or "院休業日"
+            return False, reason, bh.source
+
+        holiday_dow = await _get_holiday_practitioner_dow(db, target_date)
+        if holiday_dow is not None:
+            schedule = await _get_practitioner_schedule(db, practitioner_id, holiday_dow)
+            if schedule:
+                return schedule.is_working, None, "holiday_default"
+
+        return True, None, bh.source
+
+    # 3. デフォルトパターン
     # JS getDay(): 0=日,1=月...6=土 → DB: 0=日,1=月...6=土
     dow = target_date.isoweekday() % 7  # Mon=1..Sun=7 → Sun=0,Mon=1..Sat=6
-    result = await db.execute(
-        select(PractitionerSchedule).where(
-            and_(
-                PractitionerSchedule.practitioner_id == practitioner_id,
-                PractitionerSchedule.day_of_week == dow,
-            )
-        )
-    )
-    schedule = result.scalar_one_or_none()
+    schedule = await _get_practitioner_schedule(db, practitioner_id, dow)
     if schedule:
         return schedule.is_working, None, "default"
 
-    # 3. 個人レコードなし → 院営業スケジュールに連動（祝日・override 考慮）
-    bh = await get_business_hours_for_date(db, target_date)
+    # 4. 個人レコードなし → 院営業スケジュールに連動
     if not bh.is_open:
         reason = bh.label or "院休業日"
         return False, reason, "clinic"
@@ -77,17 +118,12 @@ async def get_practitioner_working_hours(
     if not is_working:
         return None, None
 
-    dow = target_date.isoweekday() % 7
-    if source == "default":
-        result = await db.execute(
-            select(PractitionerSchedule).where(
-                and_(
-                    PractitionerSchedule.practitioner_id == practitioner_id,
-                    PractitionerSchedule.day_of_week == dow,
-                )
-            )
-        )
-        s = result.scalar_one_or_none()
+    if source in {"default", "holiday_default"}:
+        if source == "holiday_default":
+            dow = await _get_holiday_practitioner_dow(db, target_date)
+        else:
+            dow = target_date.isoweekday() % 7
+        s = await _get_practitioner_schedule(db, practitioner_id, dow) if dow is not None else None
         if s:
             return s.start_time, s.end_time
 

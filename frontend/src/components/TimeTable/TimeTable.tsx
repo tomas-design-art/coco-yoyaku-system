@@ -249,6 +249,15 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     return weeklySchedules.find((s) => s.day_of_week === dow);
   }, [weeklySchedules]);
 
+  const isHolidayDate = useCallback((date: Date): boolean => {
+    return getBusinessHoursForDate(date)?.source === 'holiday';
+  }, [getBusinessHoursForDate]);
+
+  const getWeekDateLabel = useCallback((date: Date): string => {
+    const holidaySuffix = isHolidayDate(date) ? '祝' : '';
+    return `${date.getMonth() + 1}/${date.getDate()}(${WEEKDAY_LABELS[date.getDay()]}${holidaySuffix})`;
+  }, [isHolidayDate]);
+
   // ----- 施術者休みチェック -----
   const getPractitionerDayOff = useCallback((practitionerId: number, date: Date): PractitionerDayStatus | null => {
     const dateStr = formatDate(date);
@@ -312,15 +321,6 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     const openMin = openH * 60 + openM;
     const closeMin = closeH * 60 + closeM;
     const overlays: React.ReactNode[] = [];
-
-    // 祝日/オーバーライドでの時短営業ラベル
-    if (label && isOpen) {
-      overlays.push(
-        <div key="label" className="absolute left-0 right-0 text-center pointer-events-none" style={{ top: headerH - 2, zIndex: 13 }}>
-          <span className="text-xs text-orange-600 bg-orange-50/90 px-1 rounded">{label}</span>
-        </div>
-      );
-    }
 
     // 営業開始前
     if (openMin > dayStart) {
@@ -931,16 +931,19 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
             {/* Week columns — one per day, sub-columns per practitioner */}
             {weekDates.map((date, di) => {
               const isToday = formatDate(date) === formatDate(getTodayJST());
+              const holiday = isHolidayDate(date);
+              const holidayLabel = getBusinessHoursForDate(date)?.label || undefined;
               return (
                 <div key={`week-${di}`} className="relative" style={{ flex: 1, minWidth: weekVisiblePractitioners.length * weekPractitionerMinWidth, borderRight: '1.5px solid #1f2937' }}>
                   {/* Date + Practitioner headers — sticky top */}
                   <div className={`sticky top-0 z-[15] ${isToday ? 'bg-blue-50' : 'bg-gray-50'}`} style={{ height: WEEK_HEADER_HEIGHT }}>
                     {/* Date header */}
                     <div
-                      className={`text-center text-xs font-semibold border-b px-1 ${isToday ? 'text-blue-700' : 'text-gray-700'}`}
+                      className={`text-center text-xs font-semibold border-b px-1 ${holiday ? 'text-red-600' : isToday ? 'text-blue-700' : 'text-gray-700'}`}
                       style={{ height: 20, lineHeight: '20px' }}
+                      title={holidayLabel}
                     >
-                      {date.getMonth() + 1}/{date.getDate()}({WEEKDAY_LABELS[date.getDay()]})
+                      {getWeekDateLabel(date)}
                     </div>
                     {/* Practitioner sub-column headers */}
                     <div className="flex border-b" style={{ height: WEEK_HEADER_HEIGHT - 20 }}>
