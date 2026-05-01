@@ -123,11 +123,12 @@ async def update_default_schedules(
             raise HTTPException(status_code=400, detail="同じ曜日の勤務設定が重複しています")
         if item.is_working and item.end_time <= item.start_time:
             raise HTTPException(status_code=400, detail="終了時刻は開始時刻より後にしてください")
-        clinic_open, clinic_start, clinic_end = await _get_clinic_bounds_for_practitioner_default(db, item.day_of_week)
-        if item.is_working and not clinic_open:
-            raise HTTPException(status_code=400, detail="院が休診の日は出勤にできません")
-        if item.is_working and (item.start_time < clinic_start or item.end_time > clinic_end):
-            raise HTTPException(status_code=400, detail="勤務時間は院の営業時間内で設定してください")
+        if item.day_of_week == HOLIDAY_DAY_OF_WEEK:
+            clinic_open, clinic_start, clinic_end = await _get_clinic_bounds_for_practitioner_default(db, item.day_of_week)
+            if item.is_working and not clinic_open:
+                raise HTTPException(status_code=400, detail="院が休診の日は出勤にできません")
+            if item.is_working and (item.start_time < clinic_start or item.end_time > clinic_end):
+                raise HTTPException(status_code=400, detail="祝日の勤務時間は祝日営業時間内で設定してください")
         seen_days.add(item.day_of_week)
 
         sched = PractitionerSchedule(

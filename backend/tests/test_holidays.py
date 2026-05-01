@@ -372,6 +372,64 @@ class TestBusinessHoursForDate(unittest.TestCase):
         loop.run_until_complete(engine.dispose())
         loop.close()
 
+    def test_practitioner_default_save_validates_only_holiday_bounds(self):
+        """祝日行が範囲内なら、通常曜日の既存勤務時間で祝日保存を誤拒否しない"""
+        from app.api.practitioner_schedules import update_default_schedules
+        from app.schemas.practitioner_schedule import PractitionerScheduleBulkUpdate
+        loop, Session, engine = self._make_db()
+        self._seed_settings(loop, Session, {
+            "holiday_mode": "custom",
+            "holiday_start_time": "09:00",
+            "holiday_end_time": "18:00",
+        })
+        self._seed_weekly(loop, Session, 1, True, "10:00", "18:00")
+
+        async def _test():
+            async with Session() as db:
+                result = await update_default_schedules(
+                    1,
+                    PractitionerScheduleBulkUpdate(schedules=[
+                        {"day_of_week": 1, "is_working": True, "start_time": "08:00", "end_time": "20:00"},
+                        {"day_of_week": 7, "is_working": True, "start_time": "09:30", "end_time": "17:30"},
+                    ]),
+                    db,
+                )
+                assert len(result) == 2
+        loop.run_until_complete(_test())
+        loop.run_until_complete(engine.dispose())
+        loop.close()
+
+    def test_practitioner_default_save_rejects_holiday_outside_holiday_bounds(self):
+        """祝日行だけは祝日営業時間外なら保存を拒否する"""
+        from fastapi import HTTPException
+        from app.api.practitioner_schedules import update_default_schedules
+        from app.schemas.practitioner_schedule import PractitionerScheduleBulkUpdate
+        loop, Session, engine = self._make_db()
+        self._seed_settings(loop, Session, {
+            "holiday_mode": "custom",
+            "holiday_start_time": "09:00",
+            "holiday_end_time": "18:00",
+        })
+
+        async def _test():
+            async with Session() as db:
+                try:
+                    await update_default_schedules(
+                        1,
+                        PractitionerScheduleBulkUpdate(schedules=[
+                            {"day_of_week": 7, "is_working": True, "start_time": "08:30", "end_time": "17:30"},
+                        ]),
+                        db,
+                    )
+                except HTTPException as exc:
+                    assert exc.status_code == 400
+                    assert exc.detail == "祝日の勤務時間は祝日営業時間内で設定してください"
+                else:
+                    raise AssertionError("Expected HTTPException")
+        loop.run_until_complete(_test())
+        loop.run_until_complete(engine.dispose())
+        loop.close()
+
     def test_weekly_closed_blocks_practitioner_holiday_schedule(self):
         """定休日は職員の祝日専用勤務より優先される"""
         from app.services.schedule_service import get_practitioner_day_status
