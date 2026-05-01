@@ -398,6 +398,39 @@ class TestBusinessHoursForDate(unittest.TestCase):
         loop.run_until_complete(engine.dispose())
         loop.close()
 
+    def test_sunday_holiday_uses_sunday_practitioner_schedule_before_holiday_day_off(self):
+        """日祝は祝日OFFより日曜勤務を優先する"""
+        from app.api.practitioner_schedules import get_schedule_status
+        loop, Session, engine = self._make_db()
+        self._seed_settings(loop, Session, {
+            "holiday_mode": "custom",
+            "holiday_start_time": "09:00",
+            "holiday_end_time": "19:00",
+        })
+        self._seed_weekly(loop, Session, 0, True, "09:00", "19:00")
+        self._seed_weekly(loop, Session, 1, True, "09:00", "19:00")
+        self._seed_practitioner_schedule(loop, Session, 1, 0, True, "09:00", "19:00")
+        self._seed_practitioner_schedule(loop, Session, 1, 7, False, "09:00", "19:00")
+
+        async def _test():
+            async with Session() as db:
+                statuses = await get_schedule_status("1", "2026-05-03", "2026-05-04", db)
+                assert statuses[0]["date"] == date(2026, 5, 3)
+                assert statuses[0]["is_working"] is True
+                assert statuses[0]["source"] == "default"
+                assert statuses[0]["start_time"] == "09:00"
+                assert statuses[0]["end_time"] == "19:00"
+                assert statuses[1] == {
+                    "practitioner_id": 1,
+                    "date": date(2026, 5, 4),
+                    "is_working": False,
+                    "reason": None,
+                    "source": "holiday_schedule",
+                }
+        loop.run_until_complete(_test())
+        loop.run_until_complete(engine.dispose())
+        loop.close()
+
     def test_practitioner_default_save_validates_only_holiday_bounds(self):
         """祝日行が範囲内なら、通常曜日の既存勤務時間で祝日保存を誤拒否しない"""
         from app.api.practitioner_schedules import update_default_schedules

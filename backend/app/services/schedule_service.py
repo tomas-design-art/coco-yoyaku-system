@@ -18,6 +18,7 @@ from app.utils.holidays import is_japanese_holiday
 logger = logging.getLogger(__name__)
 
 HOLIDAY_DAY_OF_WEEK = 7
+WEEKEND_DAYS = {0, 6}
 
 
 async def _get_setting(db: AsyncSession, key: str, default: str = "") -> str:
@@ -83,7 +84,15 @@ async def is_practitioner_working(
     if override:
         return override.is_working, override.reason, "override"
 
-    # 3. 院の個別営業日/祝日設定を優先
+    dow = target_date.isoweekday() % 7  # Mon=1..Sun=7 → Sun=0,Mon=1..Sat=6
+
+    # 3. 土日祝は祝日専用設定で曜日勤務を潰さない
+    if is_japanese_holiday(target_date) and dow in WEEKEND_DAYS:
+        schedule = await _get_practitioner_schedule(db, practitioner_id, dow)
+        if schedule:
+            return schedule.is_working, None, "default"
+
+    # 4. 院の個別営業日/祝日設定を優先
     if bh.source in {"override", "holiday"}:
         if is_japanese_holiday(target_date):
             holiday_schedule = await _get_practitioner_schedule(db, practitioner_id, HOLIDAY_DAY_OF_WEEK)
@@ -109,14 +118,13 @@ async def is_practitioner_working(
             if schedule:
                 return schedule.is_working, None, "holiday_default"
 
-    # 4. デフォルトパターン
+    # 5. デフォルトパターン
     # JS getDay(): 0=日,1=月...6=土 → DB: 0=日,1=月...6=土
-    dow = target_date.isoweekday() % 7  # Mon=1..Sun=7 → Sun=0,Mon=1..Sat=6
     schedule = await _get_practitioner_schedule(db, practitioner_id, dow)
     if schedule:
         return schedule.is_working, None, "default"
 
-    # 5. 個人レコードなし → 院営業スケジュールに連動
+    # 6. 個人レコードなし → 院営業スケジュールに連動
     return True, None, "clinic"
 
 

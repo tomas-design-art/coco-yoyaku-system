@@ -19,7 +19,7 @@ import {
 import { extractErrorMessage } from '../../utils/errorUtils';
 
 const HOLIDAY_DAY_OF_WEEK = 7;
-const WEEKDAY_LABELS = ['日', '月', '火', '水', '木', '金', '土', '祝日'];
+const WEEKDAY_LABELS = ['日', '月', '火', '水', '木', '金', '土', '平日祝'];
 
 export default function PractitionerScheduleManager() {
     const [practitioners, setPractitioners] = useState<Practitioner[]>([]);
@@ -297,7 +297,7 @@ export default function PractitionerScheduleManager() {
                     {/* デフォルト出勤パターン */}
                     <div className="bg-white rounded-xl shadow p-5">
                         <h3 className="text-lg font-semibold text-gray-700 mb-4">
-                            {selectedName} — 曜日別・祝日デフォルト
+                            {selectedName} — 曜日別・平日祝デフォルト
                         </h3>
                         <div className="overflow-x-auto">
                             <table className="w-full text-sm">
