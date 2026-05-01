@@ -177,6 +177,46 @@ class TestBusinessHoursForDate(unittest.TestCase):
         loop.run_until_complete(engine.dispose())
         loop.close()
 
+    def test_weekly_closed_takes_priority_over_holiday_custom(self):
+        """定休日は祝日専用時間より優先される"""
+        from app.services.business_hours import get_business_hours_for_date
+        loop, Session, engine = self._make_db()
+        self._seed_settings(loop, Session, {
+            "holiday_mode": "custom",
+            "holiday_start_time": "09:00",
+            "holiday_end_time": "18:00",
+        })
+        self._seed_weekly(loop, Session, 1, False, "10:00", "20:00")
+
+        async def _test():
+            async with Session() as db:
+                bh = await get_business_hours_for_date(db, date(2026, 5, 4))
+                assert bh.is_open is False
+                assert bh.source == "weekly"
+        loop.run_until_complete(_test())
+        loop.run_until_complete(engine.dispose())
+        loop.close()
+
+    def test_date_override_open_takes_priority_over_weekly_closed(self):
+        """定休日でも個別の臨時営業日は営業日になる"""
+        from app.services.business_hours import get_business_hours_for_date
+        loop, Session, engine = self._make_db()
+        self._seed_settings(loop, Session, {"holiday_mode": "closed"})
+        self._seed_weekly(loop, Session, 1, False, "10:00", "20:00")
+        self._seed_override(loop, Session, date(2026, 5, 4), True, "09:00", "18:00", "臨時営業")
+
+        async def _test():
+            async with Session() as db:
+                bh = await get_business_hours_for_date(db, date(2026, 5, 4))
+                assert bh.is_open is True
+                assert bh.open_time == "09:00"
+                assert bh.close_time == "18:00"
+                assert bh.source == "override"
+                assert bh.label == "臨時営業"
+        loop.run_until_complete(_test())
+        loop.run_until_complete(engine.dispose())
+        loop.close()
+
     def test_holiday_same_as_saturday(self):
         """holiday_mode=same_as_saturday → 土曜設定を使う"""
         from app.services.business_hours import get_business_hours_for_date
@@ -304,6 +344,51 @@ class TestBusinessHoursForDate(unittest.TestCase):
                 assert status["start_time"] == "09:00"
                 assert status["end_time"] == "18:00"
                 assert status["source"] == "holiday"
+        loop.run_until_complete(_test())
+        loop.run_until_complete(engine.dispose())
+        loop.close()
+
+    def test_holiday_practitioner_schedule_takes_priority(self):
+        """職員の祝日専用勤務は祝日の通常曜日勤務より優先される"""
+        from app.services.schedule_service import get_practitioner_day_status
+        loop, Session, engine = self._make_db()
+        self._seed_settings(loop, Session, {
+            "holiday_mode": "custom",
+            "holiday_start_time": "09:00",
+            "holiday_end_time": "18:00",
+        })
+        self._seed_weekly(loop, Session, 1, True, "10:00", "20:00")
+        self._seed_practitioner_schedule(loop, Session, 1, 1, True, "10:00", "20:00")
+        self._seed_practitioner_schedule(loop, Session, 1, 7, True, "09:30", "17:30")
+
+        async def _test():
+            async with Session() as db:
+                status = await get_practitioner_day_status(db, 1, date(2026, 5, 4))
+                assert status["is_working"] is True
+                assert status["start_time"] == "09:30"
+                assert status["end_time"] == "17:30"
+                assert status["source"] == "holiday_schedule"
+        loop.run_until_complete(_test())
+        loop.run_until_complete(engine.dispose())
+        loop.close()
+
+    def test_weekly_closed_blocks_practitioner_holiday_schedule(self):
+        """定休日は職員の祝日専用勤務より優先される"""
+        from app.services.schedule_service import get_practitioner_day_status
+        loop, Session, engine = self._make_db()
+        self._seed_settings(loop, Session, {
+            "holiday_mode": "custom",
+            "holiday_start_time": "09:00",
+            "holiday_end_time": "18:00",
+        })
+        self._seed_weekly(loop, Session, 1, False, "10:00", "20:00")
+        self._seed_practitioner_schedule(loop, Session, 1, 7, True, "09:30", "17:30")
+
+        async def _test():
+            async with Session() as db:
+                status = await get_practitioner_day_status(db, 1, date(2026, 5, 4))
+                assert status["is_working"] is False
+                assert status["source"] == "weekly"
         loop.run_until_complete(_test())
         loop.run_until_complete(engine.dispose())
         loop.close()
