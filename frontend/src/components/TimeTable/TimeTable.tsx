@@ -268,6 +268,14 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     return null;
   }, [practitionerStatuses]);
 
+  const getPractitionerDayOffLabel = useCallback((dayOff: PractitionerDayStatus): string => {
+    if (dayOff.reason) return dayOff.reason;
+    if (dayOff.source === 'holiday_schedule' || dayOff.source === 'holiday_default') return '祝日休み';
+    if (dayOff.source === 'holiday') return '祝日休診';
+    if (dayOff.source === 'weekly') return '定休日';
+    return '休み';
+  }, []);
+
   // ----- 施術者の時間帯休みを取得 -----
   const getUnavailableTimesForColumn = useCallback((practitionerId: number, date: Date) => {
     const dateStr = formatDate(date);
@@ -467,18 +475,18 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
         {dayOff ? (
           /* 休みの施術者: グレーアウト＋クリック無効 */
           <div
-            className="absolute inset-0 flex items-center justify-center"
+            className="absolute inset-0 flex items-start justify-center pt-2"
             style={{
               top: headerH,
               bottom: 0,
-              zIndex: 4,
+              zIndex: 8,
               background: BLOCKED_HATCH_BG,
               backgroundColor: BLOCKED_BASE_BG,
             }}
-            title={dayOff.reason ? `休み: ${dayOff.reason}` : '休み'}
+            title={getPractitionerDayOffLabel(dayOff)}
           >
-            <span className="text-gray-500 font-bold text-xs bg-white/80 px-2 py-1 rounded shadow-sm">
-              {dayOff.reason || '休み'}
+            <span className="text-gray-600 font-bold text-[10px] bg-white/90 px-2 py-0.5 rounded shadow-sm whitespace-nowrap">
+              {getPractitionerDayOffLabel(dayOff)}
             </span>
           </div>
         ) : (
