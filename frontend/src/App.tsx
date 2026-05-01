@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { Calendar, Users, Settings, Stethoscope, Menu as MenuIcon, Volume2, VolumeX, Palette, Bot, CalendarDays, CheckCircle, Lock, Unlock, LogOut, X } from 'lucide-react';
 import TimeTable from './components/TimeTable/TimeTable';
@@ -54,6 +54,7 @@ function AppContent() {
   const location = useLocation();
   const isAdmin = role === 'admin';
   const operatorName = localStorage.getItem(OPERATOR_STORAGE_KEY) ?? '';
+  const appShellRef = useRef<HTMLDivElement>(null);
 
   const [showReservationForm, setShowReservationForm] = useState(false);
   const [showNotificationPanel, setShowNotificationPanel] = useState(false);
@@ -228,11 +229,46 @@ function AppContent() {
     setRescheduleDurationOffset(0);
   };
 
+  const exitTimeTableFullscreen = useCallback(async () => {
+    setIsTimeTableFullscreen(false);
+    if (document.fullscreenElement) {
+      try {
+        await document.exitFullscreen();
+      } catch {
+        // Browser may already be leaving fullscreen via Esc.
+      }
+    }
+  }, []);
+
+  const toggleTimeTableFullscreen = useCallback(async () => {
+    if (isTimeTableFullscreen || document.fullscreenElement) {
+      await exitTimeTableFullscreen();
+      return;
+    }
+
+    setIsTimeTableFullscreen(true);
+    try {
+      await appShellRef.current?.requestFullscreen();
+    } catch {
+      // Keep the in-app fullscreen layout even if the browser denies fullscreen.
+    }
+  }, [exitTimeTableFullscreen, isTimeTableFullscreen]);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      if (!document.fullscreenElement) {
+        setIsTimeTableFullscreen(false);
+      }
+    };
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
+  }, []);
+
   useEffect(() => {
     if (location.pathname !== '/timetable' && isTimeTableFullscreen) {
-      setIsTimeTableFullscreen(false);
+      void exitTimeTableFullscreen();
     }
-  }, [location.pathname, isTimeTableFullscreen]);
+  }, [location.pathname, isTimeTableFullscreen, exitTimeTableFullscreen]);
 
   const showAppHeader = !(location.pathname === '/timetable' && isTimeTableFullscreen);
 
@@ -243,7 +279,10 @@ function AppContent() {
   };
 
   return (
-    <div className="flex flex-col h-screen">
+    <div
+      ref={appShellRef}
+      className={`flex flex-col h-screen bg-gray-50 ${isTimeTableFullscreen ? 'fixed inset-0 z-[9999] overflow-hidden' : ''}`}
+    >
       {/* Header */}
       {showAppHeader && (
         <header className="bg-white shadow-sm border-b z-20">
@@ -313,7 +352,7 @@ function AppContent() {
       )}
 
       {/* Main */}
-      <main className="flex-1 overflow-auto bg-gray-50">
+      <main className={`flex-1 bg-gray-50 ${isTimeTableFullscreen ? 'overflow-hidden' : 'overflow-auto'}`}>
         <Routes>
           <Route path="/timetable" element={
             <TimeTable
@@ -332,7 +371,7 @@ function AppContent() {
               rescheduleDurationOffset={rescheduleDurationOffset}
               onRescheduleDurationChange={(delta) => setRescheduleDurationOffset(prev => prev + delta)}
               isFullscreenMode={isTimeTableFullscreen}
-              onToggleFullscreen={() => setIsTimeTableFullscreen((prev) => !prev)}
+              onToggleFullscreen={toggleTimeTableFullscreen}
               fullscreenRightControls={isTimeTableFullscreen ? (
                 <>
                   <NotificationBell
@@ -340,7 +379,7 @@ function AppContent() {
                     onClick={() => { setShowNotificationPanel(!showNotificationPanel); clearUnread(); }}
                   />
                   <button
-                    onClick={() => setIsTimeTableFullscreen(false)}
+                    onClick={() => { void exitTimeTableFullscreen(); }}
                     className="p-1.5 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded"
                     title="全画面表示を終了"
                   >
@@ -364,6 +403,17 @@ function AppContent() {
           <Route path="*" element={<Navigate to="/timetable" replace />} />
         </Routes>
       </main>
+
+      {location.pathname === '/timetable' && isTimeTableFullscreen && (
+        <button
+          type="button"
+          onClick={() => { void exitTimeTableFullscreen(); }}
+          className="fixed top-2 left-1/2 z-[10000] flex h-8 w-8 -translate-x-1/2 items-center justify-center rounded-full bg-white/90 text-gray-600 shadow border border-gray-200 hover:bg-white hover:text-gray-900"
+          title="全画面表示を終了"
+        >
+          <X size={16} />
+        </button>
+      )}
 
       {/* Modals */}
       <ReservationForm
