@@ -292,6 +292,116 @@ def test_shadow_rule_parse_evening_followup_extracts_time():
     assert parsed["date"] is None
 
 
+@pytest.mark.asyncio
+async def test_shadow_timetable_patient_uses_shadow_alias_without_line_id():
+    from app.api.line import _get_or_create_shadow_timetable_patient
+
+    state = SimpleNamespace(context_data={})
+    state_result = Mock()
+    state_result.scalar_one_or_none.return_value = state
+    existing_scalar = Mock()
+    existing_scalar.all.return_value = [SimpleNamespace(name="シャドー1"), SimpleNamespace(name="シャドー3")]
+    existing_result = Mock()
+    existing_result.scalars.return_value = existing_scalar
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[state_result, existing_result])
+    db.flush = AsyncMock()
+    created = SimpleNamespace(id=44, name="シャドー4")
+
+    with patch("app.api.line.create_new_patient", new=AsyncMock(return_value=created)) as mock_create:
+        patient = await _get_or_create_shadow_timetable_patient(db, "U-real-user")
+
+    assert patient.name == "シャドー4"
+    assert state.context_data["shadow_patient_id"] == 44
+    assert state.context_data["shadow_patient_name"] == "シャドー4"
+    mock_create.assert_awaited_once()
+    assert mock_create.await_args.kwargs["name"] == "シャドー4"
+    assert mock_create.await_args.kwargs["line_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_shadow_approve_registers_dummy_patient_and_does_not_push_customer():
+    from app.api.line import _handle_postback
+
+    start = datetime(2026, 5, 3, 15, 0).astimezone()
+    end = start + timedelta(minutes=60)
+    req = {
+        "user_id": "U-real-customer",
+        "customer_name": "実名患者",
+        "available": True,
+        "practitioner_id": 7,
+        "menu_id": None,
+        "start_time_iso": start.isoformat(),
+        "end_time_iso": end.isoformat(),
+        "duration_minutes": 60,
+    }
+    dummy_patient = SimpleNamespace(id=88, name="シャドー2")
+    db = AsyncMock()
+
+    with patch("app.api.line.get_request", new=AsyncMock(return_value=req)), patch(
+        "app.api.line._get_or_create_shadow_timetable_patient", new=AsyncMock(return_value=dummy_patient)
+    ) as mock_dummy, patch(
+        "app.api.line.create_reservation", new=AsyncMock(return_value={"id": 123, "status": "CONFIRMED"})
+    ) as mock_create, patch("app.api.line.update_request", new=AsyncMock()), patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ), patch("app.api.line.push_message", new=AsyncMock()) as mock_push, patch(
+        "app.api.line.reply_to_line", new=AsyncMock()
+    ), patch("app.api.line.settings.line_admin_user_id", "U-admin"):
+        await _handle_postback(
+            {"replyToken": "staff-reply", "postback": {"data": "action=shadow_approve&rid=rid123&uid=U-real-customer"}},
+            db,
+        )
+
+    mock_dummy.assert_awaited_once_with(db, "U-real-customer")
+    reservation_data = mock_create.await_args.args[1]
+    assert reservation_data.patient_id == 88
+    assert "dummy_patient=シャドー2" in reservation_data.notes
+    pushed_targets = [call.args[0] for call in mock_push.await_args_list]
+    assert pushed_targets == ["U-admin"]
+
+
+@pytest.mark.asyncio
+async def test_shadow_alt_registers_dummy_patient_and_does_not_push_customer():
+    from app.api.line import _handle_postback
+
+    req = {
+        "user_id": "U-real-customer",
+        "customer_name": "実名患者",
+        "menu_id": None,
+        "alternatives": [
+            {
+                "date": "2026-05-03",
+                "start": "16:00",
+                "end": "17:00",
+                "practitioner_id": 9,
+                "practitioner_name": "施術者A",
+            }
+        ],
+    }
+    dummy_patient = SimpleNamespace(id=89, name="シャドー3")
+    db = AsyncMock()
+
+    with patch("app.api.line.get_request", new=AsyncMock(return_value=req)), patch(
+        "app.api.line._get_or_create_shadow_timetable_patient", new=AsyncMock(return_value=dummy_patient)
+    ), patch(
+        "app.api.line.create_reservation", new=AsyncMock(return_value={"id": 124, "status": "CONFIRMED"})
+    ) as mock_create, patch("app.api.line.update_request", new=AsyncMock()), patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ), patch("app.api.line.push_message", new=AsyncMock()) as mock_push, patch(
+        "app.api.line.reply_to_line", new=AsyncMock()
+    ), patch("app.api.line.settings.line_admin_user_id", "U-admin"):
+        await _handle_postback(
+            {"replyToken": "staff-reply", "postback": {"data": "action=shadow_alt&rid=rid123&alt=1&uid=U-real-customer"}},
+            db,
+        )
+
+    reservation_data = mock_create.await_args.args[1]
+    assert reservation_data.patient_id == 89
+    assert "dummy_patient=シャドー3" in reservation_data.notes
+    pushed_targets = [call.args[0] for call in mock_push.await_args_list]
+    assert pushed_targets == ["U-admin"]
+
+
 def test_mirror_display_name_includes_environment_label():
     from app.api.line import _mirror_display_name
 
