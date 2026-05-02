@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 from unittest.mock import AsyncMock, patch
-from datetime import datetime
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -190,6 +191,105 @@ def test_line_mirror_requires_all_config_values():
         "app.api.line.settings.line_mirror_url", "https://staging.example/api/line/mirror-webhook"
     ), patch("app.api.line.settings.line_mirror_shared_secret", "secret"):
         assert _line_mirror_is_configured() is False
+
+
+def test_shadow_rule_parse_change_keeps_desired_date_separate_from_current_reservation():
+    from app.services.shadow_service import _rule_based_shadow_parse
+
+    msg = (
+        "おはようございます。佐々木です。\n"
+        "予約の変更をお願いできますでしょうか？\n"
+        "5/2（土）13時に予約を入れて頂いています。\n"
+        "翌日5/3（日）はやっていますか？"
+    )
+
+    parsed = _rule_based_shadow_parse(msg)
+
+    assert parsed["intent"] == "変更"
+    assert parsed["name"] == "佐々木"
+    assert parsed["current_date"] == "2026-05-02"
+    assert parsed["current_time"] == "13:00"
+    assert parsed["date"] == "2026-05-03"
+    assert parsed["time"] is None
+
+
+@pytest.mark.asyncio
+async def test_shadow_existing_reservation_reference_matches_board_by_name_and_time():
+    from app.services.shadow_service import _find_existing_reservation_by_reference
+    from app.utils.datetime_jst import JST
+
+    patient = SimpleNamespace(id=10, name="佐々木泉美", last_name="佐々木", first_name="泉美")
+    practitioner = SimpleNamespace(id=2, name="施術者A")
+    menu = SimpleNamespace(id=3, name="保険診療")
+    start = datetime(2026, 5, 2, 13, 0, tzinfo=JST)
+    reservation = SimpleNamespace(
+        id=99,
+        patient=patient,
+        practitioner=practitioner,
+        menu=menu,
+        start_time=start,
+        end_time=start + timedelta(minutes=60),
+    )
+
+    scalar_result = Mock()
+    scalar_result.all.return_value = [reservation]
+    execute_result = Mock()
+    execute_result.scalars.return_value = scalar_result
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=execute_result)
+
+    matched = await _find_existing_reservation_by_reference(
+        db,
+        patient_name="佐々木",
+        current_date="2026-05-02",
+        current_time="13:00",
+    )
+
+    assert matched["existing_reservation_id"] == 99
+    assert matched["customer_name"] == "佐々木泉美"
+    assert matched["practitioner_id"] == 2
+    assert matched["practitioner_name"] == "施術者A"
+    assert matched["duration_minutes"] == 60
+    assert matched["menu_id"] == 3
+    assert matched["menu_name"] == "保険診療"
+
+
+def test_shadow_rule_parse_followup_time_can_complete_existing_change_draft():
+    from app.services.shadow_service import _rule_based_shadow_parse
+
+    parsed = _rule_based_shadow_parse("15時〜は大丈夫ですか？")
+
+    assert parsed["time"] == "15:00"
+    assert parsed["date"] is None
+
+
+def test_shadow_manual_without_request_can_restart_on_clear_new_reservation_text():
+    from app.services.shadow_service import _should_restart_shadow_from_manual
+
+    msg = "本日空いていますでしょうか。\n腰に加え、先日話した肩首まわりがまだ痛くて..."
+
+    assert _should_restart_shadow_from_manual(msg, {"mode": "manual", "request_id": None, "draft": {}}) is True
+    assert _should_restart_shadow_from_manual(msg, {"mode": "manual", "request_id": "rid123", "draft": {}}) is False
+
+
+def test_shadow_normalize_keeps_availability_with_symptoms_as_reservation_request():
+    from app.services.shadow_service import _normalize_analysis
+
+    msg = "本日空いていますでしょうか。\n腰に加え、先日話した肩首まわりがまだ痛くて..."
+
+    parsed = _normalize_analysis({"intent": "相談", "date": None, "time": None}, msg)
+
+    assert parsed["intent"] == "予約希望"
+    assert parsed["date"] is not None
+
+
+def test_shadow_rule_parse_evening_followup_extracts_time():
+    from app.services.shadow_service import _rule_based_shadow_parse
+
+    parsed = _rule_based_shadow_parse("夕方頃希望です。")
+
+    assert parsed["time"] == "17:00"
+    assert parsed["date"] is None
 
 
 def test_mirror_display_name_includes_environment_label():
