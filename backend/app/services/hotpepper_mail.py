@@ -286,12 +286,13 @@ async def process_hotpepper_email(db: AsyncSession, email_body: str) -> dict:
         missing = _validate_required_for_reflection(parsed)
 
         # AI監査 + 必要時補完
-        try:
-            ai_result = await ai_review_hotpepper_required(email_body, parsed)
-            parsed = _apply_ai_patch(parsed, ai_result)
-            missing = _validate_required_for_reflection(parsed)
-        except Exception as ai_err:
-            logger.warning("HotPepper AI監査はスキップ/失敗: %s", ai_err)
+        if missing:
+            try:
+                ai_result = await ai_review_hotpepper_required(email_body, parsed)
+                parsed = _apply_ai_patch(parsed, ai_result)
+                missing = _validate_required_for_reflection(parsed)
+            except Exception as ai_err:
+                logger.warning("HotPepper AI監査はスキップ/失敗: %s", ai_err)
 
         if missing:
             msg = "ホットペッパー予約者のシステム反映がされていません。予約情報が取得できませんでした"
