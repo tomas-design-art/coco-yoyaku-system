@@ -171,6 +171,22 @@ async def test_line_parser_extracts_name_menu_datetime_from_natural_japanese():
     assert parsed["time"] == "10:00"
 
 
+def test_line_parser_resolves_morning_and_next_sunday_in_real_time():
+    from app.agents.line_parser import _extract_date_time
+    from app.utils.datetime_jst import now_jst
+
+    tomorrow = now_jst().date() + timedelta(days=1)
+    next_sunday_days = (6 - now_jst().weekday()) % 7 or 7
+    next_sunday = now_jst().date() + timedelta(days=next_sunday_days)
+
+    tomorrow_date, tomorrow_time = _extract_date_time("明日の午前中空いてますか？")
+    sunday_date, _ = _extract_date_time("次の日曜日に予約したい")
+
+    assert tomorrow_date == tomorrow.isoformat()
+    assert tomorrow_time == "10:00"
+    assert sunday_date == next_sunday.isoformat()
+
+
 def test_missing_info_message_contains_required_labels():
     from app.api.line import _build_missing_info_message
 
@@ -579,6 +595,40 @@ async def test_autopilot_rich_menu_trigger_restarts_booking_instead_of_manual_mo
     assert mock_set_mode.await_args.args[2] == "waiting_menu"
     mock_reply.assert_awaited_once()
     assert "ご希望メニュー" in mock_reply.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_autopilot_natural_booking_message_restarts_from_manual_mode():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "明日の午前中空いてますか？"},
+    }
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state", new=AsyncMock(return_value={"mode": "manual", "draft": {}, "request_id": None})
+    ), patch("app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")), patch(
+        "app.api.line._find_line_patient", new=AsyncMock(return_value=patient)
+    ), patch("app.api.line.create_notification", new=AsyncMock()), patch(
+        "app.api.line.clear_user_draft", new=AsyncMock()
+    ), patch("app.api.line.set_user_mode", new=AsyncMock()), patch(
+        "app.api.line.get_user_mode", new=AsyncMock(return_value="manual")
+    ), patch("app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)), patch(
+        "app.api.line.parse_line_message",
+        new=AsyncMock(return_value={"has_reservation_intent": True, "date": "2026-08-13", "time": "10:00", "menu_name": None}),
+    ), patch(
+        "app.api.line.merge_user_draft", new=AsyncMock(return_value={"date": "2026-08-13", "time": "10:00"})
+    ), patch(
+        "app.api.line._get_patient_default_preset",
+        new=AsyncMock(return_value={"menu_name": "マッスルセラピー", "duration_minutes": 60, "practitioner_name": "時田"}),
+    ), patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+        await _handle_text_message(event, db)
+
+    assert "いつものマッスルセラピー 60分" in mock_reply.await_args.args[1]
 
 
 @pytest.mark.asyncio

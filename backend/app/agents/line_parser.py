@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 LINE_PARSE_PROMPT = """
 あなたは接骨院予約の情報抽出器です。以下のLINEメッセージから予約情報を抽出してください。
+今日の日付は {today}（{weekday}曜日）です。
 
 必ずJSONのみで返してください。説明文は禁止。
 
@@ -27,6 +28,11 @@ LINE_PARSE_PROMPT = """
 - summary: メッセージの要約
 
 JSON形式で返してください。
+
+日時解釈ルール:
+- 朝=09:00、午前/午前中=10:00、昼=12:00、午後=14:00、夕方=17:00、夜=19:00
+- 「明日」「明後日」「次の日曜日」「来週火曜日」などは、今日の日付を基準に未来の日付へ解決する
+- 「次のX曜日」は、直近の次のX曜日とする。今日がX曜日なら7日後とする
 
 メッセージ:
 {message}
@@ -127,6 +133,20 @@ def _extract_date_time(message: str) -> tuple[str | None, str | None]:
         yy = now.year + (1 if mm < now.month else 0)
         date_val = f"{yy:04d}-{mm:02d}-{dd:02d}"
 
+    # 曜日表現: 来週/次の/今週/単独のX曜日
+    if not date_val:
+        weekday_map = {"月": 0, "火": 1, "水": 2, "木": 3, "金": 4, "土": 5, "日": 6}
+        weekday_match = re.search(r"(?:(来週|次の|今週)\s*)?([月火水木金土日])曜(?:日)?", message)
+        if weekday_match:
+            qualifier, weekday_char = weekday_match.groups()
+            target_weekday = weekday_map[weekday_char]
+            days_ahead = (target_weekday - now.weekday()) % 7
+            if qualifier == "来週":
+                days_ahead += 7
+            elif qualifier in {"次の", None} and days_ahead == 0:
+                days_ahead = 7
+            date_val = (now.date() + timedelta(days=days_ahead)).isoformat()
+
     # 時刻 10時, 10:30, 10時半
     m2 = re.search(r"(\d{1,2})\s*[時:：]\s*(\d{1,2})", message)
     if m2:
@@ -144,6 +164,20 @@ def _extract_date_time(message: str) -> tuple[str | None, str | None]:
                 hh = int(m4.group(1))
                 time_val = f"{hh:02d}:00"
 
+    if not time_val:
+        if "午前中" in message or "午前" in message:
+            time_val = "10:00"
+        elif "お昼" in message or re.search(r"(?<!\d)昼(?!食)", message):
+            time_val = "12:00"
+        elif "午後" in message:
+            time_val = "14:00"
+        elif "夕方" in message:
+            time_val = "17:00"
+        elif "夜" in message or "晩" in message:
+            time_val = "19:00"
+        elif re.search(r"(?<!深)朝(?!ご飯)", message):
+            time_val = "09:00"
+
     return date_val, time_val
 
 
@@ -156,7 +190,7 @@ async def parse_line_message(message: str, profile_name: str | None = None, prev
     """LINEメッセージを解析して予約意図を判定"""
     # ルールベース優先 + 前回文脈補完
     result = _rule_based_parse(message, profile_name=profile_name, previous=previous)
-    if result.get("has_reservation_intent"):
+    if result.get("has_reservation_intent") and result.get("date") and result.get("time"):
         result["missing_fields"] = _compute_missing_fields(result)
         return result
 
@@ -169,7 +203,10 @@ async def parse_line_message(message: str, profile_name: str | None = None, prev
         if not ai_result.get("customer_name"):
             ai_result["customer_name"] = _normalize_name(profile_name)
         ai_result["missing_fields"] = _compute_missing_fields(ai_result)
-        return ai_result
+        if ai_result.get("has_reservation_intent"):
+            return ai_result
+        result["missing_fields"] = _compute_missing_fields(result)
+        return result
     except Exception as e:
         logger.error(f"AI parse failed: {e}")
         fallback = _rule_based_parse(message, profile_name=profile_name, previous=previous)
@@ -218,7 +255,11 @@ async def _ai_parse(message: str) -> dict:
                     "role": "user",
                     "parts": [
                         {"text": "You are a helpful assistant. Respond with JSON only.\n\n"
-                                 + LINE_PARSE_PROMPT.format(message=message)}
+                                 + LINE_PARSE_PROMPT.format(
+                                     message=message,
+                                     today=now_jst().date().isoformat(),
+                                     weekday=["月", "火", "水", "木", "金", "土", "日"][now_jst().weekday()],
+                                 )}
                     ],
                 }
             ],

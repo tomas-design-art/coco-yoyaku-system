@@ -626,6 +626,17 @@ def _is_booking_or_change_menu_trigger(text: str) -> bool:
     return (text or "").strip().replace("／", "/") in {"予約/変更", "予約", "変更"}
 
 
+def _looks_like_autopilot_booking_message(text: str) -> bool:
+    normalized = (text or "").strip()
+    return any(
+        token in normalized
+        for token in (
+            "予約", "よやく", "空き", "あき", "取りたい", "お願い", "いつもの",
+            "今日", "明日", "明後日", "午前", "午後", "夕方", "夜", "朝", "曜日",
+        )
+    )
+
+
 def _is_affirmative(text: str) -> bool:
     return (text or "").strip() in {"はい", "お願いします", "それでお願いします", "それで"}
 
@@ -827,10 +838,15 @@ async def _handle_text_message(event: dict, db: AsyncSession):
 
     # 管理者が「自分で返信」を選択したユーザーは自動返信停止
     if await get_user_mode(db, user_id) == "manual":
-        await create_notification(db, "line_manual_mode", f"手動対応中ユーザーから受信: {text[:80]}")
-        if reply_token:
-            await reply_to_line(reply_token, "担当者が内容を確認中です。しばらくお待ちください。")
-        return
+        if is_autopilot_patient and _looks_like_autopilot_booking_message(text):
+            await clear_user_draft(db, user_id)
+            await set_user_mode(db, user_id, "idle")
+            user_state = {**user_state, "mode": "idle", "draft": {}, "request_id": None}
+        else:
+            await create_notification(db, "line_manual_mode", f"手動対応中ユーザーから受信: {text[:80]}")
+            if reply_token:
+                await reply_to_line(reply_token, "担当者が内容を確認中です。しばらくお待ちください。")
+            return
 
     if user_state is None:
         user_state = await get_user_state(db, user_id)
@@ -843,6 +859,31 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     current_mode = user_state.get("mode")
     latest_reservation = await _get_latest_reservation_for_line_user(db, user_id)
     merged: dict | None = None
+
+    if is_autopilot_patient and "いつもの" in text and current_mode not in {
+        "waiting_menu", "waiting_datetime", "waiting_time_duration", "autopilot_confirm_usual",
+    }:
+        preset = await _get_patient_default_preset(db, line_patient)
+        if preset:
+            usual_draft = {
+                "customer_name": line_patient.name,
+                "menu_id": preset["menu_id"],
+                "menu_name": preset["menu_name"],
+                "duration_minutes": preset["duration_minutes"],
+            }
+            if preset.get("practitioner_id"):
+                usual_draft["practitioner_id"] = preset["practitioner_id"]
+                usual_draft["practitioner_name"] = preset["practitioner_name"]
+            await merge_user_draft(db, user_id, usual_draft)
+            await set_user_mode(db, user_id, "waiting_datetime")
+            if reply_token:
+                await reply_to_line(
+                    reply_token,
+                    f"いつもの{preset['menu_name']} {preset['duration_minutes']}分"
+                    f"{'・担当: ' + preset['practitioner_name'] if preset.get('practitioner_name') else ''}で承ります。"
+                    "ご希望日時を教えてくださいね。\n例: 明日 午前中",
+                )
+            return
 
     if is_autopilot_patient and current_mode == "adjusting":
         request_id = user_state.get("request_id")
