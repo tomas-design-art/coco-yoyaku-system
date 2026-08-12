@@ -633,17 +633,91 @@ def _looks_like_autopilot_booking_message(text: str) -> bool:
         for token in (
             "予約", "よやく", "空き", "あき", "取りたい", "お願い", "いつもの",
             "今日", "明日", "明後日", "午前", "午後", "夕方", "夜", "朝", "曜日",
+            "キャンセル", "取消", "変更", "変え", "ずら", "リスケ",
+            "cancel", "reschedule", "change", "appointment",
         )
     )
 
 
+def _normalize_confirmation_text(text: str) -> str:
+    return re.sub(r"[\s\u3000,，!！?？。､、…]+", "", (text or "").lower())
+
+
 def _is_affirmative(text: str) -> bool:
-    return (text or "").strip() in {"はい", "お願いします", "それでお願いします", "それで"}
+    normalized = _normalize_confirmation_text(text)
+    return normalized in {
+        "はい", "うん", "うんうん", "ええ", "取消", "cancel", "ok", "okay", "yes", "yesplease", "y", "yep", "yeah",
+        "sure", "please", "si", "oui", "네", "예", "응", "お願いします", "それでお願いします", "それで",
+    }
+
+
+def _is_negative(text: str) -> bool:
+    normalized = _normalize_confirmation_text(text)
+    return normalized in {"いいえ", "いや", "やめる", "戻る", "ちがう", "違う", "no", "n", "nope"}
+
+
+def _extract_alternative_choice(text: str, count: int) -> int | None:
+    normalized = _normalize_confirmation_text(text)
+    match = re.search(r"(?:^|\D)([1-9])(?:番)?(?:を)?(?:で|に|お願いします|お願い)?$", normalized)
+    if not match:
+        return None
+    choice = int(match.group(1))
+    return choice if 1 <= choice <= count else None
+
+
+def _has_cancellation_intent(text: str) -> bool:
+    return bool(re.search(r"キャンセル|取り消|取消|やめたい|cancel|annul|cancelar|취소", text or "", re.IGNORECASE))
+
+
+def _has_change_intent(text: str) -> bool:
+    return bool(re.search(r"変更|変え|ずら|リスケ|reschedule|change|move|改期|更改|변경", text or "", re.IGNORECASE))
 
 
 def _format_usual_confirmation(preset: dict) -> str:
     practitioner = f"・担当: {preset['practitioner_name']}" if preset.get("practitioner_name") else ""
     return f"いつもの{preset['menu_name']} {preset['duration_minutes']}分{practitioner}でよろしいですか？\nはい / いいえ"
+
+
+async def _complete_autopilot_reschedule(
+    db: AsyncSession,
+    *,
+    reservation: Reservation,
+    desired_date: str,
+    desired_time: str,
+    user_id: str,
+    reply_token: str | None,
+) -> bool:
+    """既存予約の変更を実行し、失敗時は日時入力待ちを維持する。"""
+    try:
+        target_date = date.fromisoformat(desired_date)
+        target_time = time.fromisoformat(desired_time)
+        duration = int((reservation.end_time - reservation.start_time).total_seconds() // 60)
+        practitioner, start_dt, end_dt, _, _ = await find_best_practitioner(
+            db, target_date, target_time, duration
+        )
+        if not practitioner:
+            raise HTTPException(status_code=409, detail="変更先に空き枠がありません")
+        await reschedule_reservation(
+            db,
+            reservation.id,
+            start_dt,
+            end_dt,
+            practitioner.id,
+        )
+    except (HTTPException, ValueError):
+        await set_user_mode(db, user_id, "autopilot_change_datetime")
+        if reply_token:
+            await reply_to_line(reply_token, "ご希望の枠はご案内できませんでした。別のご希望日時を教えてください。\n例: 明日の午後3時")
+        return False
+
+    await clear_user_draft(db, user_id)
+    await set_user_mode(db, user_id, "idle")
+    if reply_token:
+        await reply_to_line(
+            reply_token,
+            f"ご予約を変更しました。\n{start_dt.strftime('%Y/%m/%d %H:%M')}〜{end_dt.strftime('%H:%M')}\nご来院をお待ちしております。",
+        )
+    return True
 
 
 async def _handle_autopilot_setup_message(
@@ -889,8 +963,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         request_id = user_state.get("request_id")
         request_data = await get_request(db, request_id, line_user_id=user_id) if request_id else None
         alternatives = request_data.get("alternatives") if request_data else None
-        if alternatives and text.strip().isdigit():
-            alternative_index = int(text.strip()) - 1
+        selected_choice = _extract_alternative_choice(text, len(alternatives)) if alternatives else None
+        if alternatives and selected_choice is not None:
+            alternative_index = selected_choice - 1
             if 0 <= alternative_index < len(alternatives):
                 alternative = alternatives[alternative_index]
                 try:
@@ -934,7 +1009,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
 
     if is_autopilot_patient and current_mode == "autopilot_cancel_confirm":
         reservation_id = prev_draft.get("autopilot_cancel_reservation_id")
-        if text.strip() in {"はい", "キャンセル", "取消"} and reservation_id:
+        if _is_affirmative(text) and reservation_id:
             try:
                 await transition_status(db, int(reservation_id), "CANCELLED")
                 await db.commit()
@@ -946,7 +1021,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             if reply_token:
                 await reply_to_line(reply_token, "ご予約をキャンセルしました。")
             return
-        if text.strip() in {"いいえ", "やめる", "戻る"}:
+        if _is_negative(text):
             await clear_user_draft(db, user_id)
             await set_user_mode(db, user_id, "idle")
             if reply_token:
@@ -954,6 +1029,30 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             return
         if reply_token:
             await reply_to_line(reply_token, "キャンセルする場合は「はい」、取りやめる場合は「いいえ」と返信してください。")
+        return
+
+    if is_autopilot_patient and current_mode == "autopilot_change_datetime":
+        reservation_id = prev_draft.get("autopilot_change_reservation_id")
+        reservation = await db.get(Reservation, int(reservation_id)) if reservation_id else None
+        parsed = await parse_line_message(text, profile_name=display_name, previous=prev_draft)
+        if not reservation:
+            await clear_user_draft(db, user_id)
+            await set_user_mode(db, user_id, "idle")
+            if reply_token:
+                await reply_to_line(reply_token, "変更する予約を確認できませんでした。あらためて「予約変更したい」と送ってください。")
+            return
+        if not parsed.get("date") or not parsed.get("time"):
+            if reply_token:
+                await reply_to_line(reply_token, "変更後の日時を教えてください。\n例: 明日の午後3時 / Next Friday at 3 PM")
+            return
+        await _complete_autopilot_reschedule(
+            db,
+            reservation=reservation,
+            desired_date=parsed["date"],
+            desired_time=parsed["time"],
+            user_id=user_id,
+            reply_token=reply_token,
+        )
         return
 
     if is_autopilot_patient and current_mode == "autopilot_confirm_usual":
@@ -991,7 +1090,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         await create_notification(db, "line_manual_mode", f"LINE手動対応: {line_patient.id}")
         return
 
-    if is_autopilot_patient and any(word in text for word in ("キャンセル", "取消", "取り消")):
+    if is_autopilot_patient and _has_cancellation_intent(text):
         reservation = await _find_single_upcoming_reservation(db, line_patient.id)
         if not reservation:
             await set_user_mode(db, user_id, "manual")
@@ -1006,45 +1105,28 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             )
         return
 
-    if is_autopilot_patient and any(word in text for word in ("変更", "変え", "ずら", "リスケ")):
+    if is_autopilot_patient and _has_change_intent(text):
         reservation = await _find_single_upcoming_reservation(db, line_patient.id)
         if not reservation:
             await set_user_mode(db, user_id, "manual")
             await create_notification(db, "line_manual_mode", f"LINE変更要確認: {line_patient.id}")
             return
-        from app.services.shadow_service import _extract_date_time_rule
-
-        desired_date, desired_time = _extract_date_time_rule(text)
+        parsed_change = await parse_line_message(text, profile_name=display_name, previous=prev_draft)
+        desired_date, desired_time = parsed_change.get("date"), parsed_change.get("time")
         if not desired_date or not desired_time:
-            await set_user_mode(db, user_id, "manual")
-            await create_notification(db, "line_manual_mode", f"LINE変更日時要確認: {line_patient.id}")
+            await merge_user_draft(db, user_id, {"autopilot_change_reservation_id": reservation.id})
+            await set_user_mode(db, user_id, "autopilot_change_datetime")
+            if reply_token:
+                await reply_to_line(reply_token, "変更後の日時を教えてください。\n例: 明日の午後3時 / Next Friday at 3 PM")
             return
-        try:
-            target_date = date.fromisoformat(desired_date)
-            target_time = time.fromisoformat(desired_time)
-            duration = int((reservation.end_time - reservation.start_time).total_seconds() // 60)
-            practitioner, start_dt, end_dt, _, _ = await find_best_practitioner(
-                db, target_date, target_time, duration
-            )
-            if not practitioner:
-                raise HTTPException(status_code=409, detail="変更先に空き枠がありません")
-            await reschedule_reservation(
-                db,
-                reservation.id,
-                start_dt,
-                end_dt,
-                practitioner.id,
-            )
-        except (HTTPException, ValueError):
-            await set_user_mode(db, user_id, "manual")
-            await create_notification(db, "line_manual_mode", f"LINE変更枠要確認: {line_patient.id}")
-            return
-        await set_user_mode(db, user_id, "idle")
-        if reply_token:
-            await reply_to_line(
-                reply_token,
-                f"ご予約を変更しました。\n{start_dt.strftime('%Y/%m/%d %H:%M')}〜{end_dt.strftime('%H:%M')}\nご来院をお待ちしております。",
-            )
+        await _complete_autopilot_reschedule(
+            db,
+            reservation=reservation,
+            desired_date=desired_date,
+            desired_time=desired_time,
+            user_id=user_id,
+            reply_token=reply_token,
+        )
         return
 
     if not line_patient and current_mode not in {"awaiting_name", "awaiting_existing_confirmation", "awaiting_identity_token"}:

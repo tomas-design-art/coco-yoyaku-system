@@ -351,7 +351,13 @@ def _extract_time_mentions_rule(text: str) -> list[dict]:
 
 def _looks_like_current_reservation_reference(text: str, mention: dict) -> bool:
     around = text[max(0, mention["start"] - 16): mention["end"] + 28]
-    return bool(re.search(r"予約|入れて|入って|いただいて|頂いて|現在|今の|元の", around))
+    return bool(
+        re.search(
+            r"予約(?:を|が)?(?:入れて|入って|あります|してあります|済み)|"
+            r"(?:現在|今|元)の予約|いただいて",
+            around,
+        )
+    )
 
 
 def _extract_change_fields_rule(text: str) -> dict:

@@ -222,6 +222,9 @@ def test_line_mirror_requires_all_config_values():
 
 def test_shadow_rule_parse_change_keeps_desired_date_separate_from_current_reservation():
     from app.services.shadow_service import _rule_based_shadow_parse
+    from app.utils.datetime_jst import now_jst
+
+    current_year = now_jst().year
 
     msg = (
         "おはようございます。佐々木です。\n"
@@ -234,9 +237,9 @@ def test_shadow_rule_parse_change_keeps_desired_date_separate_from_current_reser
 
     assert parsed["intent"] == "変更"
     assert parsed["name"] == "佐々木"
-    assert parsed["current_date"] == "2026-05-02"
+    assert parsed["current_date"] == f"{current_year + 1 if now_jst().month > 5 else current_year}-05-02"
     assert parsed["current_time"] == "13:00"
-    assert parsed["date"] == "2026-05-03"
+    assert parsed["date"] == f"{current_year + 1 if now_jst().month > 5 else current_year}-05-03"
     assert parsed["time"] is None
 
 
@@ -491,7 +494,7 @@ def test_autopilot_setup_extracts_name_phone_and_reading_birth_date():
 
 
 def test_autopilot_usual_confirmation_uses_patient_default_menu_duration_and_practitioner():
-    from app.api.line import _format_usual_confirmation, _is_affirmative
+    from app.api.line import _extract_alternative_choice, _format_usual_confirmation, _is_affirmative, _is_negative
 
     text = _format_usual_confirmation(
         {
@@ -505,7 +508,77 @@ def test_autopilot_usual_confirmation_uses_patient_default_menu_duration_and_pra
     assert "担当: 時田" in text
     assert _is_affirmative("はい") is True
     assert _is_affirmative("それでお願いします") is True
+    assert _is_affirmative("うん！") is True
+    assert _is_affirmative("Yes, please") is True
+    assert _is_affirmative("cancel") is True
     assert _is_affirmative("いいえ") is False
+    assert _is_negative("いや") is True
+    assert _extract_alternative_choice("じゃあ2で！", 3) == 2
+    assert _extract_alternative_choice("3番をお願いします", 3) == 3
+
+
+@pytest.mark.asyncio
+async def test_autopilot_cancel_confirmation_accepts_casual_affirmative():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "うん！"},
+    }
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state",
+        new=AsyncMock(return_value={"mode": "autopilot_cancel_confirm", "draft": {"autopilot_cancel_reservation_id": 91}, "request_id": None}),
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="autopilot_cancel_confirm")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.create_notification", new=AsyncMock()), patch(
+        "app.api.line.transition_status", new=AsyncMock()
+    ) as mock_transition, patch("app.api.line.clear_user_draft", new=AsyncMock()), patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ) as mock_set_mode, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+        await _handle_text_message(event, db)
+
+    mock_transition.assert_awaited_once_with(db, 91, "CANCELLED")
+    assert mock_set_mode.await_args.args[2] == "idle"
+    assert "キャンセルしました" in mock_reply.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_autopilot_change_without_datetime_asks_and_keeps_conversation_active():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    reservation = SimpleNamespace(id=91)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "予約変更したい"},
+    }
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state", new=AsyncMock(return_value={"mode": "idle", "draft": {}, "request_id": None})
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="idle")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line._find_single_upcoming_reservation", new=AsyncMock(return_value=reservation)), patch(
+        "app.api.line.parse_line_message", new=AsyncMock(return_value={"date": None, "time": None})
+    ), patch("app.api.line.create_notification", new=AsyncMock()), patch(
+        "app.api.line.merge_user_draft", new=AsyncMock()
+    ) as mock_merge, patch("app.api.line.set_user_mode", new=AsyncMock()) as mock_set_mode, patch(
+        "app.api.line.reply_to_line", new=AsyncMock()
+    ) as mock_reply:
+        await _handle_text_message(event, db)
+
+    assert mock_merge.await_args.args[2]["autopilot_change_reservation_id"] == 91
+    assert mock_set_mode.await_args.args[2] == "autopilot_change_datetime"
+    assert "変更後の日時" in mock_reply.await_args.args[1]
 
 
 @pytest.mark.asyncio

@@ -43,13 +43,15 @@ def test_rule_based_shadow_parse_extracts_intent_date_time():
 
 def test_shadow_parse_does_not_treat_yabun_osoku_as_late_arrival():
     from app.services.shadow_service import _rule_based_shadow_parse
+    from app.utils.datetime_jst import now_jst
 
     parsed = _rule_based_shadow_parse(
         "夜分遅くに失礼します。明日ご確認いただけますと幸いです！明日4/29の夕方以降で空いているお時間ありますか…？"
     )
 
     assert parsed["intent"] == "予約希望"
-    assert parsed["date"] == "2026-04-29"
+    expected_year = now_jst().year + (1 if now_jst().month > 4 else 0)
+    assert parsed["date"] == f"{expected_year}-04-29"
     assert parsed["time"] == "17:00"
 
 
