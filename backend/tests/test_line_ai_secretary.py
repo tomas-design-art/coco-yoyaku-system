@@ -451,6 +451,90 @@ def test_extract_full_name_for_first_time_registration():
     assert extract_full_name("カルテ用に 田中 太郎 です") == "田中太郎"
 
 
+def test_autopilot_setup_extracts_name_phone_and_reading_birth_date():
+    from app.api.line import _extract_reading_and_birth_date, _extract_setup_name_and_phone
+
+    name, phone = _extract_setup_name_and_phone("斉藤 花子 090-1234-5678", None)
+    reading, birth_date = _extract_reading_and_birth_date("さいとう はなこ 1990-04-01")
+
+    assert name == "斉藤花子"
+    assert phone == "09012345678"
+    assert reading == "さいとう はなこ"
+    assert birth_date.isoformat() == "1990-04-01"
+
+
+@pytest.mark.asyncio
+async def test_autopilot_setup_keyword_starts_identity_flow_only():
+    from app.api.line import _handle_autopilot_setup_message
+
+    db = AsyncMock()
+    with patch("app.api.line.clear_user_draft", new=AsyncMock()) as mock_clear, patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ) as mock_set_mode, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+        handled = await _handle_autopilot_setup_message(
+            db,
+            user_id="U-setup",
+            text="#autopilot-setup",
+            reply_token="reply-token",
+            display_name=None,
+            state={"mode": "idle", "draft": {}},
+        )
+
+    assert handled is True
+    mock_clear.assert_awaited_once_with(db, "U-setup")
+    assert mock_set_mode.await_args.args[2] == "autopilot_setup_name_phone"
+    assert "COCO整骨院" in mock_reply.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_autopilot_setup_uses_unique_phone_before_reading_birth():
+    from app.api.line import _handle_autopilot_setup_message
+
+    db = AsyncMock()
+    patient = SimpleNamespace(id=7, name="斉藤花子")
+    with patch("app.api.line.merge_user_draft", new=AsyncMock()), patch(
+        "app.api.line.find_unique_patient_by_phone", new=AsyncMock(return_value=patient)
+    ) as mock_find_phone, patch(
+        "app.api.line._complete_autopilot_setup", new=AsyncMock()
+    ) as mock_complete:
+        handled = await _handle_autopilot_setup_message(
+            db,
+            user_id="U-setup",
+            text="齋藤 花子 090-1234-5678",
+            reply_token="reply-token",
+            display_name=None,
+            state={"mode": "autopilot_setup_name_phone", "draft": {}},
+        )
+
+    assert handled is True
+    mock_find_phone.assert_awaited_once_with(db, "09012345678")
+    mock_complete.assert_awaited_once_with(db, "U-setup", "reply-token", patient)
+
+
+@pytest.mark.asyncio
+async def test_autopilot_setup_asks_reading_and_birth_when_phone_is_not_unique():
+    from app.api.line import _handle_autopilot_setup_message
+
+    db = AsyncMock()
+    with patch("app.api.line.merge_user_draft", new=AsyncMock()), patch(
+        "app.api.line.find_unique_patient_by_phone", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.set_user_mode", new=AsyncMock()) as mock_set_mode, patch(
+        "app.api.line.reply_to_line", new=AsyncMock()
+    ) as mock_reply:
+        handled = await _handle_autopilot_setup_message(
+            db,
+            user_id="U-setup",
+            text="斉藤 花子 090-1234-5678",
+            reply_token="reply-token",
+            display_name=None,
+            state={"mode": "autopilot_setup_name_phone", "draft": {}},
+        )
+
+    assert handled is True
+    assert mock_set_mode.await_args.args[2] == "autopilot_setup_reading_birth"
+    assert "読み仮名" in mock_reply.await_args.args[1]
+
+
 @pytest.mark.asyncio
 async def test_unregistered_user_gets_full_name_prompt():
     from app.api.line import _handle_text_message

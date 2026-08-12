@@ -155,7 +155,10 @@ def build_reservation_response(reservation: Reservation) -> dict:
 
 
 async def create_reservation(
-    db: AsyncSession, data: ReservationCreate
+    db: AsyncSession,
+    data: ReservationCreate,
+    *,
+    reject_conflicts: bool = False,
 ) -> dict:
     """予約登録"""
     # patient_id=0 は無効 → Noneに正規化
@@ -236,7 +239,7 @@ async def create_reservation(
         db, data.patient_id, data.start_time, data.end_time
     )
 
-    if not is_online and (practitioner_conflicts or patient_conflicts):
+    if (not is_online or reject_conflicts) and (practitioner_conflicts or patient_conflicts):
         # 手入力予約では競合を決して許さない → 409で拒否
         from app.services.schedule_service import find_transfer_candidates
         conflict_list = [

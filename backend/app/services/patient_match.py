@@ -2,10 +2,12 @@
 
 import logging
 import re
+from datetime import date
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.patient import Patient
+from app.utils.normalize import normalize_search_text
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +228,49 @@ def match_identity_token(patient: Patient, token: str) -> bool:
     return False
 
 
+async def find_unique_patient_by_phone(db: AsyncSession, phone: str) -> Patient | None:
+    """電話番号が一意に一致する有効患者だけを返す。
+
+    LINE setup では氏名の表記揺れを許容する一方、家族共用番号を誤紐づけしない。
+    """
+    normalized_phone = normalize_phone(phone)
+    if not normalized_phone:
+        return None
+
+    patients = (await db.execute(select(Patient).where(Patient.is_active == True))).scalars().all()
+    matches = [
+        patient for patient in patients
+        if patient.phone and normalize_phone(patient.phone) == normalized_phone
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+async def find_unique_patient_by_reading_and_birth_date(
+    db: AsyncSession,
+    reading: str,
+    birth_date: date,
+) -> Patient | None:
+    """読み仮名と生年月日がともに一意に一致する有効患者だけを返す。"""
+    normalized_reading = normalize_search_text(reading).replace(" ", "")
+    if not normalized_reading:
+        return None
+
+    patients = (await db.execute(select(Patient).where(Patient.is_active == True))).scalars().all()
+    matches = []
+    for patient in patients:
+        readings = [patient.reading, patient.last_name_kana, patient.first_name_kana]
+        combined_kana = f"{patient.last_name_kana or ''}{patient.first_name_kana or ''}"
+        readings.append(combined_kana)
+        reading_matches = any(
+            normalize_search_text(value).replace(" ", "") == normalized_reading
+            for value in readings
+            if value
+        )
+        if reading_matches and patient.birth_date == birth_date:
+            matches.append(patient)
+    return matches[0] if len(matches) == 1 else None
+
+
 async def find_or_create_patient(
     db: AsyncSession,
     *,
@@ -329,6 +374,7 @@ async def create_new_patient(
     first_name_kana: str | None = None,
     full_name: str | None = None,
     email: str | None = None,
+    birth_date: date | None = None,
     notes: str | None = None,
 ) -> Patient:
     """既存照合せずに患者を新規作成する。
@@ -375,6 +421,7 @@ async def create_new_patient(
         reading=resolved_reading,
         phone=norm_phone,
         email=(email.strip() if email else None) or None,
+        birth_date=birth_date,
         line_id=line_id,
         notes=(notes.strip() if notes else None) or None,
         patient_number=patient_number,
