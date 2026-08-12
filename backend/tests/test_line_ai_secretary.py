@@ -518,11 +518,16 @@ def test_autopilot_usual_confirmation_uses_patient_default_menu_duration_and_pra
     assert _is_affirmative("それでお願いします") is True
     assert _is_affirmative("うん！") is True
     assert _is_affirmative("Yes, please") is True
-    assert _is_affirmative("cancel") is True
+    assert _is_affirmative("いいよ") is True
+    assert _is_affirmative("うん、それでいいよ。明日の午後どう？") is True
+    assert _is_affirmative("はい(´Д｀)=3") is True
     assert _is_affirmative("いいえ") is False
     assert _is_negative("いや") is True
     assert _extract_alternative_choice("じゃあ2で！", 3) == 2
     assert _extract_alternative_choice("3番をお願いします", 3) == 3
+    assert _extract_alternative_choice("2でお願い", 3) == 2
+    assert _extract_alternative_choice("２がいい！", 3) == 2
+    assert _extract_alternative_choice("明日の14時", 3) is None
     assert _has_vague_time_period("明日の午後") is True
     assert _has_vague_time_period("明日の14時") is False
     slot_confirmation = _format_autopilot_slot_confirmation(
@@ -532,6 +537,106 @@ def test_autopilot_usual_confirmation_uses_patient_default_menu_duration_and_pra
     )
     assert "8/13(木) 14:00〜15:00" in slot_confirmation
     assert "よろしいでしょうか" in slot_confirmation
+
+
+def test_compose_alternatives_text_uses_neutral_header_for_vague_time():
+    from app.api.line import _compose_alternatives_text
+
+    alternatives = [{"label": "2026-08-13 14:00〜15:00（時田）"}]
+    vague = _compose_alternatives_text(alternatives, vague=True)
+    full = _compose_alternatives_text(alternatives, vague=False)
+
+    assert "空いているお時間をご案内します" in vague
+    assert "埋まって" not in vague
+    assert "満席" in full
+    # 4つ目の「別日時をどうぞ」メッセージが常に含まれること
+    assert "別の日時をお知らせください" in vague
+    assert "別の日時をお知らせください" in full
+
+
+def test_vague_time_window_maps_periods():
+    from app.api.line import _vague_time_window
+
+    assert _vague_time_window("明日の午前中") == (0, 12 * 60)
+    assert _vague_time_window("午後がいい") == (12 * 60, 24 * 60)
+    assert _vague_time_window("夕方で") == (16 * 60, 24 * 60)
+    assert _vague_time_window("夜に") == (18 * 60, 24 * 60)
+    assert _vague_time_window("お昼ごろ") == (11 * 60, 14 * 60)
+    assert _vague_time_window("14時ちょうど") is None
+
+
+@pytest.mark.asyncio
+async def test_extract_requested_practitioner_detects_named_designation():
+    from app.api.line import _extract_requested_practitioner
+
+    ueda = SimpleNamespace(id=3, name="上田 花子", is_active=True)
+    tokita = SimpleNamespace(id=1, name="時田 太郎", is_active=True)
+
+    class _Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [ueda, tokita]
+
+    class _DB:
+        async def execute(self, _q):
+            return _Result()
+
+    # 指名の合図あり → 上田を検出
+    assert (await _extract_requested_practitioner(_DB(), "担当は上田さんでお願いします")).id == 3
+    assert (await _extract_requested_practitioner(_DB(), "上田で")).id == 3
+    # 指名の合図なし（本人の名前が偶然一致するだけ）→ 検出しない
+    assert await _extract_requested_practitioner(_DB(), "上田と申します") is None
+    assert await _extract_requested_practitioner(_DB(), "明日の14時に予約したい") is None
+
+
+@pytest.mark.asyncio
+async def test_autopilot_candidate_selection_books_directly_without_extra_confirmation():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    request_data = {
+        "menu_id": 5,
+        "alternatives": [
+            {
+                "date": "2026-08-13",
+                "start": "14:30",
+                "end": "15:30",
+                "practitioner_id": 3,
+                "practitioner_name": "時田",
+                "label": "2026-08-13 14:30〜15:30（時田）",
+            }
+        ],
+    }
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "1でお願い"},
+    }
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state",
+        new=AsyncMock(return_value={"mode": "adjusting", "draft": {}, "request_id": "rid-1"}),
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="adjusting")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.get_request", new=AsyncMock(return_value=request_data)), patch(
+        "app.api.line.create_notification", new=AsyncMock()
+    ), patch(
+        "app.api.line.update_request", new=AsyncMock()
+    ), patch("app.api.line.create_reservation", new=AsyncMock(return_value={"id": 555, "status": "CONFIRMED"})) as mock_create, patch(
+        "app.api.line.clear_user_draft", new=AsyncMock()
+    ), patch("app.api.line.set_user_mode", new=AsyncMock()) as mock_set_mode, patch(
+        "app.api.line.reply_to_line", new=AsyncMock()
+    ) as mock_reply:
+        await _handle_text_message(event, db)
+
+    mock_create.assert_awaited_once()
+    assert mock_set_mode.await_args.args[2] == "idle"
+    assert "ご予約を確定しました" in mock_reply.await_args.args[1]
 
 
 @pytest.mark.asyncio

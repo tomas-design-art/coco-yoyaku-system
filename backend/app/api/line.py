@@ -29,7 +29,7 @@ from app.models.setting import Setting
 from app.schemas.reservation import ReservationCreate
 from app.services.conflict_detector import check_conflict
 from app.services.line_alerts import build_reservation_review_flex, push_admin_reservation_review
-from app.services.slot_scorer import find_best_practitioner, score_candidates
+from app.services.slot_scorer import build_same_day_candidates, find_best_practitioner, score_candidates
 from app.services.line_reply import push_message, reply_flex_message, reply_text_with_quick_reply, reply_to_line
 from app.services.line_state import (
     clear_user_draft,
@@ -643,22 +643,36 @@ def _normalize_confirmation_text(text: str) -> str:
     return re.sub(r"[\s\u3000,，!！?？。､、…]+", "", (text or "").lower())
 
 
-def _is_affirmative(text: str) -> bool:
-    normalized = _normalize_confirmation_text(text)
-    return normalized in {
-        "はい", "うん", "うんうん", "ええ", "取消", "cancel", "ok", "okay", "yes", "yesplease", "y", "yep", "yeah",
-        "sure", "please", "si", "oui", "네", "예", "응", "お願いします", "それでお願いします", "それで",
-    }
+# 否定を先に判定するので「いいえ」が肯定の「いい」に誤爆しない。
+_NEGATIVE_MARKERS = (
+    "いいえ", "いや", "やだ", "やめ", "だめ", "ちがう", "違う", "結構", "けっこう",
+    "取りやめ", "とりやめ", "no", "nope",
+)
+_AFFIRMATIVE_MARKERS = (
+    "はい", "うん", "ええ", "いいよ", "いいですよ", "いいです", "それでいい", "それで",
+    "おねがい", "お願い", "だいじょうぶ", "大丈夫", "了解", "りょうかい", "りょ",
+    "よろしく", "オッケー", "おっけー", "おけ", "ok", "okay", "yes", "yeah", "yep",
+    "sure", "please", "네", "예", "응", "好",
+)
 
 
 def _is_negative(text: str) -> bool:
-    normalized = _normalize_confirmation_text(text)
-    return normalized in {"いいえ", "いや", "やめる", "戻る", "ちがう", "違う", "no", "n", "nope"}
+    t = (text or "").lower()
+    return any(marker in t for marker in _NEGATIVE_MARKERS)
+
+
+def _is_affirmative(text: str) -> bool:
+    if _is_negative(text):
+        return False
+    t = (text or "").lower()
+    return any(marker in t for marker in _AFFIRMATIVE_MARKERS)
 
 
 def _extract_alternative_choice(text: str, count: int) -> int | None:
-    normalized = _normalize_confirmation_text(text)
-    match = re.search(r"(?:^|\D)([1-9])(?:番)?(?:を)?(?:で|に|お願いします|お願い)?$", normalized)
+    normalized = _normalize_confirmation_text(text).translate(
+        str.maketrans("０１２３４５６７８９", "0123456789")
+    )
+    match = re.search(r"(?<!\d)([1-9])(?!\d)", normalized)
     if not match:
         return None
     choice = int(match.group(1))
@@ -836,25 +850,73 @@ async def _generate_patient_number_line(db: AsyncSession) -> str:
     return f"P{next_val:06d}"
 
 
-def _compose_alternatives_text(alternatives: list[dict]) -> str:
+def _compose_alternatives_text(alternatives: list[dict], vague: bool = False) -> str:
     if not alternatives:
-        return "申し訳ありません。近い日時で空き枠が見つかりませんでした。"
-    lines = ["ご希望日時が埋まっていたため、候補をご案内します。"]
+        return (
+            "申し訳ありません、ご希望に近い空き枠が見つかりませんでした。\n"
+            "別の日時をお知らせいただければ、あらためてお探しします。\n"
+            "例:「明日の夕方は？」「金曜の午前中で」"
+        )
+    header = (
+        "空いているお時間をご案内します。"
+        if vague
+        else "ご希望の時間は満席でしたので、空いているお時間をご案内します。"
+    )
+    lines = [header]
     for i, a in enumerate(alternatives, start=1):
         lines.append(f"{i}. {a['label']}")
-    lines.append("ご希望の番号を返信してください。")
+    lines.append("ご希望の番号を返信してください（例: 2）。")
+    lines.append(
+        "上記にご希望に合うものがなければ、遠慮なく別の日時をお知らせください。"
+        "（例:「なら明日の午後は？」「金曜の夕方でお願い」）あらためてお探しします。"
+    )
     return "\n".join(lines)
 
 
-def _format_autopilot_slot_confirmation(start_dt: datetime, end_dt: datetime, practitioner_name: str) -> str:
+def _format_autopilot_slot_confirmation(start_dt: datetime, end_dt: datetime, practitioner_name: str, note: str | None = None) -> str:
+    prefix = f"{note}\n" if note else ""
     return (
-        f"{_format_date_with_weekday_jp(start_dt.date())} {start_dt.strftime('%H:%M')}〜{end_dt.strftime('%H:%M')}"
+        f"{prefix}{_format_date_with_weekday_jp(start_dt.date())} {start_dt.strftime('%H:%M')}〜{end_dt.strftime('%H:%M')}"
         f"（担当: {practitioner_name}）でよろしいでしょうか？\nはい / いいえ"
     )
 
 
 def _has_vague_time_period(text: str) -> bool:
     return bool(re.search(r"午前(?:中)?|午後|夕方|夜|晩|朝|morning|afternoon|evening|night", text or "", re.IGNORECASE))
+
+
+def _vague_time_window(text: str) -> tuple[int, int] | None:
+    """曖昧な時間帯表現から (開始分, 終了分) を返す。無ければ None。"""
+    t = text or ""
+    if re.search(r"午前|朝|morning", t, re.IGNORECASE):
+        return (0, 12 * 60)
+    if re.search(r"夕方|evening", t, re.IGNORECASE):
+        return (16 * 60, 24 * 60)
+    if re.search(r"夜|晩|night", t, re.IGNORECASE):
+        return (18 * 60, 24 * 60)
+    if re.search(r"昼", t):
+        return (11 * 60, 14 * 60)
+    if re.search(r"午後|afternoon", t, re.IGNORECASE):
+        return (12 * 60, 24 * 60)
+    return None
+
+
+async def _extract_requested_practitioner(db: AsyncSession, text: str) -> Practitioner | None:
+    """本文から明示的な担当指名（例: 上田さんで / 担当は時田）を抽出する。"""
+    if not text:
+        return None
+    practitioners = (
+        await db.execute(select(Practitioner).where(Practitioner.is_active == True))
+    ).scalars().all()
+    for p in practitioners:
+        if not p.name:
+            continue
+        surname = p.name.split()[0]
+        # 指名の合図（さん/先生/で/希望/指名/がいい/にして/でお願い、または「担当」前置）を伴う場合のみ採用
+        pattern = rf"(?:担当[はを:：]?\s*)?{re.escape(surname)}\s*(?:さん|先生)?\s*(?:で|に|希望|指名|がいい|がいいです|にして|でお願い|でお願いします|でお願いしたい)"
+        if re.search(pattern, text):
+            return p
+    return None
 
 
 def _format_date_with_weekday_jp(d: date) -> str:
@@ -909,8 +971,6 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         # 患者には一切返信しない（HTTP 200 のみ）
         return
 
-    await create_notification(db, "line_message", f"LINE受信: {text[:100]}")
-
     # リッチメニューの「予約/変更」は具体的な変更依頼ではない。
     # 過去にmanualへ退避した対象者も、ここから予約会話を再開できる。
     if is_autopilot_patient and _is_booking_or_change_menu_trigger(text):
@@ -932,7 +992,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             await set_user_mode(db, user_id, "idle")
             user_state = {**user_state, "mode": "idle", "draft": {}, "request_id": None}
         else:
-            await create_notification(db, "line_manual_mode", f"手動対応中ユーザーから受信: {text[:80]}")
+            await create_notification(db, "line_manual_mode", f"手動対応中の患者から新着メッセージ: {line_patient.name if line_patient else user_id}様")
             if reply_token:
                 await reply_to_line(reply_token, "担当者が内容を確認中です。しばらくお待ちください。")
             return
@@ -1022,41 +1082,54 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         alternatives = request_data.get("alternatives") if request_data else None
         selected_choice = _extract_alternative_choice(text, len(alternatives)) if alternatives else None
         if alternatives and selected_choice is not None:
-            alternative_index = selected_choice - 1
-            if 0 <= alternative_index < len(alternatives):
-                alternative = alternatives[alternative_index]
-                try:
-                    start_dt = datetime.combine(
-                        date.fromisoformat(alternative["date"]),
-                        time.fromisoformat(alternative["start"]),
-                        tzinfo=JST,
-                    )
-                    end_dt = datetime.combine(
-                        date.fromisoformat(alternative["date"]),
-                        time.fromisoformat(alternative["end"]),
-                        tzinfo=JST,
-                    )
-                except (KeyError, TypeError, ValueError):
-                    if reply_token:
-                        await reply_to_line(reply_token, "候補を確認できませんでした。別のご希望日時を教えてください。")
-                    return
-                await update_request(
-                    db,
-                    request_id,
-                    line_user_id=user_id,
-                    available=True,
-                    practitioner_id=int(alternative["practitioner_id"]),
-                    start_time_iso=start_dt.isoformat(),
-                    end_time_iso=end_dt.isoformat(),
-                    status="awaiting_patient_confirmation",
+            alternative = alternatives[selected_choice - 1]
+            try:
+                start_dt = datetime.combine(
+                    date.fromisoformat(alternative["date"]),
+                    time.fromisoformat(alternative["start"]),
+                    tzinfo=JST,
                 )
-                await set_user_mode(db, user_id, "autopilot_booking_confirm", request_id)
+                end_dt = datetime.combine(
+                    date.fromisoformat(alternative["date"]),
+                    time.fromisoformat(alternative["end"]),
+                    tzinfo=JST,
+                )
+            except (KeyError, TypeError, ValueError):
                 if reply_token:
-                    await reply_to_line(
-                        reply_token,
-                        _format_autopilot_slot_confirmation(start_dt, end_dt, alternative.get("practitioner_name") or "担当者"),
-                    )
+                    await reply_to_line(reply_token, "候補を確認できませんでした。別のご希望日時を教えてください。")
                 return
+            # 番号選択＝患者の明示的な確定意思。追加の「はい/いいえ」は求めない。
+            try:
+                reservation = await create_reservation(
+                    db,
+                    ReservationCreate(
+                        patient_id=line_patient.id,
+                        practitioner_id=int(alternative["practitioner_id"]),
+                        menu_id=request_data.get("menu_id"),
+                        start_time=start_dt,
+                        end_time=end_dt,
+                        channel="LINE",
+                        notes="LINE AI秘書 候補選択確定",
+                    ),
+                    reject_conflicts=True,
+                )
+            except (HTTPException, ValueError):
+                await update_request(db, request_id, line_user_id=user_id, status="alternatives_sent")
+                if reply_token:
+                    await reply_to_line(reply_token, "その候補は直前に埋まってしまいました。恐れ入りますが別の番号をお選びください。")
+                return
+            await update_request(db, request_id, line_user_id=user_id, status="confirmed", reservation_id=reservation.get("id"))
+            await clear_user_draft(db, user_id)
+            await set_user_mode(db, user_id, "idle")
+            if reply_token:
+                practitioner_name = alternative.get("practitioner_name") or "担当者"
+                await reply_to_line(
+                    reply_token,
+                    "ご予約を確定しました。\n"
+                    f"{start_dt.strftime('%Y/%m/%d %H:%M')}〜{end_dt.strftime('%H:%M')}（担当: {practitioner_name}）\n"
+                    "ご来院をお待ちしております。",
+                )
+            return
 
     if is_autopilot_patient and current_mode == "autopilot_cancel_confirm":
         reservation_id = prev_draft.get("autopilot_cancel_reservation_id")
@@ -1164,6 +1237,18 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 usual_draft["practitioner_id"] = preset["practitioner_id"]
                 usual_draft["practitioner_name"] = preset["practitioner_name"]
             merged = await merge_user_draft(db, user_id, usual_draft)
+            # 「うん、それでいいよ。明日の午後どう？」のように同じ文へ日時が含まれる場合は拾う。
+            parsed_same = await parse_line_message(text, profile_name=display_name, previous=prev_draft)
+            if parsed_same.get("date") or parsed_same.get("time"):
+                merged = await merge_user_draft(
+                    db,
+                    user_id,
+                    {
+                        "customer_name": (line_patient.name if line_patient else None),
+                        "date": parsed_same.get("date"),
+                        "time": parsed_same.get("time"),
+                    },
+                )
             await set_user_mode(db, user_id, "idle")
         elif text.strip() in {"いいえ", "変更", "ちがう", "違う"}:
             await set_user_mode(db, user_id, "waiting_menu")
@@ -1526,7 +1611,6 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 await reply_to_line(reply_token, _format_usual_confirmation(preset))
             return
         await set_user_mode(db, user_id, "waiting_menu", user_state.get("request_id"))
-        await create_notification(db, "line_interviewing", f"LINE情報ヒアリング中: {user_id} missing=menu_name")
         if reply_token:
             quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
             prompt = "ご希望メニューを選んでください。"
@@ -1553,7 +1637,6 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     missing_datetime = [k for k in ["date", "time"] if not merged.get(k)]
     if missing_datetime:
         await set_user_mode(db, user_id, "waiting_datetime", user_state.get("request_id"))
-        await create_notification(db, "line_interviewing", f"LINE情報ヒアリング中: {user_id} missing={','.join(missing_datetime)}")
         if reply_token:
             await reply_to_line(reply_token, _build_missing_info_message(missing_datetime))
         return
@@ -1592,19 +1675,65 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             await reply_to_line(reply_token, "日時の解釈に失敗しました。例: 4/10 10:00 の形式で送信してください。")
         return
 
+    # ── 担当・施術時間の決定ルール ──
+    preferred_practitioner_id = merged.get("practitioner_id")
+    prefer_director = False
+    first_visit_note: str | None = None
+    if is_autopilot_patient:
+        requested_prac = await _extract_requested_practitioner(db, text)
+        is_new_patient = latest_reservation is None and not preferred_practitioner_id
+        if requested_prac:
+            # 本人が担当を指名 → その担当固定（院長探索は不要）
+            preferred_practitioner_id = requested_prac.id
+        if is_new_patient:
+            # 完全新規は「HPからの新規獲得」と同ロジック: 院長枠優先＋60分基本固定。
+            # ただし本人が長い施術（90分マッスル等）を指定済みならその時間を優先。
+            if not requested_prac:
+                prefer_director = True
+            if duration < 60:
+                duration = 60
+            first_visit_note = "初回はカウンセリングを含め60分ほどお時間をいただいております。"
+
+    # 候補提示時の優先担当（院長優先の場合は院長IDを解決）
+    candidate_practitioner_id = preferred_practitioner_id
+    if prefer_director and not candidate_practitioner_id:
+        director = (
+            await db.execute(
+                select(Practitioner)
+                .where(Practitioner.is_active == True, Practitioner.role == "院長")
+                .order_by(Practitioner.display_order)
+            )
+        ).scalars().first()
+        if director:
+            candidate_practitioner_id = director.id
+
     practitioner, start_dt, end_dt, gap_before, gap_after = await find_best_practitioner(
         db,
         target_date,
         target_time,
         duration,
-        practitioner_id=merged.get("practitioner_id"),
+        prefer_director=prefer_director,
+        practitioner_id=preferred_practitioner_id,
     )
     alternatives: list[dict] = []
-    if not practitioner:
-        scored = await score_candidates(db, target_date, target_time, duration, max_results=3)
-        alternatives = [s.to_dict() for s in scored]
-    elif is_autopilot_patient and _has_vague_time_period(text):
-        scored = await score_candidates(db, target_date, target_time, duration, max_results=3)
+    vague_choice = False
+    needs_candidates = (not practitioner) or (is_autopilot_patient and _has_vague_time_period(text))
+    if needs_candidates:
+        vague_choice = practitioner is not None  # 空きはあるが曖昧時間帯 → 候補から選ばせる
+        if is_autopilot_patient:
+            window = _vague_time_window(text)
+            scored = await build_same_day_candidates(
+                db, target_date, target_time, duration,
+                preferred_practitioner_id=candidate_practitioner_id,
+                window_start_min=(window[0] if window else None),
+                window_end_min=(window[1] if window else None),
+                max_results=3,
+            )
+        else:
+            scored = await score_candidates(
+                db, target_date, target_time, duration,
+                practitioner_id=candidate_practitioner_id, max_results=3,
+            )
         alternatives = [s.to_dict() for s in scored]
         practitioner = None
 
@@ -1655,14 +1784,17 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             if reply_token:
                 await reply_to_line(
                     reply_token,
-                    _format_autopilot_slot_confirmation(start_dt, end_dt, practitioner.name),
+                    _format_autopilot_slot_confirmation(start_dt, end_dt, practitioner.name, note=first_visit_note),
                 )
             return
 
         await update_request(db, request_id, line_user_id=user_id, status="alternatives_sent")
         await set_user_mode(db, user_id, "adjusting", request_id)
         if reply_token:
-            await reply_to_line(reply_token, _compose_alternatives_text(alternatives))
+            alt_text = _compose_alternatives_text(alternatives, vague=vague_choice)
+            if first_visit_note:
+                alt_text = f"{first_visit_note}\n{alt_text}"
+            await reply_to_line(reply_token, alt_text)
         return
 
     payload = {

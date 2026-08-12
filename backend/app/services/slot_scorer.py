@@ -437,3 +437,137 @@ async def find_best_practitioner(
         return candidate_prac, start_dt, end_dt, gap_before, gap_after
 
     return None, start_dt, end_dt, 0, 0
+
+
+def _free_blocks(
+    info: _DayInfo, window_start: int, window_end: int,
+) -> list[tuple[int, int]]:
+    """指定ウィンドウ内での施術者の連続空きブロック（分）を返す。"""
+    lo, hi = window_start, window_end
+    if info.work_start is not None:
+        lo = max(lo, info.work_start)
+    if info.work_end is not None:
+        hi = min(hi, info.work_end)
+    if lo >= hi:
+        return []
+    busy = sorted(info.reservations + info.unavailable)
+    blocks: list[tuple[int, int]] = []
+    cur = lo
+    for bs, be in busy:
+        if be <= cur or bs >= hi:
+            continue
+        bs_c = max(bs, lo)
+        if bs_c > cur:
+            blocks.append((cur, bs_c))
+        cur = max(cur, min(be, hi))
+    if cur < hi:
+        blocks.append((cur, hi))
+    return blocks
+
+
+async def build_same_day_candidates(
+    db: AsyncSession,
+    target_date: date,
+    desired_time: time,
+    duration_minutes: int,
+    preferred_practitioner_id: int | None = None,
+    window_start_min: int | None = None,
+    window_end_min: int | None = None,
+    max_results: int = 3,
+    min_gap_minutes: int = 30,
+) -> list[ScoredSlot]:
+    """LINE秘書の患者向け「同日優先」候補を優先順位で構築。
+
+    Tier1: 同日・希望担当・希望時間以降のフル枠（最短順）
+    Tier2: 同日・希望担当・希望時間帯内の短い空き（隙間: min_gap〜フル未満）
+    Tier3: 同日・他担当・希望時間帯内のフル枠（最短順）
+    最後に呼び出し側で「④希望が無ければ別日時を提案してください」を付ける。
+    """
+    prac_q = await db.execute(
+        select(Practitioner)
+        .where(Practitioner.is_active == True)
+        .order_by(Practitioner.display_order)
+    )
+    practitioners = list(prac_q.scalars().all())
+    if not practitioners:
+        return []
+
+    bh = await get_business_hours_for_date(db, target_date)
+    if not bh.is_open:
+        return []
+    bh_start, bh_end = bh.to_minutes()
+
+    ws = bh_start if window_start_min is None else max(window_start_min, bh_start)
+    we = bh_end if window_end_min is None else min(window_end_min, bh_end)
+    if ws >= we:
+        ws, we = bh_start, bh_end
+    desired_min = max(desired_time.hour * 60 + desired_time.minute, bh_start)
+
+    day_infos = await _load_day_infos(db, target_date, practitioners)
+    info_by_id = {di.practitioner.id: di for di in day_infos}
+
+    results: list[ScoredSlot] = []
+    seen: set[tuple[int, int, int]] = set()
+
+    def _add(info: _DayInfo, s: int, dur: int) -> None:
+        key = (info.practitioner.id, s, dur)
+        if key in seen:
+            return
+        e = s + dur
+        st = time(s // 60, s % 60)
+        et = time(e // 60, e % 60)
+        if dur != duration_minutes:
+            label = (
+                f"{target_date.isoformat()} {st.strftime('%H:%M')}〜{et.strftime('%H:%M')}"
+                f"（{dur}分／担当:{info.practitioner.name}）"
+            )
+        else:
+            label = (
+                f"{target_date.isoformat()} {st.strftime('%H:%M')}〜{et.strftime('%H:%M')}"
+                f"（担当:{info.practitioner.name}）"
+            )
+        results.append(ScoredSlot(
+            target_date, st, et,
+            info.practitioner.id, info.practitioner.name, 0.0, label,
+        ))
+        seen.add(key)
+
+    pref_info = info_by_id.get(preferred_practitioner_id) if preferred_practitioner_id else None
+
+    # Tier1: 希望担当・フル枠・希望時間以降（最短順・重複を避けて間隔をあける）
+    if pref_info and pref_info.is_working:
+        last_start: int | None = None
+        s = desired_min
+        while s + duration_minutes <= bh_end and len(results) < max_results:
+            if _is_slot_available(pref_info, s, s + duration_minutes):
+                if last_start is None or (s - last_start) >= duration_minutes:
+                    _add(pref_info, s, duration_minutes)
+                    last_start = s
+            s += SLOT_INTERVAL
+
+    # Tier2: 希望担当・希望時間帯内の短い隙間（フル未満だが min_gap 以上）
+    if pref_info and pref_info.is_working and len(results) < max_results:
+        for gs, ge in _free_blocks(pref_info, ws, we):
+            block_len = ge - gs
+            if min_gap_minutes <= block_len < duration_minutes:
+                _add(pref_info, gs, block_len)
+                if len(results) >= max_results:
+                    break
+
+    # Tier3: 他担当・希望時間帯内・フル枠（各担当の最短枠）
+    if len(results) < max_results:
+        for info in day_infos:
+            if not info.is_working:
+                continue
+            if preferred_practitioner_id and info.practitioner.id == preferred_practitioner_id:
+                continue
+            s = ws
+            while s + duration_minutes <= we:
+                if _is_slot_available(info, s, s + duration_minutes):
+                    _add(info, s, duration_minutes)
+                    break
+                s += SLOT_INTERVAL
+            if len(results) >= max_results:
+                break
+
+    return results[:max_results]
