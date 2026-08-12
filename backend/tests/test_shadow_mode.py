@@ -92,7 +92,8 @@ def test_format_admin_notification():
             "confidence": "high",
         },
     )
-    assert "【原文】" in result
+    assert "【原文】" not in result
+    assert "明日10時に予約したいです" not in result
     assert "田中太郎" in result
     assert "【分類】予約希望" in result
     assert "【患者希望の予約時間】" in result
@@ -212,7 +213,7 @@ async def test_shadow_no_intent_logs_only():
     mock_state = {"mode": "idle", "draft": {}, "request_id": None}
 
     with patch("app.services.shadow_service.analyze_with_llm", new_callable=AsyncMock) as mock_llm, \
-         patch("app.services.shadow_service.notify_admin_shadow", new_callable=AsyncMock) as mock_notify, \
+         patch("app.services.shadow_service._push_admin_text", new_callable=AsyncMock) as mock_push, \
          patch("app.services.shadow_service.get_user_state", new_callable=AsyncMock, return_value=mock_state):
 
         from app.services.shadow_service import handle_shadow_message
@@ -225,10 +226,35 @@ async def test_shadow_no_intent_logs_only():
 
         # 予約意図なし → LLM も通知も呼ばれない
         mock_llm.assert_not_awaited()
-        mock_notify.assert_not_awaited()
+        mock_push.assert_not_awaited()
 
         # ただしDBログは保存される
         mock_db.add.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_shadow_manual_message_logs_without_admin_push():
+    """手動対応中の非予約文面も、管理者LINEではなく監査ログだけに残す。"""
+    from app.services.shadow_service import _DEBOUNCE_BUFFER
+    _DEBOUNCE_BUFFER.clear()
+
+    mock_db = AsyncMock()
+    mock_db.add = MagicMock()
+    mock_db.flush = AsyncMock()
+    mock_state = {"mode": "manual", "draft": {}, "request_id": None}
+
+    with patch("app.services.shadow_service._push_admin_text", new_callable=AsyncMock) as mock_push, \
+         patch("app.services.shadow_service.get_user_state", new_callable=AsyncMock, return_value=mock_state):
+        from app.services.shadow_service import handle_shadow_message
+        await handle_shadow_message(
+            mock_db,
+            user_id="U_MANUAL_NO_INTENT",
+            text="ありがとうございます",
+            display_name="山田",
+        )
+
+    mock_push.assert_not_awaited()
+    mock_db.add.assert_called()
 
 
 @pytest.mark.asyncio

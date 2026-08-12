@@ -184,15 +184,15 @@ async def test_shadow_hotpepper_dummy_patient_increments_number():
 
 
 @pytest.mark.asyncio
-async def test_shadow_mode_handle_created_uses_dummy_patient_not_real_name():
-    """shadow_mode=True のとき _handle_created が実患者名ではなくダミー患者を使う"""
+async def test_shadow_mode_handle_created_uses_parsed_patient_name():
+    """shadow_mode=True でもHotPepperメールから取得した氏名・読みを使う。"""
     from datetime import datetime
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock, patch
     import app.models.reservation_series  # noqa: F401 – SQLAlchemy mapper 解決に必要
     from app.services.hotpepper_mail import _handle_created
 
-    dummy_patient = SimpleNamespace(id=77, name="ホットペッパー5")
+    patient = SimpleNamespace(id=77, name="金田 堅")
     parsed = {
         "reservation_number": "HP-9999",
         "patient_name": "金田 堅",
@@ -208,14 +208,15 @@ async def test_shadow_mode_handle_created_uses_dummy_patient_not_real_name():
     }
 
     db = AsyncMock()
+    db.add = MagicMock()
     # 重複チェック → None（新規）、手動マッチ → None
     no_result = MagicMock()
     no_result.scalar_one_or_none.return_value = None
     db.execute.return_value = no_result
 
     with patch("app.services.hotpepper_mail.settings.shadow_mode", True), \
-         patch("app.services.hotpepper_mail._get_or_create_hotpepper_dummy_patient", new=AsyncMock(return_value=dummy_patient)) as mock_dummy, \
-         patch("app.services.hotpepper_mail._find_or_create_patient", new=AsyncMock()) as mock_real, \
+         patch("app.services.hotpepper_mail._get_or_create_hotpepper_dummy_patient", new=AsyncMock()) as mock_dummy, \
+         patch("app.services.hotpepper_mail._find_or_create_patient", new=AsyncMock(return_value=patient)) as mock_real, \
          patch("app.services.hotpepper_mail._resolve_hotpepper_color_id", new=AsyncMock(return_value=None)), \
          patch("app.services.hotpepper_mail._find_existing_manual_match", new=AsyncMock(return_value=None)), \
          patch("app.services.hotpepper_mail._resolve_hotpepper_menu", new=AsyncMock(return_value=(None, 60))), \
@@ -225,8 +226,8 @@ async def test_shadow_mode_handle_created_uses_dummy_patient_not_real_name():
          patch("app.services.hotpepper_mail.create_notification", new=AsyncMock()):
         result = await _handle_created(db, parsed)
 
-    mock_dummy.assert_awaited_once()
-    mock_real.assert_not_awaited()
+    mock_dummy.assert_not_awaited()
+    mock_real.assert_awaited_once_with(db, "金田 堅", reading="カネダ ケン")
     assert result["status"] == "created"
 
 

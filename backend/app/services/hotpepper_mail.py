@@ -402,11 +402,13 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
         logger.info(f"重複スキップ: source_ref={parsed['reservation_number']} は登録済み")
         return {"status": "skipped", "reason": "duplicate", "reservation_number": parsed["reservation_number"]}
 
-    # ── シャドーモード: ダミー患者で登録（本番 shadow_mode=False では通らない） ──
-    if settings.shadow_mode:
-        patient = await _get_or_create_hotpepper_dummy_patient(db)
-    else:
-        patient = await _find_or_create_patient(db, parsed["patient_name"], reading=parsed.get("patient_reading"))
+    # HotPepperメールには氏名が含まれるため、ミラー環境でも解析済みの氏名をそのまま使う。
+    # LINEシャドー用のダミー患者ルールをHotPepper取り込みへ適用してはいけない。
+    patient = await _find_or_create_patient(
+        db,
+        parsed["patient_name"],
+        reading=parsed.get("patient_reading"),
+    )
     hotpepper_color_id = await _resolve_hotpepper_color_id(db)
 
     # 手動登録済みの同一患者・同一時間枠があれば、HP由来情報をリンクして重複作成しない

@@ -798,11 +798,7 @@ def format_admin_notification(
         llm_current_text = f"{llm_current_date or '?'} {llm_current_time or '?'}"
 
     lines = [
-        f"📩 {name}さんからのメッセージ ({ts})",
-        "",
-        "【原文】",
-        raw_message[:300],
-        "",
+        f"📩 {name}さんの要対応連絡 ({ts})",
         f"【分類】{analysis.get('intent') or '不明'}",
         f"【内容】{content}",
     ]
@@ -930,26 +926,16 @@ async def handle_shadow_message(
             current_mode = "shadow_drafting"
             is_shadow_drafting = True
 
-        # ── デモ用フルデバッグ通知（入口） ──
+        # ── デバッグ情報（サーバーログのみ。患者原文を管理者LINEへ流さない） ──
         if _is_debug_mode():
-            await _push_admin_text(
-                _format_debug_dump(
-                    stage="着信",
-                    display_name=display_name,
-                    user_id=user_id,
-                    raw_message=msg,
-                    intent_detected=intent_detected,
-                    mode=current_mode,
-                    draft=prev_draft,
-                    analysis=None,
-                )
+            logger.debug(
+                "Shadow debug received (user=%s, mode=%s, intent=%s)",
+                user_id[:12], current_mode, intent_detected,
             )
 
-        # 手動モード、または予約確認待ち中の非予約メッセージは原文だけ転送する。
+        # 手動モード、または予約確認待ち中の非予約メッセージは監査ログだけ残す。
+        # 患者の生文面は、確定情報のみを扱う管理者通知には送らない。
         if current_mode == "manual" or (current_mode == "shadow_pending_admin" and not intent_detected):
-            await _push_admin_text(
-                f"📨 {display_name or '不明'}さんから追加メッセージ:\n── 原文 ──\n{msg}"
-            )
             await save_shadow_log(
                 db,
                 line_user_id=user_id,
@@ -962,11 +948,7 @@ async def handle_shadow_message(
             continue
 
         if not intent_detected and not is_shadow_drafting:
-            # デバッグモードでも「意図なし」はLLMを呼ばずに済ませるが、受信記録は必ず送る
-            if not _is_debug_mode():
-                await _push_admin_text(
-                    f"📭 {display_name or '不明'}さんから（予約意図なしと判定）:\n── 原文 ──\n{msg}"
-                )
+            # 意図なしはLLMも管理者通知も行わず、受信監査ログだけを保存する。
             await save_shadow_log(
                 db,
                 line_user_id=user_id,
@@ -1009,19 +991,11 @@ async def handle_shadow_message(
                     user_id[:12], existing_reservation_ref.get("existing_reservation_id"),
                 )
 
-        # ── デバッグモード: LLM解析直後のフルダンプ ──
+        # ── デバッグモード: 解析概要だけをサーバーログへ ──
         if _is_debug_mode():
-            await _push_admin_text(
-                _format_debug_dump(
-                    stage="AI解析後",
-                    display_name=display_name,
-                    user_id=user_id,
-                    raw_message=msg,
-                    intent_detected=intent_detected,
-                    mode=current_mode,
-                    draft=prev_draft,
-                    analysis=analysis,
-                )
+            logger.debug(
+                "Shadow debug analyzed (user=%s, intent=%s, source=%s)",
+                user_id[:12], intent, analysis.get("_source"),
             )
 
         # 予約希望以外の意図は原則手動対応。ただし変更依頼で希望日時の断片が
@@ -1133,20 +1107,12 @@ async def handle_shadow_message(
                 notified=True,
             )
         else:
-            # まだ情報不足 → 管理者に進捗通知
+            # まだ情報不足 → 受信ログだけ残す。途中経過は管理者LINEへ送らない。
             missing = []
             if not has_date:
                 missing.append("日付")
             if not has_time:
                 missing.append("時間")
-            status_msg = _format_draft_progress(
-                display_name=display_name,
-                user_id=user_id,
-                raw_message=msg,
-                draft=merged,
-                missing=missing,
-            )
-            await _push_admin_text(status_msg)
             await save_shadow_log(
                 db,
                 line_user_id=user_id,
@@ -1207,41 +1173,6 @@ async def _get_patient_default_preset(db: AsyncSession, patient: Patient | None)
     }
 
 
-def _format_draft_progress(
-    *,
-    display_name: str | None,
-    user_id: str,
-    raw_message: str,
-    draft: dict,
-    missing: list[str],
-) -> str:
-    """管理者向けドラフト進捗通知テキスト"""
-    ts = now_jst().strftime("%H:%M")
-    name = display_name or "不明"
-    lines = [
-        f"📝 予約抽出中: {name}",
-        f"受信 {ts}: {raw_message[:120]}",
-        "── 抽出済み ──",
-    ]
-    if draft.get("date"):
-        lines.append(f"日付: {draft['date']}")
-    if draft.get("time"):
-        lines.append(f"時間: {draft['time']}")
-    if draft.get("duration_minutes"):
-        lines.append(f"施術時間: {draft['duration_minutes']}分")
-    if draft.get("existing_reservation_id"):
-        current = " ".join(
-            part for part in [draft.get("current_date"), draft.get("current_time"), draft.get("current_end_time")]
-            if part
-        )
-        lines.append(f"既存予約照合: #{draft['existing_reservation_id']} {current}".strip())
-    if draft.get("practitioner_name"):
-        lines.append(f"既存担当: {draft['practitioner_name']}")
-    if missing:
-        lines.append(f"⏳ 未抽出: {', '.join(missing)}")
-    return "\n".join(lines)
-
-
 def _draft_from_pending_request(request: dict) -> dict:
     """確認待ちリクエストから、追加メッセージ再解析用のドラフトを復元する。"""
     if not request:
@@ -1275,52 +1206,6 @@ async def _push_admin_text(text: str) -> bool:
 def _is_debug_mode() -> bool:
     """シャドーデモ用フルデバッグ出力のON/OFF"""
     return bool(getattr(settings, "shadow_debug_dump", False))
-
-
-def _format_debug_dump(
-    *,
-    stage: str,
-    display_name: str | None,
-    user_id: str,
-    raw_message: str,
-    intent_detected: bool | None = None,
-    mode: str | None = None,
-    draft: dict | None = None,
-    analysis: dict | None = None,
-) -> str:
-    """デモ検証用：全状態をダンプする通知テキスト"""
-    ts = now_jst().strftime("%Y-%m-%d %H:%M:%S")
-    name = display_name or "（display_name取得失敗）"
-    lines = [
-        f"🧪【DEBUG/{stage}】{ts}",
-        f"user_id: {user_id}",
-        f"display_name: {name}",
-        f"mode: {mode or '-'}",
-        f"キーワード意図検出: {intent_detected}",
-        "─ 原文（全文）─",
-        raw_message if raw_message else "（空）",
-    ]
-    if draft:
-        lines.append("─ 既存ドラフト ─")
-        for k, v in draft.items():
-            lines.append(f"  {k}: {v}")
-    if analysis:
-        lines.append("─ AI解析結果 ─")
-        lines.append(f"  source: {analysis.get('_source')}")
-        lines.append(f"  intent: {analysis.get('intent')}")
-        lines.append(f"  name: {analysis.get('name')}")
-        lines.append(f"  content: {analysis.get('content')}")
-        lines.append(f"  current_date: {analysis.get('current_date')}")
-        lines.append(f"  current_time: {analysis.get('current_time')}")
-        lines.append(f"  date: {analysis.get('date')}")
-        lines.append(f"  time: {analysis.get('time')}")
-        lines.append(f"  duration_minutes: {analysis.get('duration_minutes')}")
-        lines.append(f"  confidence: {analysis.get('confidence')}")
-        llm_raw = analysis.get("_llm_raw")
-        if llm_raw:
-            lines.append("─ LLM rawレスポンス ─")
-            lines.append(str(llm_raw)[:600])
-    return "\n".join(lines)[:4800]  # LINE文字数制限考慮
 
 
 async def _shadow_check_and_notify(
@@ -1487,26 +1372,11 @@ def _build_shadow_available_flex(
     raw_message: str = "",
     content_summary: str = "",
 ) -> dict:
-    """空きあり時の管理者通知 Flex Message（原文→分類→内容→希望時間→枠の状況）"""
+    """空きあり時の管理者通知 Flex Message（確定判断に必要な情報のみ）"""
     uid_suffix = f"&uid={user_id}" if user_id else ""
     end_time_str = end_dt.strftime("%H:%M")
 
     body_contents: list[dict] = [
-        # 原文セクション
-        {"type": "text", "text": "【原文】", "size": "xs", "color": "#6B7280", "weight": "bold"},
-        {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [
-                {"type": "text", "text": raw_message[:300] or "—", "wrap": True, "size": "sm"}
-            ],
-            "backgroundColor": "#F3F4F6",
-            "paddingAll": "8px",
-            "cornerRadius": "4px",
-            "margin": "xs",
-        },
-        {"type": "separator", "margin": "md"},
-        # 分類
         {"type": "text", "text": f"【分類】予約希望", "size": "sm", "weight": "bold", "margin": "md"},
         # 内容
         {"type": "text", "text": f"【内容】{content_summary}", "wrap": True, "size": "sm"},
@@ -1631,25 +1501,10 @@ def _build_shadow_conflict_flex(
     raw_message: str = "",
     content_summary: str = "",
 ) -> dict:
-    """満席時の管理者通知 Flex Message（原文→分類→内容→希望時間→枠の状況→提案3件）"""
+    """満席時の管理者通知 Flex Message（確定判断に必要な情報のみ）"""
     uid_suffix = f"&uid={user_id}" if user_id else ""
 
     body_contents: list[dict] = [
-        # 原文セクション
-        {"type": "text", "text": "【原文】", "size": "xs", "color": "#6B7280", "weight": "bold"},
-        {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [
-                {"type": "text", "text": raw_message[:300] or "—", "wrap": True, "size": "sm"}
-            ],
-            "backgroundColor": "#F3F4F6",
-            "paddingAll": "8px",
-            "cornerRadius": "4px",
-            "margin": "xs",
-        },
-        {"type": "separator", "margin": "md"},
-        # 分類
         {"type": "text", "text": f"【分類】予約希望", "size": "sm", "weight": "bold", "margin": "md"},
         # 内容
         {"type": "text", "text": f"【内容】{content_summary}", "wrap": True, "size": "sm"},
