@@ -494,7 +494,15 @@ def test_autopilot_setup_extracts_name_phone_and_reading_birth_date():
 
 
 def test_autopilot_usual_confirmation_uses_patient_default_menu_duration_and_practitioner():
-    from app.api.line import _extract_alternative_choice, _format_usual_confirmation, _is_affirmative, _is_negative
+    from app.api.line import (
+        _extract_alternative_choice,
+        _format_autopilot_slot_confirmation,
+        _format_usual_confirmation,
+        _has_vague_time_period,
+        _is_affirmative,
+        _is_negative,
+    )
+    from app.utils.datetime_jst import JST
 
     text = _format_usual_confirmation(
         {
@@ -515,6 +523,15 @@ def test_autopilot_usual_confirmation_uses_patient_default_menu_duration_and_pra
     assert _is_negative("いや") is True
     assert _extract_alternative_choice("じゃあ2で！", 3) == 2
     assert _extract_alternative_choice("3番をお願いします", 3) == 3
+    assert _has_vague_time_period("明日の午後") is True
+    assert _has_vague_time_period("明日の14時") is False
+    slot_confirmation = _format_autopilot_slot_confirmation(
+        datetime(2026, 8, 13, 14, 0, tzinfo=JST),
+        datetime(2026, 8, 13, 15, 0, tzinfo=JST),
+        "時田",
+    )
+    assert "8/13(木) 14:00〜15:00" in slot_confirmation
+    assert "よろしいでしょうか" in slot_confirmation
 
 
 @pytest.mark.asyncio
@@ -536,7 +553,7 @@ async def test_autopilot_cancel_confirmation_accepts_casual_affirmative():
         "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
     ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
         "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
-    ), patch("app.api.line.create_notification", new=AsyncMock()), patch(
+    ), patch("app.api.line.create_notification", new=AsyncMock()) as mock_notification, patch(
         "app.api.line.transition_status", new=AsyncMock()
     ) as mock_transition, patch("app.api.line.clear_user_draft", new=AsyncMock()), patch(
         "app.api.line.set_user_mode", new=AsyncMock()
@@ -545,7 +562,44 @@ async def test_autopilot_cancel_confirmation_accepts_casual_affirmative():
 
     mock_transition.assert_awaited_once_with(db, 91, "CANCELLED")
     assert mock_set_mode.await_args.args[2] == "idle"
+    assert mock_notification.await_args.args[1] == "reservation_cancelled"
+    assert mock_notification.await_args.args[3] == 91
     assert "キャンセルしました" in mock_reply.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_autopilot_change_proposes_slot_before_rescheduling():
+    from app.api.line import _complete_autopilot_reschedule
+    from app.utils.datetime_jst import JST
+
+    reservation = SimpleNamespace(
+        id=91,
+        start_time=datetime(2026, 8, 13, 10, 0, tzinfo=JST),
+        end_time=datetime(2026, 8, 13, 11, 0, tzinfo=JST),
+    )
+    practitioner = SimpleNamespace(id=3, name="時田")
+    start_dt = datetime(2026, 8, 14, 14, 0, tzinfo=JST)
+    end_dt = datetime(2026, 8, 14, 15, 0, tzinfo=JST)
+    db = AsyncMock()
+
+    with patch("app.api.line.find_best_practitioner", new=AsyncMock(return_value=(practitioner, start_dt, end_dt, 0, 0))), patch(
+        "app.api.line.merge_user_draft", new=AsyncMock()
+    ) as mock_merge, patch("app.api.line.set_user_mode", new=AsyncMock()) as mock_set_mode, patch(
+        "app.api.line.reply_to_line", new=AsyncMock()
+    ) as mock_reply:
+        proposed = await _complete_autopilot_reschedule(
+            db,
+            reservation=reservation,
+            desired_date="2026-08-14",
+            desired_time="14:00",
+            user_id="U-autopilot",
+            reply_token="reply-token",
+        )
+
+    assert proposed is True
+    assert mock_merge.await_args.args[2]["autopilot_change_reservation_id"] == 91
+    assert mock_set_mode.await_args.args[2] == "autopilot_change_confirm"
+    assert "よろしいでしょうか" in mock_reply.await_args.args[1]
 
 
 @pytest.mark.asyncio

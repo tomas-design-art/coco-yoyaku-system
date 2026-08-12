@@ -687,7 +687,7 @@ async def _complete_autopilot_reschedule(
     user_id: str,
     reply_token: str | None,
 ) -> bool:
-    """既存予約の変更を実行し、失敗時は日時入力待ちを維持する。"""
+    """変更候補を提示し、患者の明示確認を待つ。"""
     try:
         target_date = date.fromisoformat(desired_date)
         target_time = time.fromisoformat(desired_time)
@@ -697,25 +697,29 @@ async def _complete_autopilot_reschedule(
         )
         if not practitioner:
             raise HTTPException(status_code=409, detail="変更先に空き枠がありません")
-        await reschedule_reservation(
-            db,
-            reservation.id,
-            start_dt,
-            end_dt,
-            practitioner.id,
-        )
     except (HTTPException, ValueError):
         await set_user_mode(db, user_id, "autopilot_change_datetime")
         if reply_token:
             await reply_to_line(reply_token, "ご希望の枠はご案内できませんでした。別のご希望日時を教えてください。\n例: 明日の午後3時")
         return False
 
-    await clear_user_draft(db, user_id)
-    await set_user_mode(db, user_id, "idle")
+    await merge_user_draft(
+        db,
+        user_id,
+        {
+            "autopilot_change_reservation_id": reservation.id,
+            "autopilot_change_start_time_iso": start_dt.isoformat(),
+            "autopilot_change_end_time_iso": end_dt.isoformat(),
+            "autopilot_change_practitioner_id": practitioner.id,
+            "autopilot_change_practitioner_name": practitioner.name,
+        },
+    )
+    await set_user_mode(db, user_id, "autopilot_change_confirm")
     if reply_token:
         await reply_to_line(
             reply_token,
-            f"ご予約を変更しました。\n{start_dt.strftime('%Y/%m/%d %H:%M')}〜{end_dt.strftime('%H:%M')}\nご来院をお待ちしております。",
+            "変更後の候補をご確認ください。\n"
+            + _format_autopilot_slot_confirmation(start_dt, end_dt, practitioner.name),
         )
     return True
 
@@ -842,6 +846,17 @@ def _compose_alternatives_text(alternatives: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _format_autopilot_slot_confirmation(start_dt: datetime, end_dt: datetime, practitioner_name: str) -> str:
+    return (
+        f"{_format_date_with_weekday_jp(start_dt.date())} {start_dt.strftime('%H:%M')}〜{end_dt.strftime('%H:%M')}"
+        f"（担当: {practitioner_name}）でよろしいでしょうか？\nはい / いいえ"
+    )
+
+
+def _has_vague_time_period(text: str) -> bool:
+    return bool(re.search(r"午前(?:中)?|午後|夕方|夜|晩|朝|morning|afternoon|evening|night", text or "", re.IGNORECASE))
+
+
 def _format_date_with_weekday_jp(d: date) -> str:
     weekday = ["月", "火", "水", "木", "金", "土", "日"][d.weekday()]
     return f"{d.month}/{d.day}({weekday})"
@@ -959,6 +974,48 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 )
             return
 
+    if is_autopilot_patient and current_mode == "autopilot_booking_confirm":
+        request_id = user_state.get("request_id")
+        request_data = await get_request(db, request_id, line_user_id=user_id) if request_id else None
+        if _is_negative(text):
+            await clear_user_draft(db, user_id)
+            await set_user_mode(db, user_id, "waiting_datetime", request_id)
+            if reply_token:
+                await reply_to_line(reply_token, "候補を取りやめました。別のご希望日時を教えてください。")
+            return
+        if not _is_affirmative(text) or not request_data or not request_data.get("available"):
+            if reply_token:
+                await reply_to_line(reply_token, "この候補で予約する場合は「はい」、別の日時を希望する場合は「いいえ」と返信してください。")
+            return
+        try:
+            start_dt = datetime.fromisoformat(request_data["start_time_iso"])
+            end_dt = datetime.fromisoformat(request_data["end_time_iso"])
+            reservation = await create_reservation(
+                db,
+                ReservationCreate(
+                    patient_id=line_patient.id,
+                    practitioner_id=int(request_data["practitioner_id"]),
+                    menu_id=request_data.get("menu_id"),
+                    start_time=start_dt,
+                    end_time=end_dt,
+                    channel="LINE",
+                    notes="LINE AI秘書 確認後確定",
+                ),
+                reject_conflicts=True,
+            )
+        except (HTTPException, ValueError):
+            await update_request(db, request_id, line_user_id=user_id, status="alternatives_sent")
+            await set_user_mode(db, user_id, "adjusting", request_id)
+            if reply_token:
+                await reply_to_line(reply_token, "候補枠が直前に埋まりました。別の候補をご案内します。")
+            return
+        await update_request(db, request_id, line_user_id=user_id, status="confirmed", reservation_id=reservation.get("id"))
+        await clear_user_draft(db, user_id)
+        await set_user_mode(db, user_id, "idle")
+        if reply_token:
+            await reply_to_line(reply_token, f"ご予約を確定しました。\n{start_dt.strftime('%Y/%m/%d %H:%M')}〜{end_dt.strftime('%H:%M')}\nご来院をお待ちしております。")
+        return
+
     if is_autopilot_patient and current_mode == "adjusting":
         request_id = user_state.get("request_id")
         request_data = await get_request(db, request_id, line_user_id=user_id) if request_id else None
@@ -979,31 +1036,25 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         time.fromisoformat(alternative["end"]),
                         tzinfo=JST,
                     )
-                    reservation = await create_reservation(
-                        db,
-                        ReservationCreate(
-                            patient_id=line_patient.id,
-                            practitioner_id=int(alternative["practitioner_id"]),
-                            menu_id=request_data.get("menu_id"),
-                            start_time=start_dt,
-                            end_time=end_dt,
-                            channel="LINE",
-                            notes="LINE AI秘書 自動確定（代替候補）",
-                        ),
-                        reject_conflicts=True,
-                    )
-                except HTTPException:
+                except (KeyError, TypeError, ValueError):
                     if reply_token:
-                        await reply_to_line(reply_token, "その枠は直前に埋まりました。別の候補を確認しますので、しばらくお待ちください。")
-                    await set_user_mode(db, user_id, "manual", request_id)
+                        await reply_to_line(reply_token, "候補を確認できませんでした。別のご希望日時を教えてください。")
                     return
-                await update_request(db, request_id, line_user_id=user_id, status="confirmed", reservation_id=reservation.get("id"))
-                await clear_user_draft(db, user_id)
-                await set_user_mode(db, user_id, "idle")
+                await update_request(
+                    db,
+                    request_id,
+                    line_user_id=user_id,
+                    available=True,
+                    practitioner_id=int(alternative["practitioner_id"]),
+                    start_time_iso=start_dt.isoformat(),
+                    end_time_iso=end_dt.isoformat(),
+                    status="awaiting_patient_confirmation",
+                )
+                await set_user_mode(db, user_id, "autopilot_booking_confirm", request_id)
                 if reply_token:
                     await reply_to_line(
                         reply_token,
-                        f"ご予約を確定しました。\n{start_dt.strftime('%Y/%m/%d %H:%M')}〜{end_dt.strftime('%H:%M')}\nご来院をお待ちしております。",
+                        _format_autopilot_slot_confirmation(start_dt, end_dt, alternative.get("practitioner_name") or "担当者"),
                     )
                 return
 
@@ -1022,6 +1073,12 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 return
             await clear_user_draft(db, user_id)
             await set_user_mode(db, user_id, "idle")
+            await create_notification(
+                db,
+                "reservation_cancelled",
+                f"LINE予約キャンセル: {line_patient.name}様",
+                int(reservation_id),
+            )
             if reply_token:
                 await reply_to_line(reply_token, "ご予約をキャンセルしました。")
             return
@@ -1057,6 +1114,36 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             user_id=user_id,
             reply_token=reply_token,
         )
+        return
+
+    if is_autopilot_patient and current_mode == "autopilot_change_confirm":
+        reservation_id = prev_draft.get("autopilot_change_reservation_id")
+        start_time_iso = prev_draft.get("autopilot_change_start_time_iso")
+        end_time_iso = prev_draft.get("autopilot_change_end_time_iso")
+        practitioner_id = prev_draft.get("autopilot_change_practitioner_id")
+        if _is_negative(text):
+            await clear_user_draft(db, user_id)
+            await set_user_mode(db, user_id, "autopilot_change_datetime")
+            if reply_token:
+                await reply_to_line(reply_token, "変更候補を取りやめました。別のご希望日時を教えてください。")
+            return
+        if not _is_affirmative(text) or not all([reservation_id, start_time_iso, end_time_iso, practitioner_id]):
+            if reply_token:
+                await reply_to_line(reply_token, "変更する場合は「はい」、別の日時を希望する場合は「いいえ」と返信してください。")
+            return
+        try:
+            start_dt = datetime.fromisoformat(start_time_iso)
+            end_dt = datetime.fromisoformat(end_time_iso)
+            await reschedule_reservation(db, int(reservation_id), start_dt, end_dt, int(practitioner_id))
+        except (HTTPException, ValueError):
+            await set_user_mode(db, user_id, "autopilot_change_datetime")
+            if reply_token:
+                await reply_to_line(reply_token, "候補枠が直前に埋まりました。別のご希望日時を教えてください。")
+            return
+        await clear_user_draft(db, user_id)
+        await set_user_mode(db, user_id, "idle")
+        if reply_token:
+            await reply_to_line(reply_token, f"ご予約を変更しました。\n{start_dt.strftime('%Y/%m/%d %H:%M')}〜{end_dt.strftime('%H:%M')}\nご来院をお待ちしております。")
         return
 
     if is_autopilot_patient and current_mode == "autopilot_confirm_usual":
@@ -1516,6 +1603,10 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     if not practitioner:
         scored = await score_candidates(db, target_date, target_time, duration, max_results=3)
         alternatives = [s.to_dict() for s in scored]
+    elif is_autopilot_patient and _has_vague_time_period(text):
+        scored = await score_candidates(db, target_date, target_time, duration, max_results=3)
+        alternatives = [s.to_dict() for s in scored]
+        practitioner = None
 
     if practitioner:
         gap_notes = []
@@ -1559,42 +1650,12 @@ async def _handle_text_message(event: dict, db: AsyncSession):
 
     if is_autopilot_patient:
         if practitioner:
-            try:
-                reservation = await create_reservation(
-                    db,
-                    ReservationCreate(
-                        patient_id=line_patient.id,
-                        practitioner_id=practitioner.id,
-                        menu_id=menu.id if menu else None,
-                        start_time=start_dt,
-                        end_time=end_dt,
-                        channel="LINE",
-                        notes="LINE AI秘書 自動確定",
-                    ),
-                    reject_conflicts=True,
-                )
-            except HTTPException:
-                scored = await score_candidates(db, target_date, target_time, duration, max_results=3)
-                alternatives = [slot.to_dict() for slot in scored]
-                await update_request(
-                    db,
-                    request_id,
-                    line_user_id=user_id,
-                    available=False,
-                    alternatives=alternatives,
-                    status="alternatives_sent",
-                )
-                await set_user_mode(db, user_id, "adjusting", request_id)
-                if reply_token:
-                    await reply_to_line(reply_token, _compose_alternatives_text(alternatives))
-                return
-            await update_request(db, request_id, line_user_id=user_id, status="confirmed", reservation_id=reservation.get("id"))
-            await clear_user_draft(db, user_id)
-            await set_user_mode(db, user_id, "idle")
+            await update_request(db, request_id, line_user_id=user_id, status="awaiting_patient_confirmation")
+            await set_user_mode(db, user_id, "autopilot_booking_confirm", request_id)
             if reply_token:
                 await reply_to_line(
                     reply_token,
-                    f"ご予約を確定しました。\n{start_dt.strftime('%Y/%m/%d %H:%M')}〜{end_dt.strftime('%H:%M')}\nご来院をお待ちしております。",
+                    _format_autopilot_slot_confirmation(start_dt, end_dt, practitioner.name),
                 )
             return
 
