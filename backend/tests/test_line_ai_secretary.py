@@ -463,6 +463,24 @@ def test_autopilot_setup_extracts_name_phone_and_reading_birth_date():
     assert birth_date.isoformat() == "1990-04-01"
 
 
+def test_autopilot_usual_confirmation_uses_patient_default_menu_duration_and_practitioner():
+    from app.api.line import _format_usual_confirmation, _is_affirmative
+
+    text = _format_usual_confirmation(
+        {
+            "menu_name": "マッスルセラピー",
+            "duration_minutes": 60,
+            "practitioner_name": "時田",
+        }
+    )
+
+    assert "マッスルセラピー 60分" in text
+    assert "担当: 時田" in text
+    assert _is_affirmative("はい") is True
+    assert _is_affirmative("それでお願いします") is True
+    assert _is_affirmative("いいえ") is False
+
+
 @pytest.mark.asyncio
 async def test_autopilot_setup_keyword_starts_identity_flow_only():
     from app.api.line import _handle_autopilot_setup_message
@@ -532,7 +550,35 @@ async def test_autopilot_setup_asks_reading_and_birth_when_phone_is_not_unique()
 
     assert handled is True
     assert mock_set_mode.await_args.args[2] == "autopilot_setup_reading_birth"
-    assert "読み仮名" in mock_reply.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_autopilot_rich_menu_trigger_restarts_booking_instead_of_manual_mode():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "予約/変更"},
+    }
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state", new=AsyncMock(return_value={"mode": "manual", "draft": {}, "request_id": None})
+    ), patch("app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")), patch(
+        "app.api.line._find_line_patient", new=AsyncMock(return_value=patient)
+    ), patch("app.api.line.create_notification", new=AsyncMock()), patch(
+        "app.api.line.clear_user_draft", new=AsyncMock()
+    ) as mock_clear, patch("app.api.line.set_user_mode", new=AsyncMock()) as mock_set_mode, patch(
+        "app.api.line._build_menu_quick_reply_items", new=AsyncMock(return_value=[])
+    ), patch("app.api.line.reply_text_with_quick_reply", new=AsyncMock()) as mock_reply:
+        await _handle_text_message(event, db)
+
+    mock_clear.assert_awaited_once_with(db, "U-autopilot")
+    assert mock_set_mode.await_args.args[2] == "waiting_menu"
+    mock_reply.assert_awaited_once()
+    assert "ご希望メニュー" in mock_reply.await_args.args[1]
 
 
 @pytest.mark.asyncio

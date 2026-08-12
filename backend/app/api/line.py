@@ -622,6 +622,19 @@ def _requires_manual_autopilot_handling(text: str) -> bool:
     return any(word in (text or "") for word in ("遅刻", "遅れ", "相談", "問合せ", "問い合わせ"))
 
 
+def _is_booking_or_change_menu_trigger(text: str) -> bool:
+    return (text or "").strip().replace("／", "/") in {"予約/変更", "予約", "変更"}
+
+
+def _is_affirmative(text: str) -> bool:
+    return (text or "").strip() in {"はい", "お願いします", "それでお願いします", "それで"}
+
+
+def _format_usual_confirmation(preset: dict) -> str:
+    practitioner = f"・担当: {preset['practitioner_name']}" if preset.get("practitioner_name") else ""
+    return f"いつもの{preset['menu_name']} {preset['duration_minutes']}分{practitioner}でよろしいですか？\nはい / いいえ"
+
+
 async def _handle_autopilot_setup_message(
     db: AsyncSession,
     *,
@@ -798,6 +811,20 @@ async def _handle_text_message(event: dict, db: AsyncSession):
 
     await create_notification(db, "line_message", f"LINE受信: {text[:100]}")
 
+    # リッチメニューの「予約/変更」は具体的な変更依頼ではない。
+    # 過去にmanualへ退避した対象者も、ここから予約会話を再開できる。
+    if is_autopilot_patient and _is_booking_or_change_menu_trigger(text):
+        await clear_user_draft(db, user_id)
+        await set_user_mode(db, user_id, "waiting_menu")
+        if reply_token:
+            quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
+            await reply_text_with_quick_reply(
+                reply_token,
+                "ご希望メニューを選んでください。",
+                quick_items,
+            )
+        return
+
     # 管理者が「自分で返信」を選択したユーザーは自動返信停止
     if await get_user_mode(db, user_id) == "manual":
         await create_notification(db, "line_manual_mode", f"手動対応中ユーザーから受信: {text[:80]}")
@@ -887,6 +914,36 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         if reply_token:
             await reply_to_line(reply_token, "キャンセルする場合は「はい」、取りやめる場合は「いいえ」と返信してください。")
         return
+
+    if is_autopilot_patient and current_mode == "autopilot_confirm_usual":
+        preset = await _get_patient_default_preset(db, line_patient)
+        if not preset:
+            await set_user_mode(db, user_id, "waiting_menu")
+            if reply_token:
+                quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
+                await reply_text_with_quick_reply(reply_token, "ご希望メニューを選んでください。", quick_items)
+            return
+        if _is_affirmative(text):
+            usual_draft = {
+                "menu_id": preset["menu_id"],
+                "menu_name": preset["menu_name"],
+                "duration_minutes": preset["duration_minutes"],
+            }
+            if preset.get("practitioner_id"):
+                usual_draft["practitioner_id"] = preset["practitioner_id"]
+                usual_draft["practitioner_name"] = preset["practitioner_name"]
+            merged = await merge_user_draft(db, user_id, usual_draft)
+            await set_user_mode(db, user_id, "idle")
+        elif text.strip() in {"いいえ", "変更", "ちがう", "違う"}:
+            await set_user_mode(db, user_id, "waiting_menu")
+            if reply_token:
+                quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
+                await reply_text_with_quick_reply(reply_token, "ご希望メニューを選んでください。", quick_items)
+            return
+        else:
+            if reply_token:
+                await reply_to_line(reply_token, _format_usual_confirmation(preset))
+            return
 
     if is_autopilot_patient and _requires_manual_autopilot_handling(text):
         await set_user_mode(db, user_id, "manual")
@@ -1248,6 +1305,12 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         )
 
     if not merged.get("menu_name"):
+        preset = await _get_patient_default_preset(db, line_patient) if is_autopilot_patient else None
+        if preset:
+            await set_user_mode(db, user_id, "autopilot_confirm_usual")
+            if reply_token:
+                await reply_to_line(reply_token, _format_usual_confirmation(preset))
+            return
         await set_user_mode(db, user_id, "waiting_menu", user_state.get("request_id"))
         await create_notification(db, "line_interviewing", f"LINE情報ヒアリング中: {user_id} missing=menu_name")
         if reply_token:
@@ -1315,7 +1378,13 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             await reply_to_line(reply_token, "日時の解釈に失敗しました。例: 4/10 10:00 の形式で送信してください。")
         return
 
-    practitioner, start_dt, end_dt, gap_before, gap_after = await find_best_practitioner(db, target_date, target_time, duration)
+    practitioner, start_dt, end_dt, gap_before, gap_after = await find_best_practitioner(
+        db,
+        target_date,
+        target_time,
+        duration,
+        practitioner_id=merged.get("practitioner_id"),
+    )
     alternatives: list[dict] = []
     if not practitioner:
         scored = await score_candidates(db, target_date, target_time, duration, max_results=3)

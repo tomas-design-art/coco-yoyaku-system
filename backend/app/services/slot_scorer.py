@@ -377,6 +377,7 @@ async def find_best_practitioner(
     start_time: time,
     duration_minutes: int,
     prefer_director: bool = False,
+    practitioner_id: int | None = None,
 ) -> tuple[Practitioner | None, datetime, datetime, int, int]:
     """
     指定スロットで最適な施術者を選択。
@@ -387,11 +388,10 @@ async def find_best_practitioner(
     start_dt = datetime.combine(target_date, start_time, tzinfo=JST)
     end_dt = start_dt + timedelta(minutes=duration_minutes)
 
-    prac_q = await db.execute(
-        select(Practitioner)
-        .where(Practitioner.is_active == True)
-        .order_by(Practitioner.display_order)
-    )
+    practitioner_query = select(Practitioner).where(Practitioner.is_active == True)
+    if practitioner_id is not None:
+        practitioner_query = practitioner_query.where(Practitioner.id == practitioner_id)
+    prac_q = await db.execute(practitioner_query.order_by(Practitioner.display_order))
     practitioners = list(prac_q.scalars().all())
     if not practitioners:
         return None, start_dt, end_dt, 0, 0
