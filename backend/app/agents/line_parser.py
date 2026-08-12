@@ -110,7 +110,16 @@ def _extract_menu(message: str) -> str | None:
     return None
 
 
+def _strip_courtesy_phrases(message: str) -> str:
+    """日時抽出を誤らせる定型的な挨拶を除去する。"""
+    cleaned = message or ""
+    cleaned = re.sub(r"夜分\s*遅く(?:に)?\s*(?:失礼(?:します|いたします)?|すみません|申し訳ありません)?", "", cleaned)
+    cleaned = re.sub(r"夜分(?:に)?\s*(?:失礼(?:します|いたします)?|すみません|申し訳ありません)", "", cleaned)
+    return cleaned
+
+
 def _extract_date_time(message: str) -> tuple[str | None, str | None]:
+    message = _strip_courtesy_phrases(message)
     now = now_jst()
     date_val: str | None = None
     time_val: str | None = None
@@ -125,13 +134,18 @@ def _extract_date_time(message: str) -> tuple[str | None, str | None]:
     elif "今日" in message:
         date_val = now.date().isoformat()
 
-    # 絶対日付 4/10, 4月10日
-    m = re.search(r"(\d{1,2})\s*[月/]\s*(\d{1,2})\s*日?", message)
-    if m:
-        mm = int(m.group(1))
-        dd = int(m.group(2))
-        yy = now.year + (1 if mm < now.month else 0)
+    # 絶対日付 YYYY/MM/DD, YYYY-MM-DD, 4/10, 4月10日
+    m_year = re.search(r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})", message)
+    if m_year:
+        yy, mm, dd = map(int, m_year.groups())
         date_val = f"{yy:04d}-{mm:02d}-{dd:02d}"
+    else:
+        m = re.search(r"(\d{1,2})\s*[月/]\s*(\d{1,2})\s*日?", message)
+        if m:
+            mm = int(m.group(1))
+            dd = int(m.group(2))
+            yy = now.year + (1 if mm < now.month else 0)
+            date_val = f"{yy:04d}-{mm:02d}-{dd:02d}"
 
     # 曜日表現: 来週/次の/今週/単独のX曜日
     if not date_val:
@@ -147,22 +161,23 @@ def _extract_date_time(message: str) -> tuple[str | None, str | None]:
                 days_ahead = 7
             date_val = (now.date() + timedelta(days=days_ahead)).isoformat()
 
-    # 時刻 10時, 10:30, 10時半
-    m2 = re.search(r"(\d{1,2})\s*[時:：]\s*(\d{1,2})", message)
+    # 時刻 午後3時, 午後3:30, 10時半
+    m2 = re.search(r"(午前|午後)?\s*(\d{1,2})\s*[:：]\s*(\d{1,2})", message)
     if m2:
-        hh = int(m2.group(1))
-        mi = int(m2.group(2))
+        period, hour, minute = m2.groups()
+        hh = int(hour)
+        mi = int(minute)
+        if period == "午後" and 1 <= hh <= 11:
+            hh += 12
         time_val = f"{hh:02d}:{mi:02d}"
     else:
-        m3 = re.search(r"(\d{1,2})\s*時\s*半", message)
+        m3 = re.search(r"(午前|午後)?\s*(\d{1,2})\s*時\s*(半)?", message)
         if m3:
-            hh = int(m3.group(1))
-            time_val = f"{hh:02d}:30"
-        else:
-            m4 = re.search(r"(\d{1,2})\s*時", message)
-            if m4:
-                hh = int(m4.group(1))
-                time_val = f"{hh:02d}:00"
+            period, hour, half = m3.groups()
+            hh = int(hour)
+            if period == "午後" and 1 <= hh <= 11:
+                hh += 12
+            time_val = f"{hh:02d}:{'30' if half else '00'}"
 
     if not time_val:
         if "午前中" in message or "午前" in message:
@@ -218,7 +233,10 @@ def _rule_based_parse(message: str, profile_name: str | None = None, previous: d
     """ルールベースのメッセージ解析"""
     previous = previous or {}
     # 予約キーワード
-    reservation_keywords = ["予約", "よやく", "空き", "あき", "取りたい", "お願い", "受診", "見てもら", "診てもら"]
+    reservation_keywords = [
+        "予約", "よやく", "空き", "あき", "空いて", "空きますか", "取りたい", "お願い",
+        "受診", "診察", "見てもら", "診てもら",
+    ]
     has_intent = any(kw in message for kw in reservation_keywords)
     date_val, time_val = _extract_date_time(message)
     name_val = _extract_name(message)

@@ -187,6 +187,17 @@ def test_line_parser_resolves_morning_and_next_sunday_in_real_time():
     assert sunday_date == next_sunday.isoformat()
 
 
+def test_line_parser_reuses_shadow_datetime_normalization_rules():
+    from app.agents.line_parser import _extract_date_time
+
+    afternoon_date, afternoon_time = _extract_date_time("2026-08-15の午後3時半に予約したい")
+    _, courtesy_time = _extract_date_time("夜分遅くに失礼します。明日空いていますか？")
+
+    assert afternoon_date == "2026-08-15"
+    assert afternoon_time == "15:30"
+    assert courtesy_time is None
+
+
 def test_missing_info_message_contains_required_labels():
     from app.api.line import _build_missing_info_message
 
