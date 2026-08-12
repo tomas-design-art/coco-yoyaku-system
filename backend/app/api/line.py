@@ -1013,8 +1013,12 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             try:
                 await transition_status(db, int(reservation_id), "CANCELLED")
                 await db.commit()
-            except HTTPException:
-                await set_user_mode(db, user_id, "manual")
+            except HTTPException as error:
+                await db.rollback()
+                await set_user_mode(db, user_id, "autopilot_cancel_confirm")
+                logger.warning("LINE autopilot cancellation failed: reservation_id=%s detail=%s", reservation_id, error.detail)
+                if reply_token:
+                    await reply_to_line(reply_token, "キャンセル処理を完了できませんでした。もう一度「はい」と返信するか、担当者へご連絡ください。")
                 return
             await clear_user_draft(db, user_id)
             await set_user_mode(db, user_id, "idle")

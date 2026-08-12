@@ -63,7 +63,7 @@ class TestStatusTransitions:
         valid = {
             "PENDING": {"CONFIRMED", "REJECTED", "EXPIRED"},
             "HOLD": {"CONFIRMED", "EXPIRED"},
-            "CONFIRMED": {"CHANGE_REQUESTED", "CANCEL_REQUESTED"},
+            "CONFIRMED": {"CHANGE_REQUESTED", "CANCEL_REQUESTED", "CANCELLED"},
             "CHANGE_REQUESTED": {"CANCELLED"},
             "CANCEL_REQUESTED": {"CANCELLED"},
         }
@@ -81,7 +81,7 @@ class TestStatusTransitions:
         valid = {
             "PENDING": {"CONFIRMED", "REJECTED", "EXPIRED"},
             "HOLD": {"CONFIRMED", "EXPIRED"},
-            "CONFIRMED": {"CHANGE_REQUESTED", "CANCEL_REQUESTED"},
+            "CONFIRMED": {"CHANGE_REQUESTED", "CANCEL_REQUESTED", "CANCELLED"},
         }
 
         # CANCELLED → CONFIRMED は不可
@@ -90,9 +90,9 @@ class TestStatusTransitions:
         assert "EXPIRED" in terminal
 
     def test_cancel_flow(self):
-        """CONFIRMED → CANCEL_REQUESTED → CANCELLED"""
+        """CONFIRMED → CANCEL_REQUESTED → CANCELLED と自動取消を許可する。"""
         valid = {
-            "CONFIRMED": {"CHANGE_REQUESTED", "CANCEL_REQUESTED"},
+            "CONFIRMED": {"CHANGE_REQUESTED", "CANCEL_REQUESTED", "CANCELLED"},
             "CANCEL_REQUESTED": {"CANCELLED"},
         }
         assert "CANCEL_REQUESTED" in valid["CONFIRMED"]
@@ -101,7 +101,7 @@ class TestStatusTransitions:
     def test_change_flow(self):
         """CONFIRMED → CHANGE_REQUESTED → CANCELLED（旧）+ CONFIRMED（新）"""
         valid = {
-            "CONFIRMED": {"CHANGE_REQUESTED", "CANCEL_REQUESTED"},
+            "CONFIRMED": {"CHANGE_REQUESTED", "CANCEL_REQUESTED", "CANCELLED"},
             "CHANGE_REQUESTED": {"CANCELLED"},
         }
         assert "CHANGE_REQUESTED" in valid["CONFIRMED"]

@@ -549,6 +549,38 @@ async def test_autopilot_cancel_confirmation_accepts_casual_affirmative():
 
 
 @pytest.mark.asyncio
+async def test_autopilot_cancel_failure_replies_and_keeps_confirmation_active():
+    from fastapi import HTTPException
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "はい"},
+    }
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state",
+        new=AsyncMock(return_value={"mode": "autopilot_cancel_confirm", "draft": {"autopilot_cancel_reservation_id": 91}, "request_id": None}),
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="autopilot_cancel_confirm")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.create_notification", new=AsyncMock()), patch(
+        "app.api.line.transition_status", new=AsyncMock(side_effect=HTTPException(status_code=400, detail="invalid transition"))
+    ), patch("app.api.line.set_user_mode", new=AsyncMock()) as mock_set_mode, patch(
+        "app.api.line.reply_to_line", new=AsyncMock()
+    ) as mock_reply:
+        await _handle_text_message(event, db)
+
+    db.rollback.assert_awaited_once()
+    assert mock_set_mode.await_args.args[2] == "autopilot_cancel_confirm"
+    assert "完了できませんでした" in mock_reply.await_args.args[1]
+
+
+@pytest.mark.asyncio
 async def test_autopilot_change_without_datetime_asks_and_keeps_conversation_active():
     from app.api.line import _handle_text_message
 
