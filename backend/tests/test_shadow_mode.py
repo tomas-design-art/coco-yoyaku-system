@@ -131,6 +131,15 @@ def test_debounce_flushes_previous():
     _DEBOUNCE_BUFFER.clear()
 
 
+def test_merge_debounced_message_returns_accumulated_text():
+    from app.services.line_debounce import _DEBOUNCE_BUFFER, merge_debounced_message
+
+    _DEBOUNCE_BUFFER.clear()
+    assert merge_debounced_message("user_c", "明日の") == "明日の"
+    assert merge_debounced_message("user_c", "14時で") == "明日の\n14時で"
+    _DEBOUNCE_BUFFER.clear()
+
+
 # ── シャドーモード Webhook 統合テスト ──
 
 

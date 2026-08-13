@@ -9,39 +9,25 @@ from app.utils.datetime_jst import now_jst
 
 logger = logging.getLogger(__name__)
 
-LINE_PARSE_PROMPT = """
-あなたは接骨院の熟練した多言語予約秘書です。以下のLINEメッセージから予約情報を抽出してください。
-今日の日付は {today}（{weekday}曜日）です。
+LINE_PARSE_PROMPT = """あなたは接骨院の熟練予約秘書AIです。患者からのLINEメッセージを解析し、必ずJSONのみで返します（説明文禁止）。
+今日は {today}（{weekday}曜日）。メッセージは任意の言語で届きます。言語を問わず意味を取り、日付時刻は必ず正規化してください。
 
-メッセージは日本語・英語・中国語・韓国語など、どの言語でも届きます。入力言語を問わず意味を理解し、日付と時刻は必ず下記のJSON形式へ正規化してください。患者が既に本人確認済みの場合は、名前が本文になくても名前を推測・創作しないでください。
+当院の有効メニュー一覧（この中の名称にマッピング。不明ならnull）:
+{menu_list}
 
-必ずJSONのみで返してください。説明文は禁止。
+出力JSON（全キー必須）:
+{{"intent":"new | change | cancel | question | other","has_reservation_intent":true,"name":null,"menu_hint":null,"date":null,"time":null,"current_date":null,"current_time":null,"duration_minutes":null,"constraints":[],"polarity":"affirmative | negative | none","confidence":"high | medium | low","needs_human":false}}
 
-予約意図がある場合:
-- has_reservation_intent: true
-- customer_name: 顧客名（例: 田中五郎丸）
-- date: 希望日（YYYY-MM-DD）
-- time: 希望時間（HH:MM）
-- menu_name: 施術メニュー（例: 保険診療 / 初診 / 骨盤矯正）
-- missing_fields: 欠けている必須項目名の配列。必須項目は customer_name,date,time,menu_name
-
-予約意図がない場合:
-- has_reservation_intent: false
-- summary: メッセージの要約
-
-JSON形式で返してください。
-
-日時解釈ルール:
-- 朝=09:00、午前/午前中=10:00、昼=12:00、午後=14:00、夕方=17:00、夜=19:00
-- 「明日」「明後日」「次の日曜日」「来週火曜日」などは、今日の日付を基準に未来の日付へ解決する
-- 「次のX曜日」は、直近の次のX曜日とする。今日がX曜日なら7日後とする
-- 時刻や日付が書かれていない予約希望は has_reservation_intent を true にし、該当する missing_fields を返す
+intent: new=新規予約/空き確認、change=日時変更、cancel=取消/行けない、question=営業時間・料金・領収書等、other=お礼・雑談・相槌。
+polarity: 「大丈夫じゃない」「難しい」「無理」「やめておく」はnegative。「それで」「おけ」「はい」「お願いします」はaffirmative。
+相対日付は今日基準で未来へ解決。朝=09:00、午前=10:00、昼=12:00、午後イチ/午後=14:00、夕方=17:00、夜=19:00。具体時刻があれば優先する。
+曖昧時間帯は time と constraints の window を併記する。constraints は end_by:HH:MM、after:HH:MM、before:HH:MM、window:HH:MM-HH:MM、asap、exclude_weekday:wed、exclude_date:YYYY-MM-DD、symptom:内容、ref_history 等を使う。
+name は患者の自己申告だけ。クレーム、緊急性の高い痛み、領収書・保険・料金の個別相談は needs_human=true。
 
 メッセージ:
 {message}
 
-JSON:
-"""
+JSON:"""
 
 
 def _normalize_name(name: str | None) -> str | None:
@@ -99,7 +85,10 @@ def extract_full_name(message: str, profile_name: str | None = None) -> str | No
     return _normalize_name(profile_name)
 
 
-def _extract_menu(message: str) -> str | None:
+def _extract_menu(message: str, menu_names: list[str] | None = None) -> str | None:
+    for menu_name in menu_names or []:
+        if menu_name and menu_name in message:
+            return menu_name
     menu_map = {
         "保険診療": ["保険診療", "保険", "保険の治療"],
         "初診": ["初診", "はじめて", "初めて", "初めての受診"],
@@ -110,6 +99,8 @@ def _extract_menu(message: str) -> str | None:
     for canonical, keys in menu_map.items():
         if any(k in message for k in keys):
             return canonical
+    if any(word in message for word in ("肩こり", "寝違え", "ぎっくり", "腰", "首", "痛み")):
+        return "保険診療"
     return None
 
 
@@ -204,49 +195,95 @@ def _compute_missing_fields(parsed: dict) -> list[str]:
     return [k for k in required if not parsed.get(k)]
 
 
-async def parse_line_message(message: str, profile_name: str | None = None, previous: dict | None = None) -> dict:
-    """LINEメッセージを解析して予約意図を判定"""
-    # ルールベース優先 + 前回文脈補完
-    result = _rule_based_parse(message, profile_name=profile_name, previous=previous)
-    if result.get("has_reservation_intent") and result.get("date") and result.get("time"):
-        result["missing_fields"] = _compute_missing_fields(result)
-        return result
+def _rule_intent(message: str) -> str:
+    text = _strip_courtesy_phrases(message).lower()
+    if re.search(r"キャンセル|取り消|取消|やめておく|やめます|行けなく|予定が入っ|cancel|취소", text):
+        return "cancel"
+    if re.search(r"変更|変え|ずら|別の日|リスケ|reschedule|change|変更", text):
+        return "change"
+    if re.search(r"領収書|保険|料金|何時から|営業時間|問い合わせ|問合せ", text):
+        return "question"
+    if re.search(r"予約|よやく|空き|あき|空いて|取りたい|受診|診てもら|見てもら|肩こり|寝違え|ぎっくり|午後イチ", text):
+        return "new"
+    return "other"
 
-    # AI解析
+
+def _rule_polarity(message: str) -> str:
+    text = message.lower()
+    if re.search(r"大丈夫じゃない|難しい|無理|いや|いいえ|やめ|だめ|ちがう", text):
+        return "negative"
+    if re.search(r"はい|うん|おけ|オッケー|それで|大丈夫です|お願いします|おねがい", text):
+        return "affirmative"
+    return "none"
+
+
+def _rule_constraints(message: str) -> list[str]:
+    constraints: list[str] = []
+    if match := re.search(r"(\d{1,2})時までに終わ", message):
+        constraints.append(f"end_by:{int(match.group(1)):02d}:00")
+    if match := re.search(r"(\d{1,2})時以降", message):
+        constraints.append(f"after:{int(match.group(1)):02d}:00")
+    windows = ((r"午前|朝", "00:00-12:00"), (r"昼", "11:00-14:00"), (r"午後", "12:00-24:00"), (r"夕方", "16:00-24:00"), (r"夜|晩", "18:00-24:00"))
+    for pattern, window in windows:
+        if re.search(pattern, message):
+            constraints.append(f"window:{window}")
+            break
+    if "なるべく早" in message:
+        constraints.append("asap")
+    weekday_map = {"月": "mon", "火": "tue", "水": "wed", "木": "thu", "金": "fri", "土": "sat", "日": "sun"}
+    if match := re.search(r"([月火水木金土日])曜以外", message):
+        constraints.append(f"exclude_weekday:{weekday_map[match.group(1)]}")
+    if "月末" in message:
+        constraints.append("date_range:month_end")
+    for symptom in ("肩こり", "寝違え", "ぎっくり腰"):
+        if symptom in message:
+            constraints.append(f"symptom:{symptom}")
+    if re.search(r"いつもの|この前と同じ", message):
+        constraints.append("ref_history")
+    return constraints
+
+
+def _normalize_result(parsed: dict, profile_name: str | None, previous: dict | None) -> dict:
+    previous = previous or {}
+    result = dict(parsed)
+    result["customer_name"] = _normalize_name(result.get("customer_name") or result.get("name")) or previous.get("customer_name") or _normalize_name(profile_name)
+    result["menu_name"] = result.get("menu_name") or result.get("menu_hint") or previous.get("menu_name")
+    result["date"] = result.get("date") or previous.get("date")
+    result["time"] = result.get("time") or previous.get("time")
+    result["intent"] = result.get("intent") if result.get("intent") in {"new", "change", "cancel", "question", "other"} else "other"
+    result["has_reservation_intent"] = bool(result.get("has_reservation_intent"))
+    result["constraints"] = result.get("constraints") if isinstance(result.get("constraints"), list) else []
+    result["polarity"] = result.get("polarity") if result.get("polarity") in {"affirmative", "negative", "none"} else "none"
+    result["confidence"] = result.get("confidence") if result.get("confidence") in {"high", "medium", "low"} else "medium"
+    result["needs_human"] = bool(result.get("needs_human"))
+    result["missing_fields"] = _compute_missing_fields(result)
+    return result
+
+
+async def parse_line_message(message: str, profile_name: str | None = None, previous: dict | None = None, menu_names: list[str] | None = None) -> dict:
+    """LINEメッセージを解析して予約意図を判定"""
+    fallback = _rule_based_parse(message, profile_name=profile_name, previous=previous, menu_names=menu_names)
+    from app.config import settings
+    if not settings.gemini_api_key:
+        return _normalize_result(fallback, profile_name, previous)
     try:
-        ai_result = await _ai_parse(message)
-        if previous:
-            for k in ["customer_name", "date", "time", "menu_name"]:
-                ai_result[k] = ai_result.get(k) or previous.get(k)
-        if not ai_result.get("customer_name"):
-            ai_result["customer_name"] = _normalize_name(profile_name)
-        ai_result["missing_fields"] = _compute_missing_fields(ai_result)
-        if ai_result.get("has_reservation_intent"):
-            return ai_result
-        result["missing_fields"] = _compute_missing_fields(result)
-        return result
+        return _normalize_result(await _ai_parse(message, menu_names=menu_names), profile_name, previous)
     except Exception as e:
         logger.error(f"AI parse failed: {e}")
-        fallback = _rule_based_parse(message, profile_name=profile_name, previous=previous)
-        fallback["missing_fields"] = _compute_missing_fields(fallback)
-        return fallback
+        return _normalize_result(fallback, profile_name, previous)
 
 
-def _rule_based_parse(message: str, profile_name: str | None = None, previous: dict | None = None) -> dict:
+def _rule_based_parse(message: str, profile_name: str | None = None, previous: dict | None = None, menu_names: list[str] | None = None) -> dict:
     """ルールベースのメッセージ解析"""
     previous = previous or {}
-    # 予約キーワード
-    reservation_keywords = [
-        "予約", "よやく", "空き", "あき", "空いて", "空きますか", "取りたい", "お願い",
-        "受診", "診察", "見てもら", "診てもら",
-    ]
-    has_intent = any(kw in message for kw in reservation_keywords)
+    intent = _rule_intent(message)
+    has_intent = intent in {"new", "change", "cancel"}
     date_val, time_val = _extract_date_time(message)
     name_val = _extract_name(message)
-    menu_val = _extract_menu(message)
+    menu_val = _extract_menu(message, menu_names)
 
     if not has_intent and not any([date_val, time_val, name_val, menu_val, previous]):
-        return {"has_reservation_intent": False, "summary": message[:100]}
+        return {"has_reservation_intent": False, "intent": intent, "polarity": _rule_polarity(message), "constraints": _rule_constraints(message), "confidence": "high", "needs_human": intent == "question", "summary": message[:100]}
 
     result = {
         "has_reservation_intent": True,
@@ -254,12 +291,20 @@ def _rule_based_parse(message: str, profile_name: str | None = None, previous: d
         "date": date_val or previous.get("date"),
         "time": time_val or previous.get("time"),
         "menu_name": menu_val or previous.get("menu_name"),
+        "intent": intent if intent != "other" else "new",
+        "current_date": None,
+        "current_time": None,
+        "duration_minutes": None,
+        "constraints": _rule_constraints(message),
+        "polarity": _rule_polarity(message),
+        "confidence": "medium",
+        "needs_human": intent == "question",
     }
 
     return result
 
 
-async def _ai_parse(message: str) -> dict:
+async def _ai_parse(message: str, menu_names: list[str] | None = None) -> dict:
     """AI（Gemini）を使ったメッセージ解析"""
     from app.config import settings
 
@@ -280,6 +325,7 @@ async def _ai_parse(message: str) -> dict:
                                      message=message,
                                      today=now_jst().date().isoformat(),
                                      weekday=["月", "火", "水", "木", "金", "土", "日"][now_jst().weekday()],
+                                     menu_list="\n".join(f"- {name}" for name in menu_names or []) or "- 未登録",
                                  )}
                     ],
                 }
@@ -295,8 +341,6 @@ async def _ai_parse(message: str) -> dict:
             json_match = re.search(r'\{.*\}', text, re.DOTALL)
             if json_match:
                 parsed = json.loads(json_match.group())
-                if parsed.get("customer_name"):
-                    parsed["customer_name"] = _normalize_name(parsed.get("customer_name"))
                 if parsed.get("time"):
                     tm = str(parsed["time"])
                     m = re.match(r"^(\d{1,2}):(\d{1,2})$", tm)

@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import time as _time
 from datetime import date, datetime, time, timedelta
 
 import httpx
@@ -19,6 +18,13 @@ from app.models.reservation_series import ReservationSeries  # noqa: F401 - SQLA
 from app.models.shadow_log import ShadowLog
 from app.services.patient_match import normalize_name
 from app.services.line_reply import push_message_with_access_token
+from app.services.line_debounce import (
+    _DEBOUNCE_BUFFER,
+    _DEBOUNCE_SECONDS,
+    debounce_message,
+    flush_debounce,
+    is_duplicate_message,
+)
 from app.services.line_state import (
     clear_user_draft,
     create_pending_request,
@@ -30,14 +36,6 @@ from app.services.line_state import (
 from app.utils.datetime_jst import JST, now_jst
 
 logger = logging.getLogger(__name__)
-
-# ── デバウンス用バッファ（user_id → {text, ts}) ──
-_DEBOUNCE_BUFFER: dict[str, dict] = {}
-_DEBOUNCE_SECONDS = 10
-
-# ミラー転送と通常Webhookが同時に届く構成では、同一LINEイベントが数秒差で二重処理される。
-_RECENT_SHADOW_MESSAGES: dict[tuple[str, str], float] = {}
-_DEDUP_SECONDS = 8
 
 # ── 予約意図キーワード ──
 _RESERVATION_KEYWORDS = [
@@ -601,54 +599,9 @@ def _should_restart_shadow_from_manual(message: str, user_state: dict) -> bool:
     return bool(re.search(r"予約|空い|空き|希望|お願い|取りたい|受診|見てもら|診てもら", message or ""))
 
 
-def debounce_message(user_id: str, text: str) -> str | None:
-    """同一ユーザーの連続メッセージを統合。統合結果を返すか、まだ待機中ならNone。
-
-    呼び出し側は最初のメッセージ到着から _DEBOUNCE_SECONDS 後に
-    flush_debounce() を呼ぶ設計だが、シンプルに
-    「前回から _DEBOUNCE_SECONDS 以内なら結合、超えたら確定」で実装する。
-    """
-    now = _time.time()
-    entry = _DEBOUNCE_BUFFER.get(user_id)
-
-    if entry and (now - entry["ts"]) < _DEBOUNCE_SECONDS:
-        # 統合: テキストを改行で追記
-        entry["text"] = entry["text"] + "\n" + text
-        entry["ts"] = now
-        return None  # まだ確定しない
-
-    # 前回のバッファが残っていればフラッシュ
-    flushed: str | None = None
-    if entry:
-        flushed = entry["text"]
-
-    # 新しいバッファを開始
-    _DEBOUNCE_BUFFER[user_id] = {"text": text, "ts": now}
-
-    return flushed
-
-
 def _is_duplicate_shadow_message(user_id: str, text: str) -> bool:
-    """短時間に同じユーザー・同じ本文が二重到着した場合は後続を捨てる。"""
-    now = _time.time()
-    normalized = re.sub(r"\s+", "", text or "")
-    if not normalized:
-        return False
-
-    expired = [key for key, ts in _RECENT_SHADOW_MESSAGES.items() if now - ts > _DEDUP_SECONDS]
-    for key in expired:
-        _RECENT_SHADOW_MESSAGES.pop(key, None)
-
-    key = (user_id, normalized)
-    last_seen = _RECENT_SHADOW_MESSAGES.get(key)
-    _RECENT_SHADOW_MESSAGES[key] = now
-    return last_seen is not None and now - last_seen <= _DEDUP_SECONDS
-
-
-def flush_debounce(user_id: str) -> str | None:
-    """バッファに残っているメッセージを強制確定して返す"""
-    entry = _DEBOUNCE_BUFFER.pop(user_id, None)
-    return entry["text"] if entry else None
+    """shadow 側の後方互換ラッパー。"""
+    return is_duplicate_message(user_id, text)
 
 
 async def analyze_with_llm(message: str) -> dict:
