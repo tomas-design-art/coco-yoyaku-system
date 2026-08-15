@@ -1,35 +1,31 @@
 """LINE予約パーサーの精度評価ランナー（回帰テスト兼ベンチマーク）。
 
 使い方（backend/ で実行）:
-    python -m scripts.eval_line_parser
-
-    # LLMも使って評価（GEMINI_API_KEY が .env にあれば自動でON）
-    # 純ルールベースのみで評価したいとき:
-    python -m scripts.eval_line_parser --rules-only
-
-    # 失敗した項目だけ詳細表示:
+    python -m scripts.eval_line_parser              # LLM込み（GEMINI_API_KEYがあれば自動ON）
+    python -m scripts.eval_line_parser --rules-only # 純ルールベースのみ
     python -m scripts.eval_line_parser --failures-only
+    python -m scripts.eval_line_parser --sleep 2.0  # 呼び出し間隔を長めに（429対策）
 
 目的:
 - backend/tests/data/line_parse_corpus.jsonl の各メッセージを parse_line_message に流し、
-  期待値（intent検出 / date / time）と突き合わせて正答率を出す。
-- 改修の前後で「72% → 88%」のように数値で効果を測るための基盤。
-- constraints / intent種別（new/change/cancel）は現行パーサが未対応なので
-  「未サポート（改修ターゲット）」として集計に出す。改修で produce するようになったら
-  このランナーの compare を拡張して採点対象に含めること。
+  期待値（intent検出 / intent種別 / date / time / constraints）と突き合わせて正答率を出す。
+- 改修の前後で数値で効果を測るための基盤。
+
+429（レート制限）対策:
+- 各ケースの間に --sleep 秒の待ちを入れる（既定1.0秒）。
+- LLM呼び出しが失敗したら指数バックオフで最大2回まで再試行する。
+- 「LLM実効件数」を表示し、LLMが本当に効いたか／全部フォールバックしたかを可視化する。
+  ここが 0/45 なら精度はルールベースのままなので、数値がLLMの実力を表さない。
 
 重要:
 - 「今日」を 2026-08-13(木) に固定して評価する（相対日付の期待値がこの基準日で作られているため）。
-  now_jst をこの日付にモンキーパッチする。
-- 本番の実ログ（shadow_logsテーブル）から実メッセージを抜き出して
-  このJSONLに追記していくほど、評価の実効性が上がる（種は同梱、実データで育てる）。
+- 本番の実ログ（shadow_logsテーブル）から実メッセージを抜き出して追記するほど実効性が上がる。
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -63,7 +59,36 @@ def _patch_now():
     lp.now_jst = lambda: FIXED_NOW  # type: ignore[assignment]
 
 
-async def _run(rules_only: bool, failures_only: bool) -> int:
+def _install_llm_probe(retries: int, backoff: float) -> dict:
+    """_ai_parse をラップして (1)成功/失敗を数える (2)429等の失敗を指数バックオフで再試行する。
+
+    戻り値の dict に llm_ok / llm_fail が積算される。
+    """
+    import app.agents.line_parser as lp
+
+    stats = {"llm_ok": 0, "llm_fail": 0}
+    original = lp._ai_parse
+
+    async def _wrapped(message, menu_names=None):
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                result = await original(message, menu_names=menu_names)
+                stats["llm_ok"] += 1
+                return result
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt < retries:
+                    await asyncio.sleep(backoff * (2 ** attempt))
+        stats["llm_fail"] += 1
+        assert last_exc is not None
+        raise last_exc
+
+    lp._ai_parse = _wrapped  # type: ignore[assignment]
+    return stats
+
+
+async def _run(rules_only: bool, failures_only: bool, sleep: float, retries: int, backoff: float) -> int:
     _patch_now()
 
     from app.agents.line_parser import parse_line_message
@@ -73,6 +98,7 @@ async def _run(rules_only: bool, failures_only: bool) -> int:
         settings.gemini_api_key = ""
 
     llm_on = bool(getattr(settings, "gemini_api_key", "")) and not rules_only
+    llm_stats = _install_llm_probe(retries, backoff) if llm_on else {"llm_ok": 0, "llm_fail": 0}
 
     corpus = _load_corpus()
     n = len(corpus)
@@ -81,8 +107,10 @@ async def _run(rules_only: bool, failures_only: bool) -> int:
     date_total = time_total = 0
     failures: list[dict] = []
 
-    for case in corpus:
+    for idx, case in enumerate(corpus):
         parsed = await parse_line_message(case["message"])
+        if llm_on and sleep > 0 and idx < n - 1:
+            await asyncio.sleep(sleep)  # レート制限回避のスロットリング
 
         got_intent = bool(parsed.get("has_reservation_intent"))
         exp_intent = bool(case.get("expect_reservation_intent"))
@@ -113,7 +141,7 @@ async def _run(rules_only: bool, failures_only: bool) -> int:
                 {
                     "id": case["id"],
                     "msg": case["message"],
-                    "exp": {"intent": exp_intent, "date": case.get("expect_date"), "time": case.get("expect_time")},
+                    "exp": {"intent": exp_intent, "kind": expected_kind, "date": case.get("expect_date"), "time": case.get("expect_time")},
                     "got": {"intent": got_intent, "kind": parsed.get("intent"), "date": parsed.get("date"), "time": parsed.get("time")},
                     "constraints": case.get("constraints", []),
                     "note": case.get("note", ""),
@@ -126,13 +154,18 @@ async def _run(rules_only: bool, failures_only: bool) -> int:
     print("=" * 72)
     print(f"LINE parser eval  (LLM={'ON' if llm_on else 'OFF/rules-only'}, cases={n}, today={FIXED_NOW.date()})")
     print("=" * 72)
+    if llm_on:
+        total_llm = llm_stats["llm_ok"] + llm_stats["llm_fail"]
+        print(f"LLM実効件数 (成功/試行)           : {llm_stats['llm_ok']}/{total_llm}   （失敗={llm_stats['llm_fail']}）")
+        if llm_stats["llm_ok"] == 0:
+            print("  ⚠ LLMが1件も成功していません。全ケースがルールへフォールバック＝数値はLLMの実力ではありません。")
+        print("-" * 72)
     print(f"意図検出 (has_reservation_intent) : {pct(intent_ok, n)}   ({intent_ok}/{n})")
     print(f"意図種別一致 (intent)              : {pct(intent_kind_ok, n)}   ({intent_kind_ok}/{n})")
     print(f"日付一致 (date)                   : {pct(date_ok, date_total)}   ({date_ok}/{date_total})")
     print(f"時刻一致 (time)                   : {pct(time_ok, time_total)}   ({time_ok}/{time_total})")
     print(f"制約再現 (constraints)             : {pct(constraint_ok, n)}   ({constraint_ok}/{n})")
     print(f"完全失敗ケース数                  : {len(failures)}/{n}")
-    print("-" * 72)
     print("=" * 72)
 
     if failures:
@@ -157,8 +190,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rules-only", action="store_true", help="LLMを使わずルールベースのみで評価")
     ap.add_argument("--failures-only", action="store_true", help="失敗ケースのみ表示")
+    ap.add_argument("--sleep", type=float, default=1.0, help="各ケース間の待ち秒（429対策。既定1.0）")
+    ap.add_argument("--retries", type=int, default=2, help="LLM失敗時の再試行回数（既定2）")
+    ap.add_argument("--backoff", type=float, default=2.0, help="再試行の基準待ち秒（指数バックオフ。既定2.0）")
     args = ap.parse_args()
-    exit_code = asyncio.run(_run(args.rules_only, args.failures_only))
+    exit_code = asyncio.run(_run(args.rules_only, args.failures_only, args.sleep, args.retries, args.backoff))
     sys.exit(exit_code)
 
 

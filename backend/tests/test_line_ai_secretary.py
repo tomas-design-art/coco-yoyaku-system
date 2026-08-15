@@ -1053,3 +1053,82 @@ async def test_waiting_time_duration_accepts_10min_step_and_moves_to_datetime():
 
     assert mock_merge.await_args.args[2]["duration_minutes"] == 50
     assert mock_set_mode.await_args.args[2] == "waiting_datetime"
+
+
+def test_normalize_constraints_converts_llm_objects_to_strings():
+    from app.agents.line_parser import _normalize_constraints
+
+    assert _normalize_constraints(
+        [
+            {"type": "window", "start": "11:00", "end": "14:00"},
+            {"type": "symptom", "value": "肩こり"},
+            {"asap": True},
+            "ref_history",
+        ]
+    ) == ["window:11:00-14:00", "symptom:肩こり", "asap", "ref_history"]
+
+
+def test_composer_rejects_reworded_confirmed_facts():
+    from app.services.line_composer import _is_grounded_reply
+
+    context = {
+        "date": "2026/08/16",
+        "start": "14:00",
+        "end": "15:00",
+        "practitioner": "時田",
+        "menu": "保険診療",
+    }
+    assert _is_grounded_reply(
+        "confirmed",
+        context,
+        "ご予約を確定しました。2026/08/16 14:00〜15:00（担当: 時田・メニュー: 保険診療）",
+    )
+    assert not _is_grounded_reply(
+        "confirmed",
+        context,
+        "8月16日14時から時田の担当で予約を承りました。",
+    )
+
+
+def test_autopilot_debounce_does_not_merge_thanks_or_changed_intent():
+    from app.services.line_debounce import _DEBOUNCE_BUFFER, merge_debounced_message
+
+    _DEBOUNCE_BUFFER.clear()
+    assert merge_debounced_message("user-guard", "明日の14時に予約したい") == "明日の14時に予約したい"
+    assert merge_debounced_message("user-guard", "ありがとう") == "ありがとう"
+
+    _DEBOUNCE_BUFFER.clear()
+    assert merge_debounced_message("user-guard", "明日予約したい") == "明日予約したい"
+    assert merge_debounced_message("user-guard", "やっぱりキャンセル") == "やっぱりキャンセル"
+
+
+@pytest.mark.asyncio
+async def test_repeated_autopilot_prompt_hands_off_on_third_attempt():
+    from app.api.line import _reply_with_loop_guard
+
+    db = AsyncMock()
+    with patch(
+        "app.api.line.get_user_state",
+        new=AsyncMock(
+            return_value={
+                "mode": "autopilot_booking_confirm",
+                "request_id": "rid-1",
+                "draft": {"autopilot_last_situation": "reconfirm_yes_no", "autopilot_situation_streak": 2},
+            }
+        ),
+    ), patch("app.api.line.merge_user_draft", new=AsyncMock()), patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ) as mock_set_mode, patch("app.api.line.create_notification", new=AsyncMock()), patch(
+        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="担当者が確認します。")
+    ) as mock_compose, patch("app.api.line.reply_to_line", new=AsyncMock()):
+        handed_off = await _reply_with_loop_guard(
+            db,
+            "U-autopilot",
+            "reply-token",
+            "reconfirm_yes_no",
+            {"what": "提示した予約候補", "patient_message": "よく分からない"},
+        )
+
+    assert handed_off is True
+    mock_set_mode.assert_awaited_once_with(db, "U-autopilot", "manual", "rid-1")
+    assert mock_compose.await_args.args[0] == "handoff_to_human"

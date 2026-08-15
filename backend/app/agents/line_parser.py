@@ -21,7 +21,7 @@ LINE_PARSE_PROMPT = """あなたは接骨院の熟練予約秘書AIです。患�
 intent: new=新規予約/空き確認、change=日時変更、cancel=取消/行けない、question=営業時間・料金・領収書等、other=お礼・雑談・相槌。
 polarity: 「大丈夫じゃない」「難しい」「無理」「やめておく」はnegative。「それで」「おけ」「はい」「お願いします」はaffirmative。
 相対日付は今日基準で未来へ解決。朝=09:00、午前=10:00、昼=12:00、午後イチ/午後=14:00、夕方=17:00、夜=19:00。具体時刻があれば優先する。
-曖昧時間帯は time と constraints の window を併記する。constraints は end_by:HH:MM、after:HH:MM、before:HH:MM、window:HH:MM-HH:MM、asap、exclude_weekday:wed、exclude_date:YYYY-MM-DD、symptom:内容、ref_history 等を使う。
+曖昧時間帯は time と constraints の window を併記する。constraints は必ず文字列だけの配列とし、オブジェクトは入れない。文字列は end_by:HH:MM、after:HH:MM、before:HH:MM、window:HH:MM-HH:MM、asap、exclude_weekday:wed、exclude_date:YYYY-MM-DD、symptom:内容、ref_history 等を使う。
 name は患者の自己申告だけ。クレーム、緊急性の高い痛み、領収書・保険・料金の個別相談は needs_human=true。
 
 メッセージ:
@@ -243,6 +243,35 @@ def _rule_constraints(message: str) -> list[str]:
     return constraints
 
 
+def _normalize_constraints(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    normalized: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item:
+            normalized.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+
+        constraint_type = item.get("type") or item.get("kind")
+        if constraint_type == "window" and item.get("start") and item.get("end"):
+            normalized.append(f"window:{item['start']}-{item['end']}")
+            continue
+        constraint_value = item.get("value")
+        if constraint_type and constraint_value not in (None, ""):
+            normalized.append(f"{constraint_type}:{constraint_value}")
+            continue
+        if len(item) == 1:
+            key, single_value = next(iter(item.items()))
+            if single_value is True:
+                normalized.append(str(key))
+            elif single_value not in (None, False, ""):
+                normalized.append(f"{key}:{single_value}")
+    return normalized
+
+
 def _normalize_result(parsed: dict, profile_name: str | None, previous: dict | None) -> dict:
     previous = previous or {}
     result = dict(parsed)
@@ -252,7 +281,7 @@ def _normalize_result(parsed: dict, profile_name: str | None, previous: dict | N
     result["time"] = result.get("time") or previous.get("time")
     result["intent"] = result.get("intent") if result.get("intent") in {"new", "change", "cancel", "question", "other"} else "other"
     result["has_reservation_intent"] = bool(result.get("has_reservation_intent"))
-    result["constraints"] = result.get("constraints") if isinstance(result.get("constraints"), list) else []
+    result["constraints"] = _normalize_constraints(result.get("constraints"))
     result["polarity"] = result.get("polarity") if result.get("polarity") in {"affirmative", "negative", "none"} else "none"
     result["confidence"] = result.get("confidence") if result.get("confidence") in {"high", "medium", "low"} else "medium"
     result["needs_human"] = bool(result.get("needs_human"))
@@ -267,7 +296,14 @@ async def parse_line_message(message: str, profile_name: str | None = None, prev
     if not settings.gemini_api_key:
         return _normalize_result(fallback, profile_name, previous)
     try:
-        return _normalize_result(await _ai_parse(message, menu_names=menu_names), profile_name, previous)
+        result = _normalize_result(await _ai_parse(message, menu_names=menu_names), profile_name, previous)
+        rule_result = _normalize_result(fallback, profile_name, previous)
+        for key in ("customer_name", "menu_name", "duration_minutes"):
+            if result.get(key) in (None, "") and rule_result.get(key) not in (None, ""):
+                result[key] = rule_result[key]
+        result["constraints"] = list(dict.fromkeys([*result["constraints"], *rule_result["constraints"]]))
+        result["missing_fields"] = _compute_missing_fields(result)
+        return result
     except Exception as e:
         logger.error(f"AI parse failed: {e}")
         return _normalize_result(fallback, profile_name, previous)

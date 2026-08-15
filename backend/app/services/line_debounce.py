@@ -10,12 +10,32 @@ _RECENT_MESSAGES: dict[tuple[str, str], float] = {}
 _DEDUP_SECONDS = 8
 
 
+def _intent_hint(text: str) -> str | None:
+    if re.search(r"キャンセル|取消|取り消|やめたい", text or ""):
+        return "cancel"
+    if re.search(r"変更|変え|ずら|リスケ|別の日", text or ""):
+        return "change"
+    if re.search(r"予約|空き|今日|明日|明後日|曜日|午前|午後|夕方|夜|\d{1,2}\s*(?:時|[:：])", text or ""):
+        return "booking"
+    return None
+
+
+def _should_merge(previous: str, current: str) -> bool:
+    if re.fullmatch(r"[\s。、!！?？]*(?:ありがとう(?:ございます)?|了解です?|わかりました|助かります)[\s。、!！?？]*", current or ""):
+        return False
+    previous_intent = _intent_hint(previous)
+    current_intent = _intent_hint(current)
+    if previous_intent and current_intent and previous_intent != current_intent:
+        return False
+    return bool(previous_intent or current_intent)
+
+
 def debounce_message(user_id: str, text: str) -> str | None:
     """同一ユーザーの連続メッセージを統合し、古いドラフトだけを返す。"""
     now = time.time()
     entry = _DEBOUNCE_BUFFER.get(user_id)
 
-    if entry and (now - entry["ts"]) < _DEBOUNCE_SECONDS:
+    if entry and (now - entry["ts"]) < _DEBOUNCE_SECONDS and _should_merge(entry["text"], text):
         entry["text"] = entry["text"] + "\n" + text
         entry["ts"] = now
         return None
