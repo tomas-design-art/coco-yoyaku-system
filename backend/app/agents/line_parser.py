@@ -9,6 +9,30 @@ from app.utils.datetime_jst import now_jst
 
 logger = logging.getLogger(__name__)
 
+CONVERSATION_CONTROL_PROMPT = """あなたは接骨院のLINE受付で、患者が現在の会話を続けたいかを判定します。
+必ずJSONだけを返してください。
+
+現在の会話フェーズ: {phase}
+- identity_setup: LINE IDと予約データを紐づける本人確認の入力中
+- booking: まだ確定していない新規予約・予約変更の相談中
+
+actionは次のいずれか:
+- continue: 現在の会話を続ける、回答する、日時やメニューを修正する
+- restart_identity: 本人確認の入力間違いを訂正し、本人確認を最初からやり直したい
+- restart_booking: 今の未確定内容を捨て、予約相談を最初からやり直したい
+- abandon_booking: 今は予約せず、また後日連絡する、今回の未確定相談を終えたい
+
+重要:
+- 単語一致ではなく文全体の意味で判断する。
+- booking中の「既に確定している予約をキャンセルしたい」はabandon_bookingではなくcontinue。予約取消フローで処理する。
+- 「この時間はやめて別の日」「メニューを変えたい」は会話継続なのでcontinue。
+- identity_setup中の入力訂正・打ち間違い・最初からはrestart_identity。
+- 確信が持てなければcontinueにする。
+
+出力: {{"action":"continue | restart_identity | restart_booking | abandon_booking","confidence":"high | medium | low"}}
+患者メッセージ: {message}
+JSON:"""
+
 LINE_PARSE_PROMPT = """あなたは接骨院の熟練予約秘書AIです。患者からのLINEメッセージを解析し、必ずJSONのみで返します（説明文禁止）。
 今日は {today}（{weekday}曜日）。メッセージは任意の言語で届きます。言語を問わず意味を取り、日付時刻は必ず正規化してください。
 
@@ -307,6 +331,53 @@ async def parse_line_message(message: str, profile_name: str | None = None, prev
     except Exception as e:
         logger.error(f"AI parse failed: {e}")
         return _normalize_result(fallback, profile_name, previous)
+
+
+async def classify_conversation_control(message: str, phase: str) -> dict:
+    """自然文から会話の継続・やり直し・中止だけを判定する。"""
+    safe_fallback_actions = {
+        "本人確認をやり直す": "restart_identity",
+        "予約を最初からやり直す": "restart_booking",
+        "今回は予約しない": "abandon_booking",
+    }
+    fallback = {"action": safe_fallback_actions.get(message.strip(), "continue"), "confidence": "high"}
+
+    from app.config import settings
+    if not settings.gemini_api_key:
+        return fallback
+
+    try:
+        import httpx
+
+        prompt = CONVERSATION_CONTROL_PROMPT.format(phase=phase, message=message)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent",
+                headers={"x-goog-api-key": settings.gemini_api_key},
+                json={
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0, "maxOutputTokens": 80},
+                },
+                timeout=10,
+            )
+        response.raise_for_status()
+        text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        json_match = re.search(r"\{.*\}", text, re.DOTALL)
+        parsed = json.loads(json_match.group()) if json_match else {}
+        action = parsed.get("action")
+        confidence = parsed.get("confidence")
+        if action not in {"continue", "restart_identity", "restart_booking", "abandon_booking"}:
+            return fallback
+        if confidence not in {"high", "medium", "low"}:
+            confidence = "low"
+        if phase == "identity_setup" and action in {"restart_booking", "abandon_booking"}:
+            action = "continue"
+        if phase == "booking" and action == "restart_identity":
+            action = "continue"
+        return {"action": action, "confidence": confidence}
+    except Exception as error:
+        logger.warning("Conversation control classification failed: %s", error)
+        return fallback
 
 
 def _rule_based_parse(message: str, profile_name: str | None = None, previous: dict | None = None, menu_names: list[str] | None = None) -> dict:

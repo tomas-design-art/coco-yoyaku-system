@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.line_parser import extract_full_name, parse_line_message
+from app.agents.line_parser import classify_conversation_control, extract_full_name, parse_line_message
 from app.config import settings
 from app.database import get_db
 from app.models.menu import Menu
@@ -40,6 +40,7 @@ from app.services.line_state import (
     get_user_mode,
     get_user_state,
     merge_user_draft,
+    reset_user_conversation,
     set_user_mode,
     update_request,
 )
@@ -68,6 +69,18 @@ _AUTOPILOT_SETUP_MODES = {
     "autopilot_setup_reading_birth",
     "autopilot_setup_confirm_new",
 }
+_AUTOPILOT_BOOKING_MODES = {
+    "waiting_menu",
+    "waiting_datetime",
+    "waiting_time_duration",
+    "autopilot_confirm_usual",
+    "autopilot_booking_confirm",
+    "adjusting",
+    "autopilot_cancel_confirm",
+    "autopilot_change_datetime",
+    "autopilot_change_confirm",
+}
+_CONVERSATION_TIMEOUT = timedelta(hours=1)
 
 
 class LineMessageRequest(BaseModel):
@@ -225,6 +238,39 @@ def _build_yes_no_new_quick_reply_items() -> list[dict]:
             "action": {"type": "message", "label": "新規登録", "text": "新規登録"},
         },
     ]
+
+
+def _build_setup_retry_quick_reply_items(include_confirm: bool = False) -> list[dict]:
+    items: list[dict] = []
+    if include_confirm:
+        items.append({"type": "action", "action": {"type": "message", "label": "はい", "text": "はい"}})
+    items.append(
+        {
+            "type": "action",
+            "action": {
+                "type": "message",
+                "label": "入力をやり直す",
+                "text": "本人確認をやり直す",
+            },
+        }
+    )
+    return items
+
+
+def _conversation_is_expired(state: dict, now: datetime | None = None) -> bool:
+    if state.get("mode") not in _AUTOPILOT_SETUP_MODES | _AUTOPILOT_BOOKING_MODES:
+        return False
+    raw_last_activity = state.get("last_activity_at")
+    if not raw_last_activity:
+        return False
+    try:
+        last_activity = datetime.fromisoformat(str(raw_last_activity))
+        current = now or now_jst()
+        if last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=JST)
+        return current - last_activity >= _CONVERSATION_TIMEOUT
+    except (TypeError, ValueError):
+        return False
 
 
 def _extract_duration_minutes(text: str) -> int | None:
@@ -568,6 +614,12 @@ def _extract_reading_and_birth_date(text: str) -> tuple[str | None, date | None]
     return reading or None, birth_date
 
 
+def _redact_identity_control_text(text: str) -> str:
+    redacted = re.sub(r"(?<!\d)(?:19\d{2}|20\d{2})[/-]\d{1,2}[/-]\d{1,2}(?!\d)", "[生年月日]", text or "")
+    redacted = re.sub(r"(?:\+81|81|0)[0-9０-９－ー -]{8,16}", "[電話番号]", redacted)
+    return redacted
+
+
 def _has_explicit_new_registration_intent(text: str) -> bool:
     normalized = (text or "").replace(" ", "").replace("\u3000", "")
     return any(phrase in normalized for phrase in ("新規登録", "新規利用", "初めての利用", "初めて利用", "初診です"))
@@ -819,6 +871,23 @@ async def _complete_autopilot_reschedule(
     return True
 
 
+async def _reply_setup_start(reply_token: str | None, prefix: str | None = None) -> None:
+    if not reply_token:
+        return
+    message = (
+        "予約システムに登録されているCOCO整骨院でのご利用履歴と照合します。\n"
+        "お名前をフルネームで入力し、登録済みの電話番号を続けて入力してください。\n"
+        "例: 山田 太郎 090-1234-5678"
+    )
+    if prefix:
+        message = f"{prefix}\n{message}"
+    await reply_text_with_quick_reply(
+        reply_token,
+        message,
+        _build_setup_retry_quick_reply_items(),
+    )
+
+
 async def _handle_autopilot_setup_message(
     db: AsyncSession,
     *,
@@ -833,20 +902,20 @@ async def _handle_autopilot_setup_message(
     draft = state.get("draft") or {}
 
     if text.strip() == AUTOPILOT_SETUP_KEYWORD:
-        await clear_user_draft(db, user_id)
-        await set_user_mode(db, user_id, "autopilot_setup_name_phone")
-        if reply_token:
-            await reply_to_line(
-                reply_token,
-                "ご利用ありがとうございます。\n"
-                "予約システムに登録されているCOCO整骨院でのご利用履歴と照合します。\n"
-                "お名前をフルネームで入力し、登録済みの電話番号を続けて入力してください。\n"
-                "例: 山田 太郎 090-1234-5678",
-            )
+        await reset_user_conversation(db, user_id, mode="autopilot_setup_name_phone", reason="setup_started")
+        clear_debounce(user_id)
+        await _reply_setup_start(reply_token, "ご利用ありがとうございます。")
         return True
 
     if mode not in _AUTOPILOT_SETUP_MODES:
         return False
+
+    control = await classify_conversation_control(_redact_identity_control_text(text), "identity_setup")
+    if control.get("action") == "restart_identity" and control.get("confidence") != "low":
+        await reset_user_conversation(db, user_id, mode="autopilot_setup_name_phone", reason="identity_restart")
+        clear_debounce(user_id)
+        await _reply_setup_start(reply_token, "承知しました。本人確認の入力を最初からやり直します。")
+        return True
 
     if mode == "autopilot_setup_name_phone":
         name, phone = _extract_setup_name_and_phone(text, display_name)
@@ -854,11 +923,19 @@ async def _handle_autopilot_setup_message(
             await merge_user_draft(db, user_id, {"setup_name": name, "setup_phone": phone})
             await set_user_mode(db, user_id, "autopilot_setup_confirm_new")
             if reply_token:
-                await reply_to_line(reply_token, "新規登録として進めます。よろしければ「はい」と返信してください。")
+                await reply_text_with_quick_reply(
+                    reply_token,
+                    "新規登録として進めます。入力内容が正しければ「はい」を、訂正する場合は「入力をやり直す」を選んでください。",
+                    _build_setup_retry_quick_reply_items(include_confirm=True),
+                )
             return True
         if not name or not phone:
             if reply_token:
-                await reply_to_line(reply_token, "お名前をフルネームで入力し、登録済みの電話番号を続けて入力してください。\n例: 山田 太郎 090-1234-5678")
+                await reply_text_with_quick_reply(
+                    reply_token,
+                    "お名前をフルネームで入力し、登録済みの電話番号を続けて入力してください。\n例: 山田 太郎 090-1234-5678",
+                    _build_setup_retry_quick_reply_items(),
+                )
             return True
 
         await merge_user_draft(db, user_id, {"setup_name": name, "setup_phone": phone})
@@ -869,11 +946,12 @@ async def _handle_autopilot_setup_message(
 
         await set_user_mode(db, user_id, "autopilot_setup_reading_birth")
         if reply_token:
-            await reply_to_line(
+            await reply_text_with_quick_reply(
                 reply_token,
                 "電話番号では照合できませんでした。\n"
                 "お名前の読み仮名と生年月日を入力してください。\n"
                 "例: やまだ たろう 1990-04-01",
+                _build_setup_retry_quick_reply_items(),
             )
         return True
 
@@ -881,7 +959,11 @@ async def _handle_autopilot_setup_message(
         reading, birth_date = _extract_reading_and_birth_date(text)
         if not reading or not birth_date:
             if reply_token:
-                await reply_to_line(reply_token, "お名前の読み仮名と生年月日を入力してください。\n例: やまだ たろう 1990-04-01")
+                await reply_text_with_quick_reply(
+                    reply_token,
+                    "お名前の読み仮名と生年月日を入力してください。\n例: やまだ たろう 1990-04-01",
+                    _build_setup_retry_quick_reply_items(),
+                )
             return True
         await merge_user_draft(db, user_id, {"setup_reading": reading, "setup_birth_date": birth_date.isoformat()})
         patient = await find_unique_patient_by_reading_and_birth_date(db, reading, birth_date)
@@ -891,13 +973,21 @@ async def _handle_autopilot_setup_message(
 
         await set_user_mode(db, user_id, "autopilot_setup_confirm_new")
         if reply_token:
-            await reply_to_line(reply_token, "ご利用履歴を確認できませんでした。新規登録として進めます。よろしければ「はい」と返信してください。")
+            await reply_text_with_quick_reply(
+                reply_token,
+                "ご利用履歴を確認できませんでした。入力内容が正しいかご確認ください。新規登録として進める場合は「はい」を、入力を訂正する場合は「入力をやり直す」を選んでください。",
+                _build_setup_retry_quick_reply_items(include_confirm=True),
+            )
         return True
 
     if mode == "autopilot_setup_confirm_new":
         if text.strip() not in {"はい", "新規登録", "新規利用", "初めての利用"}:
             if reply_token:
-                await reply_to_line(reply_token, "新規登録として進める場合は「はい」と返信してください。")
+                await reply_text_with_quick_reply(
+                    reply_token,
+                    "新規登録として進める場合は「はい」を、入力を訂正する場合は「入力をやり直す」を選んでください。",
+                    _build_setup_retry_quick_reply_items(include_confirm=True),
+                )
             return True
         name = draft.get("setup_name")
         if not name:
@@ -1021,6 +1111,38 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     if _autopilot_is_globally_enabled():
         user_state = await get_user_state(db, user_id)
         display_name = await _get_line_display_name(user_id)
+        if _conversation_is_expired(user_state):
+            expired_mode = user_state.get("mode")
+            clear_debounce(user_id)
+            if expired_mode in _AUTOPILOT_SETUP_MODES:
+                await reset_user_conversation(
+                    db,
+                    user_id,
+                    mode="autopilot_setup_name_phone",
+                    reason="identity_timeout",
+                )
+                await _reply_setup_start(
+                    reply_token,
+                    "一定時間が経過したため、本人確認の入力をリセットしました。最初からやり直します。",
+                )
+                return
+
+            line_patient = await _find_line_patient(db, user_id)
+            is_autopilot_patient = bool(line_patient and line_patient.line_autopilot_enabled)
+            if is_autopilot_patient:
+                await reset_user_conversation(db, user_id, reason="booking_timeout")
+                if reply_token:
+                    quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
+                    await reply_text_with_quick_reply(
+                        reply_token,
+                        await _compose_autopilot_reply(
+                            "conversation_expired",
+                            {"patient_message": text},
+                        ),
+                        quick_items,
+                    )
+                return
+
         if await _handle_autopilot_setup_message(
             db,
             user_id=user_id,
@@ -1032,6 +1154,37 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             return
         line_patient = await _find_line_patient(db, user_id)
         is_autopilot_patient = bool(line_patient and line_patient.line_autopilot_enabled)
+
+    if is_autopilot_patient and (user_state or {}).get("mode") in _AUTOPILOT_BOOKING_MODES:
+        control = await classify_conversation_control(text, "booking")
+        action = control.get("action")
+        if action in {"restart_booking", "abandon_booking"} and control.get("confidence") != "low":
+            clear_debounce(user_id)
+            await reset_user_conversation(
+                db,
+                user_id,
+                reason="booking_restart" if action == "restart_booking" else "booking_abandoned",
+            )
+            if reply_token:
+                if action == "restart_booking":
+                    quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
+                    await reply_text_with_quick_reply(
+                        reply_token,
+                        await _compose_autopilot_reply(
+                            "conversation_restarted",
+                            {"patient_message": text},
+                        ),
+                        quick_items,
+                    )
+                else:
+                    await reply_to_line(
+                        reply_token,
+                        await _compose_autopilot_reply(
+                            "conversation_abandoned",
+                            {"patient_message": text},
+                        ),
+                    )
+            return
 
     # LINE の再送 webhook は予約会話を二重に進めてしまうため、対象患者だけで捨てる。
     if is_autopilot_patient and is_duplicate_message(user_id, text):

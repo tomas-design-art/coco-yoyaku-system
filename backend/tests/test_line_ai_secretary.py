@@ -777,9 +777,9 @@ async def test_autopilot_setup_keyword_starts_identity_flow_only():
     from app.api.line import _handle_autopilot_setup_message
 
     db = AsyncMock()
-    with patch("app.api.line.clear_user_draft", new=AsyncMock()) as mock_clear, patch(
-        "app.api.line.set_user_mode", new=AsyncMock()
-    ) as mock_set_mode, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+    with patch("app.api.line.reset_user_conversation", new=AsyncMock()) as mock_reset, patch(
+        "app.api.line.reply_text_with_quick_reply", new=AsyncMock()
+    ) as mock_reply:
         handled = await _handle_autopilot_setup_message(
             db,
             user_id="U-setup",
@@ -790,8 +790,12 @@ async def test_autopilot_setup_keyword_starts_identity_flow_only():
         )
 
     assert handled is True
-    mock_clear.assert_awaited_once_with(db, "U-setup")
-    assert mock_set_mode.await_args.args[2] == "autopilot_setup_name_phone"
+    mock_reset.assert_awaited_once_with(
+        db,
+        "U-setup",
+        mode="autopilot_setup_name_phone",
+        reason="setup_started",
+    )
     assert "COCO整骨院" in mock_reply.await_args.args[1]
 
 
@@ -1132,3 +1136,147 @@ async def test_repeated_autopilot_prompt_hands_off_on_third_attempt():
     assert handed_off is True
     mock_set_mode.assert_awaited_once_with(db, "U-autopilot", "manual", "rid-1")
     assert mock_compose.await_args.args[0] == "handoff_to_human"
+
+
+def test_autopilot_conversation_expires_after_one_hour():
+    from app.api.line import _conversation_is_expired
+    from app.utils.datetime_jst import JST
+
+    now = datetime(2026, 8, 15, 12, 0, tzinfo=JST)
+    active = {"mode": "waiting_datetime", "last_activity_at": (now - timedelta(minutes=59)).isoformat()}
+    expired = {"mode": "waiting_datetime", "last_activity_at": (now - timedelta(hours=1)).isoformat()}
+    idle = {"mode": "idle", "last_activity_at": (now - timedelta(days=1)).isoformat()}
+
+    assert not _conversation_is_expired(active, now)
+    assert _conversation_is_expired(expired, now)
+    assert not _conversation_is_expired(idle, now)
+
+
+def test_identity_control_redacts_phone_and_birth_date_before_llm():
+    from app.api.line import _redact_identity_control_text
+
+    redacted = _redact_identity_control_text("山田 太郎 090-1234-5678 1990-04-01を間違えました")
+    assert "090" not in redacted
+    assert "1990" not in redacted
+    assert "[電話番号]" in redacted
+    assert "[生年月日]" in redacted
+
+
+@pytest.mark.asyncio
+async def test_reset_user_conversation_abandons_only_pending_request():
+    from app.services.line_state import reset_user_conversation
+
+    state = SimpleNamespace(
+        current_step="autopilot_booking_confirm",
+        context_data={
+            "request_id": "rid-pending",
+            "draft": {"date": "2026-08-16", "menu_name": "保険診療"},
+            "requests": {
+                "rid-pending": {"status": "awaiting_patient_confirmation"},
+                "rid-confirmed": {"status": "confirmed", "reservation_id": 91},
+            },
+        },
+    )
+    db = AsyncMock()
+    with patch("app.services.line_state._get_or_create_state", new=AsyncMock(return_value=state)):
+        await reset_user_conversation(db, "U-reset", reason="booking_abandoned")
+
+    assert state.current_step == "idle"
+    assert state.context_data["draft"] == {}
+    assert "request_id" not in state.context_data
+    assert state.context_data["requests"]["rid-pending"]["status"] == "abandoned"
+    assert state.context_data["requests"]["rid-confirmed"]["status"] == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_setup_natural_language_retry_restarts_identity_without_registration():
+    from app.api.line import _handle_autopilot_setup_message
+
+    db = AsyncMock()
+    with patch(
+        "app.api.line.classify_conversation_control",
+        new=AsyncMock(return_value={"action": "restart_identity", "confidence": "high"}),
+    ), patch("app.api.line.reset_user_conversation", new=AsyncMock()) as mock_reset, patch(
+        "app.api.line.reply_text_with_quick_reply", new=AsyncMock()
+    ) as mock_reply, patch("app.api.line.create_new_patient", new=AsyncMock()) as mock_create:
+        handled = await _handle_autopilot_setup_message(
+            db,
+            user_id="U-setup",
+            text="電話番号を間違えました。もう一度入力したいです",
+            reply_token="reply-token",
+            display_name=None,
+            state={"mode": "autopilot_setup_confirm_new", "draft": {"setup_name": "誤入力"}},
+        )
+
+    assert handled is True
+    mock_reset.assert_awaited_once_with(
+        db,
+        "U-setup",
+        mode="autopilot_setup_name_phone",
+        reason="identity_restart",
+    )
+    assert mock_reply.await_args.args[2][0]["action"]["text"] == "本人確認をやり直す"
+    mock_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_expired_booking_resets_before_processing_new_message():
+    from app.api.line import _handle_text_message
+    from app.utils.datetime_jst import JST
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    old = datetime(2026, 8, 15, 10, 0, tzinfo=JST)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "では14時で"},
+    }
+    db = AsyncMock()
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.now_jst", return_value=datetime(2026, 8, 15, 12, 0, tzinfo=JST)
+    ), patch(
+        "app.api.line.get_user_state",
+        new=AsyncMock(return_value={"mode": "waiting_datetime", "draft": {"menu_name": "保険診療"}, "last_activity_at": old.isoformat()}),
+    ), patch("app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")), patch(
+        "app.api.line._find_line_patient", new=AsyncMock(return_value=patient)
+    ), patch("app.api.line.reset_user_conversation", new=AsyncMock()) as mock_reset, patch(
+        "app.api.line._build_menu_quick_reply_items", new=AsyncMock(return_value=[])
+    ), patch("app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="時間切れです")), patch(
+        "app.api.line.reply_text_with_quick_reply", new=AsyncMock()
+    ) as mock_reply, patch("app.api.line.parse_line_message", new=AsyncMock()) as mock_parse:
+        await _handle_text_message(event, db)
+
+    mock_reset.assert_awaited_once_with(db, "U-autopilot", reason="booking_timeout")
+    assert mock_reply.await_args.args[1] == "時間切れです"
+    mock_parse.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_llm_abandonment_resets_unconfirmed_booking_without_cancelling_reservation():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "また予定を確認して連絡します"},
+    }
+    db = AsyncMock()
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state",
+        new=AsyncMock(return_value={"mode": "autopilot_booking_confirm", "draft": {}, "request_id": "rid-1", "last_activity_at": None}),
+    ), patch("app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")), patch(
+        "app.api.line._find_line_patient", new=AsyncMock(return_value=patient)
+    ), patch(
+        "app.api.line.classify_conversation_control",
+        new=AsyncMock(return_value={"action": "abandon_booking", "confidence": "high"}),
+    ), patch("app.api.line.reset_user_conversation", new=AsyncMock()) as mock_reset, patch(
+        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="またお待ちしております")
+    ), patch("app.api.line.reply_to_line", new=AsyncMock()), patch(
+        "app.api.line.transition_status", new=AsyncMock()
+    ) as mock_cancel, patch("app.api.line.create_reservation", new=AsyncMock()) as mock_create:
+        await _handle_text_message(event, db)
+
+    mock_reset.assert_awaited_once_with(db, "U-autopilot", reason="booking_abandoned")
+    mock_cancel.assert_not_awaited()
+    mock_create.assert_not_awaited()

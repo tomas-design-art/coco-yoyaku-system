@@ -21,6 +21,9 @@ SITUATION_GUIDES = {
     "handoff_to_human": "無人では完結できない理由を簡潔に伝え、担当者が対応すると案内する。",
     "parse_failed": "聞き取れなかったことを詫び、希望日と時間帯の例を添えて言い直しを促す。",
     "reconfirm_yes_no": "何に対する確認かを明示し、はい/いいえでの返答を促す。",
+    "conversation_expired": "一定時間が経過したため前回の未確定内容を破棄したことと、最初から案内することを伝える。",
+    "conversation_restarted": "希望に沿って未確定内容を破棄し、予約を最初から案内することを伝える。",
+    "conversation_abandoned": "今回は予約せず会話を終了したことを穏やかに受け止め、またの連絡を歓迎する。",
 }
 
 
@@ -68,6 +71,12 @@ def _fallback(situation: str, context: dict) -> str:
         return f"{context.get('what') or 'この内容'}について、はい / いいえで返信してください。"
     if situation == "ask_datetime" and context.get("purpose") == "予約変更":
         return "変更後の日時を教えてください。\n例: 明日の午後3時"
+    if situation == "conversation_expired":
+        return "一定時間が経過したため、前回の入力をリセットしました。予約を最初からご案内します。"
+    if situation == "conversation_restarted":
+        return "承知しました。前回の入力をリセットし、予約を最初からご案内します。"
+    if situation == "conversation_abandoned":
+        return "承知しました。今回は予約せず終了します。またご都合が決まりましたら、いつでもご連絡ください。"
     templates = {
         "ask_datetime": "ご希望の日時を教えてください。\n例: 明日の午後3時",
         "ask_menu": "ご希望のメニューを選んでください。",
@@ -83,6 +92,8 @@ def _is_grounded_reply(situation: str, context: dict, reply: str) -> bool:
         "confirmed": "ご予約を確定しました",
         "cancel_done": "キャンセルしました",
         "change_done": "変更しました",
+        "conversation_expired": "一定時間",
+        "conversation_restarted": "最初",
     }
     required_phrase = required_phrases.get(situation)
     if required_phrase and required_phrase not in reply:

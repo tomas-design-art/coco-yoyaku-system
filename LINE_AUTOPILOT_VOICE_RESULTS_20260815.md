@@ -43,10 +43,21 @@ Reproduced failure classes from the live-LLM eval included constraints returned 
 - time: 17/17
 - constraints: 23/45 (before: 18/45)
 - fully failed cases: 22/45 (before: 27/45)
-- `pytest tests/test_shadow_mode.py tests/test_line_ai_secretary.py -q`: 62 passed
+- `pytest tests/test_shadow_mode.py tests/test_line_ai_secretary.py -q`: 68 passed
+- `pytest tests/test_alembic_revision_chain.py tests/test_shadow_mode.py tests/test_line_ai_secretary.py -q`: 69 passed
 - `reject_conflicts=True`: retained on all three autopilot reservation-creation paths
 - global and per-patient autopilot gates: retained
 - Render Blueprint: `GEMINI_API_KEY` and `LINE_AUTOPILOT_ENABLED=true` declared for production and staging; secret values remain dashboard-managed
+
+## Conversation reset follow-up
+
+- Active setup and booking conversations expire after one hour of inactivity. The next message does not reuse stale draft data; setup restarts from identity input and booking restarts from menu selection with an expiration explanation.
+- A dedicated Gemini classifier uses the current phase to distinguish `continue`, identity retry, booking restart, and abandonment. It treats changing a proposed time and cancelling an already confirmed reservation as `continue`, so the existing reservation flow handles them.
+- Live Gemini probe results were high-confidence and correct for natural abandonment, booking restart, proposed-time change, confirmed-reservation cancellation, and identity-input correction examples.
+- When Gemini is unavailable or uncertain, natural text does not reset state. Only exact quick-reply command payloads are accepted as the safe fallback.
+- Conversation reset marks only the current unconfirmed request as `abandoned`; it does not create, delete, reschedule, or cancel a reservation.
+- All identity steps provide an `入力をやり直す` quick reply. Before any new patient is created, the user sees both confirmation and retry choices.
+- Phone numbers and birth dates are replaced with placeholders before identity-control text is sent to Gemini. Matching still uses the original input locally.
 
 ## Remaining environment verification
 

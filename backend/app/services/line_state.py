@@ -153,13 +153,47 @@ async def find_latest_pending_shadow_request(db: AsyncSession) -> tuple[str, str
 async def get_user_state(db: AsyncSession, line_user_id: str) -> dict:
     state = await _get_or_create_state(db, line_user_id)
     context = _normalize_context(state.context_data)
-    return {
+    previous_activity = context.get("last_activity_at") or (state.updated_at.isoformat() if state.updated_at else None)
+    result = {
         "line_user_id": line_user_id,
         "mode": state.current_step,
         "request_id": context.get("request_id"),
         "draft": context.get("draft") if isinstance(context.get("draft"), dict) else {},
         "context_data": context,
+        "last_activity_at": previous_activity,
     }
+    context["last_activity_at"] = now_jst().isoformat()
+    state.context_data = context
+    await db.flush()
+    return result
+
+
+async def reset_user_conversation(
+    db: AsyncSession,
+    line_user_id: str,
+    *,
+    mode: str = "idle",
+    reason: str = "user_reset",
+) -> None:
+    """未確定の会話だけを破棄し、患者紐づけや確定予約は変更しない。"""
+    state = await _get_or_create_state(db, line_user_id)
+    context = _normalize_context(state.context_data)
+    request_id = context.get("request_id")
+    requests = context.get("requests") if isinstance(context.get("requests"), dict) else {}
+    request = requests.get(request_id) if request_id else None
+    if isinstance(request, dict) and request.get("status") not in {"confirmed", "confirmed_alt"}:
+        request["status"] = "abandoned"
+        request["abandoned_reason"] = reason
+        request["updated_at"] = now_jst().isoformat()
+        requests[request_id] = request
+
+    context["requests"] = requests
+    context["draft"] = {}
+    context["last_activity_at"] = now_jst().isoformat()
+    context.pop("request_id", None)
+    state.current_step = mode
+    state.context_data = context
+    await db.flush()
 
 
 async def merge_user_draft(
