@@ -189,11 +189,31 @@ async def reset_user_conversation(
 
     context["requests"] = requests
     context["draft"] = {}
+    context["conversation_history"] = []
     context["last_activity_at"] = now_jst().isoformat()
     context.pop("request_id", None)
     state.current_step = mode
     state.context_data = context
     await db.flush()
+
+
+async def append_conversation_history(
+    db: AsyncSession,
+    line_user_id: str,
+    role: str,
+    content: str,
+) -> list[dict]:
+    state = await _get_or_create_state(db, line_user_id)
+    context = _normalize_context(state.context_data)
+    history = context.get("conversation_history") if isinstance(context.get("conversation_history"), list) else []
+    entry = {"role": role, "content": content[:1000]}
+    if not history or history[-1] != entry:
+        history.append(entry)
+    history = history[-6:]
+    context["conversation_history"] = history
+    state.context_data = context
+    await db.flush()
+    return list(history)
 
 
 async def merge_user_draft(

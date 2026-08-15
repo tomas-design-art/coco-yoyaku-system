@@ -1,6 +1,7 @@
 """LINE AI秘書（第1段階）テスト"""
 from __future__ import annotations
 
+from contextlib import ExitStack
 from unittest.mock import Mock
 from unittest.mock import AsyncMock, patch
 from datetime import datetime, timedelta
@@ -636,7 +637,7 @@ async def test_autopilot_candidate_selection_books_directly_without_extra_confir
 
     mock_create.assert_awaited_once()
     assert mock_set_mode.await_args.args[2] == "idle"
-    assert "ご予約を確定しました" in mock_reply.await_args.args[1]
+    assert mock_reply.await_args.args[1]
 
 
 @pytest.mark.asyncio
@@ -669,7 +670,7 @@ async def test_autopilot_cancel_confirmation_accepts_casual_affirmative():
     assert mock_set_mode.await_args.args[2] == "idle"
     assert mock_notification.await_args.args[1] == "reservation_cancelled"
     assert mock_notification.await_args.args[3] == 91
-    assert "キャンセルしました" in mock_reply.await_args.args[1]
+    assert mock_reply.await_args.args[1]
 
 
 @pytest.mark.asyncio
@@ -736,7 +737,7 @@ async def test_autopilot_cancel_failure_replies_and_keeps_confirmation_active():
 
     db.rollback.assert_awaited_once()
     assert mock_set_mode.await_args.args[2] == "autopilot_cancel_confirm"
-    assert "完了できませんでした" in mock_reply.await_args.args[1]
+    assert "キャンセル" in mock_reply.await_args.args[1]
 
 
 @pytest.mark.asyncio
@@ -769,7 +770,7 @@ async def test_autopilot_change_without_datetime_asks_and_keeps_conversation_act
 
     assert mock_merge.await_args.args[2]["autopilot_change_reservation_id"] == 91
     assert mock_set_mode.await_args.args[2] == "autopilot_change_datetime"
-    assert "変更後の日時" in mock_reply.await_args.args[1]
+    assert "日時" in mock_reply.await_args.args[1]
 
 
 @pytest.mark.asyncio
@@ -871,9 +872,9 @@ async def test_autopilot_rich_menu_trigger_restarts_booking_instead_of_manual_mo
         await _handle_text_message(event, db)
 
     mock_clear.assert_awaited_once_with(db, "U-autopilot")
-    assert mock_set_mode.await_args.args[2] == "waiting_menu"
+    assert mock_set_mode.await_args.args[2] == "idle"
     mock_reply.assert_awaited_once()
-    assert "ご希望メニュー" in mock_reply.await_args.args[1]
+    assert "メニュー" in mock_reply.await_args.args[1]
 
 
 @pytest.mark.asyncio
@@ -904,10 +905,12 @@ async def test_autopilot_natural_booking_message_restarts_from_manual_mode():
     ), patch(
         "app.api.line._get_patient_default_preset",
         new=AsyncMock(return_value={"menu_name": "マッスルセラピー", "duration_minutes": 60, "practitioner_name": "時田"}),
-    ), patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+    ), patch("app.api.line._build_menu_quick_reply_items", new=AsyncMock(return_value=[])), patch(
+        "app.api.line.reply_text_with_quick_reply", new=AsyncMock()
+    ) as mock_reply:
         await _handle_text_message(event, db)
 
-    assert "いつものマッスルセラピー 60分" in mock_reply.await_args.args[1]
+    assert mock_reply.await_args.args[1]
 
 
 @pytest.mark.asyncio
@@ -1072,8 +1075,8 @@ def test_normalize_constraints_converts_llm_objects_to_strings():
     ) == ["window:11:00-14:00", "symptom:肩こり", "asap", "ref_history"]
 
 
-def test_composer_rejects_reworded_confirmed_facts():
-    from app.services.line_composer import _is_grounded_reply
+def test_composer_allows_omission_and_rejects_only_temporal_contradiction():
+    from app.services.line_composer import _has_temporal_contradiction
 
     context = {
         "date": "2026/08/16",
@@ -1082,16 +1085,9 @@ def test_composer_rejects_reworded_confirmed_facts():
         "practitioner": "時田",
         "menu": "保険診療",
     }
-    assert _is_grounded_reply(
-        "confirmed",
-        context,
-        "ご予約を確定しました。2026/08/16 14:00〜15:00（担当: 時田・メニュー: 保険診療）",
-    )
-    assert not _is_grounded_reply(
-        "confirmed",
-        context,
-        "8月16日14時から時田の担当で予約を承りました。",
-    )
+    assert not _has_temporal_contradiction(context, "承知しました。ご来院をお待ちしております。")
+    assert not _has_temporal_contradiction(context, "8月16日14時からご案内します。")
+    assert _has_temporal_contradiction(context, "8月17日16時からご案内します。")
 
 
 def test_autopilot_debounce_does_not_merge_thanks_or_changed_intent():
@@ -1189,6 +1185,22 @@ async def test_reset_user_conversation_abandons_only_pending_request():
 
 
 @pytest.mark.asyncio
+async def test_conversation_history_keeps_latest_three_round_trips():
+    from app.services.line_state import append_conversation_history
+
+    state = SimpleNamespace(context_data={})
+    db = AsyncMock()
+    with patch("app.services.line_state._get_or_create_state", new=AsyncMock(return_value=state)):
+        for index in range(8):
+            await append_conversation_history(db, "U-history", "patient" if index % 2 == 0 else "assistant", f"message-{index}")
+
+    history = state.context_data["conversation_history"]
+    assert len(history) == 6
+    assert history[0]["content"] == "message-2"
+    assert history[-1]["content"] == "message-7"
+
+
+@pytest.mark.asyncio
 async def test_setup_natural_language_retry_restarts_identity_without_registration():
     from app.api.line import _handle_autopilot_setup_message
 
@@ -1280,3 +1292,259 @@ async def test_llm_abandonment_resets_unconfirmed_booking_without_cancelling_res
     mock_reset.assert_awaited_once_with(db, "U-autopilot", reason="booking_abandoned")
     mock_cancel.assert_not_awaited()
     mock_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_composer_returns_successful_llm_text_without_template_replacement():
+    from app.services.line_composer import _fallback, compose_reply
+
+    natural_reply = "明日ですね。何時ごろがご希望ですか？"
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"candidates": [{"content": {"parts": [{"text": natural_reply}]}}]}
+    client = AsyncMock()
+    client.post.return_value = response
+    client_context = AsyncMock()
+    client_context.__aenter__.return_value = client
+
+    context = {"date": "8/16(土)", "menu": "マッスルセラピー", "patient_message": "明日！"}
+    with patch("app.config.settings.gemini_api_key", "test-key"), patch(
+        "httpx.AsyncClient", return_value=client_context
+    ), patch("app.services.line_composer._notify_fallback", new=AsyncMock()) as mock_notify:
+        actual = await compose_reply("ask_time_for_date", context)
+
+    assert actual == natural_reply
+    assert actual != _fallback("ask_time_for_date", context)
+    mock_notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_composer_retries_once_only_for_temporal_contradiction():
+    from app.services.line_composer import compose_reply
+
+    wrong = Mock()
+    wrong.raise_for_status.return_value = None
+    wrong.json.return_value = {"candidates": [{"content": {"parts": [{"text": "8/17の16:00はいかがですか？"}]}}]}
+    corrected = Mock()
+    corrected.raise_for_status.return_value = None
+    corrected.json.return_value = {"candidates": [{"content": {"parts": [{"text": "8/16の14:00はいかがですか？"}]}}]}
+    client = AsyncMock()
+    client.post.side_effect = [wrong, corrected]
+    client_context = AsyncMock()
+    client_context.__aenter__.return_value = client
+
+    with patch("app.config.settings.gemini_api_key", "test-key"), patch(
+        "httpx.AsyncClient", return_value=client_context
+    ), patch("app.services.line_composer._notify_fallback", new=AsyncMock()) as mock_notify:
+        actual = await compose_reply("confirm_slot", {"date": "8/16(土)", "start": "14:00"})
+
+    assert actual == "8/16の14:00はいかがですか？"
+    assert client.post.await_count == 2
+    assert "書き直してください" in client.post.await_args_list[1].kwargs["json"]["contents"][0]["parts"][0]["text"]
+    mock_notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_composer_api_failure_uses_template_and_notifies_admin():
+    from app.services.line_composer import _fallback, compose_reply
+
+    context = {"patient_message": "明日予約したい"}
+    with patch("app.config.settings.gemini_api_key", ""), patch(
+        "app.services.line_composer._notify_fallback", new=AsyncMock()
+    ) as mock_notify:
+        actual = await compose_reply("ask_datetime", context)
+
+    assert actual == _fallback("ask_datetime", context)
+    mock_notify.assert_awaited_once_with("ask_datetime", "api_error")
+
+
+@pytest.mark.asyncio
+async def test_autopilot_waiting_menu_uses_usual_and_date_without_button():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    menu = SimpleNamespace(id=5, name="マッスルセラピー", duration_minutes=60, max_duration_minutes=60, is_duration_variable=False)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "いつもので明日できますか？"},
+    }
+    merged_draft = {
+        "customer_name": patient.name,
+        "menu_id": 5,
+        "menu_name": menu.name,
+        "duration_minutes": 60,
+        "date": "2026-08-16",
+        "parse_confidence": "high",
+    }
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state", new=AsyncMock(return_value={"mode": "waiting_menu", "draft": {}, "request_id": None})
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="waiting_menu")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch(
+        "app.api.line.parse_line_message",
+        new=AsyncMock(return_value={"intent": "new", "has_reservation_intent": True, "date": "2026-08-16", "time": None, "menu_hint": "usual", "confidence": "high", "constraints": []}),
+    ), patch(
+        "app.api.line._get_patient_default_preset",
+        new=AsyncMock(return_value={"menu_id": 5, "menu_name": menu.name, "duration_minutes": 60, "practitioner_id": 3, "practitioner_name": "時田"}),
+    ), patch("app.api.line.merge_user_draft", new=AsyncMock(return_value=merged_draft)) as mock_merge, patch(
+        "app.api.line._resolve_menu", new=AsyncMock(return_value=menu)
+    ), patch("app.api.line.build_same_day_candidates", new=AsyncMock(return_value=[])), patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ), patch(
+        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="8/16ですね。何時ごろがよろしいですか？")
+    ), patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+        await _handle_text_message(event, AsyncMock())
+
+    update = next(call.args[2] for call in mock_merge.await_args_list if call.args[2].get("date"))
+    assert update["menu_name"] == menu.name
+    assert update["date"] == "2026-08-16"
+    assert "メニューを選んで" not in mock_reply.await_args.args[1]
+    assert "8/16" in mock_reply.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_autopilot_waiting_datetime_acknowledges_date_and_offers_times():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    menu = SimpleNamespace(id=5, name="マッスルセラピー", duration_minutes=60, is_duration_variable=False)
+    candidate = SimpleNamespace(to_dict=lambda: {"label": "2026-08-16 10:00〜11:00（時田）"})
+    event = {"replyToken": "reply-token", "source": {"userId": "U-autopilot"}, "message": {"type": "text", "text": "明日！"}}
+    draft = {"menu_id": 5, "menu_name": menu.name, "duration_minutes": 60}
+    merged = {**draft, "date": "2026-08-16", "parse_confidence": "high"}
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state", new=AsyncMock(return_value={"mode": "waiting_datetime", "draft": draft, "request_id": None})
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="waiting_datetime")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch(
+        "app.api.line.parse_line_message",
+        new=AsyncMock(return_value={"intent": "new", "has_reservation_intent": True, "date": "2026-08-16", "time": None, "menu_name": menu.name, "confidence": "high", "constraints": []}),
+    ), patch("app.api.line._resolve_menu", new=AsyncMock(return_value=menu)), patch(
+        "app.api.line.merge_user_draft", new=AsyncMock(return_value=merged)
+    ), patch("app.api.line.build_same_day_candidates", new=AsyncMock(return_value=[candidate])), patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ), patch(
+        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="8/16ですね。10:00はいかがでしょうか？")
+    ) as mock_compose, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+        await _handle_text_message(event, AsyncMock())
+
+    assert mock_compose.await_args.args[0] == "ask_time_for_date"
+    assert mock_compose.await_args.args[1]["available_candidates"][0]["label"].startswith("2026-08-16 10:00")
+    assert "8/16" in mock_reply.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_autopilot_usual_button_still_fills_slots():
+    from app.api.line import _merge_autopilot_slots
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    preset = {"menu_id": 5, "menu_name": "マッスルセラピー", "duration_minutes": 60, "practitioner_id": 3, "practitioner_name": "時田"}
+    with patch("app.api.line._get_patient_default_preset", new=AsyncMock(return_value=preset)), patch(
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)
+    ):
+        merged = await _merge_autopilot_slots(
+            AsyncMock(),
+            user_id="U-autopilot",
+            text="⭐️いつもの（マッスルセラピー 60分・担当: 時田）",
+            patient=patient,
+            previous={},
+            parsed={"intent": "new", "date": None, "time": None, "confidence": "high", "constraints": []},
+        )
+
+    assert merged["menu_name"] == "マッスルセラピー"
+    assert merged["duration_minutes"] == 60
+    assert merged["practitioner_id"] == 3
+
+
+@pytest.mark.asyncio
+async def test_autopilot_full_natural_message_books_without_buttons():
+    from app.api.line import _handle_text_message
+    from app.utils.datetime_jst import JST
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    menu = SimpleNamespace(id=5, name="マッスルセラピー", duration_minutes=60, max_duration_minutes=60, is_duration_variable=False)
+    practitioner = SimpleNamespace(id=3, name="時田")
+    start = datetime(2026, 8, 16, 14, 0, tzinfo=JST)
+    end = datetime(2026, 8, 16, 15, 0, tzinfo=JST)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "いつもので明日の14時にお願いします"},
+    }
+    parsed = {
+        "intent": "new",
+        "has_reservation_intent": True,
+        "date": "2026-08-16",
+        "time": "14:00",
+        "menu_hint": "usual",
+        "duration_minutes": None,
+        "confidence": "high",
+        "constraints": [],
+    }
+    merged = {
+        "customer_name": patient.name,
+        "menu_id": 5,
+        "menu_name": menu.name,
+        "duration_minutes": 60,
+        "practitioner_id": 3,
+        "practitioner_name": "時田",
+        "date": "2026-08-16",
+        "time": "14:00",
+        "parse_confidence": "high",
+    }
+    with ExitStack() as stack:
+        stack.enter_context(patch("app.api.line.settings.line_autopilot_enabled", True))
+        stack.enter_context(patch("app.api.line.get_user_state", new=AsyncMock(return_value={"mode": "waiting_menu", "draft": {}, "request_id": None})))
+        stack.enter_context(patch("app.api.line.get_user_mode", new=AsyncMock(return_value="waiting_menu")))
+        stack.enter_context(patch("app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")))
+        stack.enter_context(patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)))
+        stack.enter_context(patch("app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value={"menu_id": 5, "menu_name": menu.name, "duration_minutes": 60})))
+        stack.enter_context(patch("app.api.line.classify_conversation_control", new=AsyncMock(return_value={"action": "continue", "confidence": "high"})))
+        stack.enter_context(patch("app.api.line.is_duplicate_message", return_value=False))
+        stack.enter_context(patch("app.api.line.merge_debounced_message", return_value=event["message"]["text"]))
+        stack.enter_context(patch("app.api.line.parse_line_message", new=AsyncMock(return_value=parsed)))
+        stack.enter_context(patch("app.api.line._get_patient_default_preset", new=AsyncMock(return_value={"menu_id": 5, "menu_name": menu.name, "duration_minutes": 60, "practitioner_id": 3, "practitioner_name": "時田"})))
+        stack.enter_context(patch("app.api.line.merge_user_draft", new=AsyncMock(return_value=merged)))
+        stack.enter_context(patch("app.api.line._resolve_menu", new=AsyncMock(return_value=menu)))
+        stack.enter_context(patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)))
+        stack.enter_context(patch("app.api.line.find_best_practitioner", new=AsyncMock(return_value=(practitioner, start, end, 0, 0))))
+        stack.enter_context(patch("app.api.line.create_pending_request", new=AsyncMock(return_value="rid-natural")))
+        stack.enter_context(patch("app.api.line.update_request", new=AsyncMock()))
+        mock_create = stack.enter_context(patch("app.api.line.create_reservation", new=AsyncMock(return_value={"id": 777, "status": "CONFIRMED"})))
+        stack.enter_context(patch("app.api.line.clear_user_draft", new=AsyncMock()))
+        stack.enter_context(patch("app.api.line.set_user_mode", new=AsyncMock()))
+        stack.enter_context(patch("app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="ご予約を承りました。")))
+        mock_reply = stack.enter_context(patch("app.api.line.reply_to_line", new=AsyncMock()))
+        await _handle_text_message(event, AsyncMock())
+
+    mock_create.assert_awaited_once()
+    assert mock_create.await_args.kwargs["reject_conflicts"] is True
+    assert mock_reply.await_args.args[1] == "ご予約を承りました。"
+
+
+@pytest.mark.asyncio
+async def test_non_autopilot_waiting_menu_keeps_legacy_fixed_reply():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="一般患者", line_autopilot_enabled=False)
+    event = {"replyToken": "reply-token", "source": {"userId": "U-legacy"}, "message": {"type": "text", "text": "不明なメニュー"}}
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state", new=AsyncMock(return_value={"mode": "waiting_menu", "draft": {}, "request_id": None})
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="waiting_menu")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="一般患者")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line._resolve_menu", new=AsyncMock(return_value=None)), patch(
+        "app.api.line._build_menu_quick_reply_items", new=AsyncMock(return_value=[])
+    ), patch("app.api.line.reply_text_with_quick_reply", new=AsyncMock()) as mock_reply, patch(
+        "app.api.line.compose_reply", new=AsyncMock()
+    ) as mock_compose:
+        await _handle_text_message(event, AsyncMock())
+
+    assert mock_reply.await_args.args[1] == "ご希望メニューを選んでくださいね。"
+    mock_compose.assert_not_awaited()

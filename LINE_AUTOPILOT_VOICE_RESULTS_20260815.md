@@ -59,6 +59,20 @@ Reproduced failure classes from the live-LLM eval included constraints returned 
 - All identity steps provide an `入力をやり直す` quick reply. Before any new patient is created, the user sees both confirmation and retry choices.
 - Phone numbers and birth dates are replaced with placeholders before identity-control text is sent to Gemini. Matching still uses the original input locally.
 
+## LLM-only reply follow-up
+
+- Removed `_is_grounded_reply` and all verbatim fact-repetition requirements. A successful Gemini reply is sent unchanged even when it omits menu, practitioner, or date facts.
+- Numeric date/time contradictions are detected separately. A contradiction triggers one rewrite request; a second contradiction falls back to the emergency template.
+- Missing key/API errors and repeated contradictions log `logger.error` with `reason=api_error` or `reason=contradiction`, then notify the administrator before returning a template.
+- The latest six conversation messages (three round trips) are stored in `line_user_states.context_data.conversation_history` and supplied to reply composition.
+- Autopilot patients now use unified LLM slot filling across `idle`, `waiting_menu`, `waiting_datetime`, and `waiting_time_duration`. Parsed date, time, menu hint, duration, and constraints are merged into the draft.
+- Natural `usual` expressions and the existing `⭐️いつもの` quick reply share the same preset resolution path.
+- Date-only input is acknowledged with up to three same-day availability candidates. Time-only input is acknowledged before asking only for the date.
+- The legacy waiting-menu/duration/datetime branches remain present and are explicitly restricted to non-autopilot patients.
+- Acceptance tests cover successful LLM text not matching fallback templates, one contradiction rewrite, API-failure alerting, natural `いつもので明日`, date-only acknowledgement, quick-reply compatibility, non-autopilot legacy behavior, and button-free natural-message booking.
+- Final parser eval: LLM 45/45, intent 41/45, date 17/18, time 17/17, constraints 23/45.
+- Final required regression: `pytest tests/test_shadow_mode.py tests/test_line_ai_secretary.py -q` passed 77 tests after the final identity-branch scope guard.
+
 ## Remaining environment verification
 
 - Confirm the deployed Render service has a non-empty `GEMINI_API_KEY`; the dashboard value is not visible from this workspace.

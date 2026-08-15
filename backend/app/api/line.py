@@ -1,5 +1,6 @@
 """LINE Webhook & API（AI秘書: 第1段階）"""
 import base64
+from contextvars import ContextVar
 from datetime import date, datetime, time, timedelta
 import hashlib
 import hmac
@@ -34,6 +35,7 @@ from app.services.line_debounce import clear_debounce, is_duplicate_message, mer
 from app.services.slot_scorer import build_same_day_candidates, find_best_practitioner, score_candidates
 from app.services.line_reply import push_message, reply_flex_message, reply_text_with_quick_reply, reply_to_line
 from app.services.line_state import (
+    append_conversation_history,
     clear_user_draft,
     create_pending_request,
     get_request,
@@ -60,6 +62,9 @@ from app.services.shadow_service import handle_shadow_message
 from app.utils.datetime_jst import JST, now_jst
 
 logger = logging.getLogger(__name__)
+
+_AUTOPILOT_DB_CONTEXT: ContextVar[AsyncSession | None] = ContextVar("autopilot_db", default=None)
+_AUTOPILOT_USER_CONTEXT: ContextVar[str | None] = ContextVar("autopilot_user", default=None)
 
 router = APIRouter(prefix="/api/line", tags=["line"])
 
@@ -751,7 +756,20 @@ async def _compose_autopilot_reply(
     context: dict,
     parsed: dict | None = None,
 ) -> str:
-    reply = await compose_reply(situation, context)
+    db = _AUTOPILOT_DB_CONTEXT.get()
+    user_id = _AUTOPILOT_USER_CONTEXT.get()
+    enriched_context = dict(context)
+    if db is not None and user_id:
+        patient_message = context.get("patient_message")
+        if patient_message:
+            await append_conversation_history(db, user_id, "patient", str(patient_message))
+        state = await get_user_state(db, user_id)
+        history = state.get("context_data", {}).get("conversation_history") or []
+        enriched_context["recent_history"] = history[-6:]
+
+    reply = await compose_reply(situation, enriched_context)
+    if db is not None and user_id:
+        await append_conversation_history(db, user_id, "assistant", reply)
     parser_summary = {
         key: parsed.get(key)
         for key in ("intent", "date", "time", "polarity", "confidence", "needs_human", "constraints")
@@ -869,6 +887,70 @@ async def _complete_autopilot_reschedule(
             ),
         )
     return True
+
+
+async def _merge_autopilot_slots(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    text: str,
+    patient: Patient,
+    previous: dict,
+    parsed: dict,
+) -> dict:
+    update = {
+        "customer_name": patient.name,
+        "date": parsed.get("date"),
+        "time": parsed.get("time"),
+        "duration_minutes": parsed.get("duration_minutes") or _extract_duration_minutes(text),
+        "constraints": parsed.get("constraints"),
+        "parse_confidence": parsed.get("confidence"),
+    }
+    menu_hint = parsed.get("menu_name") or parsed.get("menu_hint")
+    wants_usual = menu_hint == "usual" or bool(re.search(r"いつもの|前回と同じ|この前と同じ", text)) or text.startswith("⭐️いつもの")
+    if wants_usual:
+        preset = await _get_patient_default_preset(db, patient)
+        if preset:
+            update.update(
+                {
+                    "menu_id": preset["menu_id"],
+                    "menu_name": preset["menu_name"],
+                    "duration_minutes": preset["duration_minutes"],
+                    "practitioner_id": preset.get("practitioner_id"),
+                    "practitioner_name": preset.get("practitioner_name"),
+                }
+            )
+        else:
+            latest = await _get_latest_reservation_for_line_user(db, user_id)
+            if latest:
+                update.update(
+                    {
+                        "menu_id": latest.get("menu_id"),
+                        "menu_name": latest["menu_name"],
+                        "duration_minutes": latest["duration_minutes"],
+                    }
+                )
+    elif menu_hint:
+        selected_menu = await _resolve_menu(db, str(menu_hint))
+        if selected_menu:
+            update.update(
+                {
+                    "menu_id": selected_menu.id,
+                    "menu_name": selected_menu.name,
+                    "duration_minutes": update.get("duration_minutes") or selected_menu.duration_minutes,
+                }
+            )
+    elif previous.get("menu_name") is None and (text.startswith("⭐️") or previous.get("mode") == "waiting_menu"):
+        selected_menu = await _resolve_menu(db, text)
+        if selected_menu:
+            update.update(
+                {
+                    "menu_id": selected_menu.id,
+                    "menu_name": selected_menu.name,
+                    "duration_minutes": update.get("duration_minutes") or selected_menu.duration_minutes,
+                }
+            )
+    return await merge_user_draft(db, user_id, update)
 
 
 async def _reply_setup_start(reply_token: str | None, prefix: str | None = None) -> None:
@@ -1110,6 +1192,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     is_autopilot_patient = False
     if _autopilot_is_globally_enabled():
         user_state = await get_user_state(db, user_id)
+        if "context_data" in user_state:
+            _AUTOPILOT_DB_CONTEXT.set(db)
+            _AUTOPILOT_USER_CONTEXT.set(user_id)
         display_name = await _get_line_display_name(user_id)
         if _conversation_is_expired(user_state):
             expired_mode = user_state.get("mode")
@@ -1216,12 +1301,15 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     # 過去にmanualへ退避した対象者も、ここから予約会話を再開できる。
     if is_autopilot_patient and _is_booking_or_change_menu_trigger(text):
         await clear_user_draft(db, user_id)
-        await set_user_mode(db, user_id, "waiting_menu")
+        await set_user_mode(db, user_id, "idle")
         if reply_token:
             quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
             await reply_text_with_quick_reply(
                 reply_token,
-                "ご希望メニューを選んでください。",
+                await _compose_autopilot_reply(
+                    "ask_menu",
+                    {"patient_name": line_patient.name, "patient_message": text},
+                ),
                 quick_items,
             )
         return
@@ -1288,37 +1376,20 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             )
             return
 
-    if is_autopilot_patient and "いつもの" in text and current_mode not in {
-        "waiting_menu", "waiting_datetime", "waiting_time_duration", "autopilot_confirm_usual",
-    }:
-        preset = await _get_patient_default_preset(db, line_patient)
-        if preset:
-            usual_draft = {
-                "customer_name": line_patient.name,
-                "menu_id": preset["menu_id"],
-                "menu_name": preset["menu_name"],
-                "duration_minutes": preset["duration_minutes"],
-            }
-            if preset.get("practitioner_id"):
-                usual_draft["practitioner_id"] = preset["practitioner_id"]
-                usual_draft["practitioner_name"] = preset["practitioner_name"]
-            await merge_user_draft(db, user_id, usual_draft)
-            await set_user_mode(db, user_id, "waiting_datetime")
-            if reply_token:
-                await reply_to_line(
-                    reply_token,
-                    await _compose_autopilot_reply(
-                        "ask_datetime",
-                        {
-                            "patient_name": line_patient.name,
-                            "menu": preset["menu_name"],
-                            "practitioner": preset.get("practitioner_name"),
-                            "patient_message": text,
-                        },
-                        parsed_intent,
-                    ),
-                )
-            return
+        if (
+            current_mode in {"idle", "waiting_menu", "waiting_datetime", "waiting_time_duration"}
+            and parsed_intent.get("intent") not in {"cancel", "change", "question"}
+            and not _has_cancellation_intent(text)
+            and not _has_change_intent(text)
+        ):
+            merged = await _merge_autopilot_slots(
+                db,
+                user_id=user_id,
+                text=text,
+                patient=line_patient,
+                previous=prev_draft,
+                parsed=parsed_intent,
+            )
 
     if is_autopilot_patient and current_mode == "autopilot_booking_confirm":
         request_id = user_state.get("request_id")
@@ -1490,7 +1561,14 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 await set_user_mode(db, user_id, "autopilot_cancel_confirm")
                 logger.warning("LINE autopilot cancellation failed: reservation_id=%s detail=%s", reservation_id, error.detail)
                 if reply_token:
-                    await reply_to_line(reply_token, "キャンセル処理を完了できませんでした。もう一度「はい」と返信するか、担当者へご連絡ください。")
+                    await reply_to_line(
+                        reply_token,
+                        await _compose_autopilot_reply(
+                            "cancel_failed",
+                            {"patient_message": text, "reason": str(error.detail)},
+                            parsed_intent,
+                        ),
+                    )
                 return
             await clear_user_draft(db, user_id)
             await set_user_mode(db, user_id, "idle")
@@ -1514,7 +1592,10 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             await clear_user_draft(db, user_id)
             await set_user_mode(db, user_id, "idle")
             if reply_token:
-                await reply_to_line(reply_token, "キャンセルを取りやめました。")
+                await reply_to_line(
+                    reply_token,
+                    await _compose_autopilot_reply("cancel_aborted", {"patient_message": text}, parsed_intent),
+                )
             return
         if reply_token:
             await _reply_with_loop_guard(
@@ -1535,7 +1616,10 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             await clear_user_draft(db, user_id)
             await set_user_mode(db, user_id, "idle")
             if reply_token:
-                await reply_to_line(reply_token, "変更する予約を確認できませんでした。あらためて「予約変更したい」と送ってください。")
+                await reply_to_line(
+                    reply_token,
+                    await _compose_autopilot_reply("change_target_missing", {"patient_message": text}, parsed),
+                )
             return
         if not parsed.get("date") or not parsed.get("time"):
             if reply_token:
@@ -1568,11 +1652,21 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             await clear_user_draft(db, user_id)
             await set_user_mode(db, user_id, "autopilot_change_datetime")
             if reply_token:
-                await reply_to_line(reply_token, "変更候補を取りやめました。別のご希望日時を教えてください。")
+                await reply_to_line(
+                    reply_token,
+                    await _compose_autopilot_reply("change_aborted", {"patient_message": text}, parsed_intent),
+                )
             return
         if not _is_affirmative(text) or not all([reservation_id, start_time_iso, end_time_iso, practitioner_id]):
             if reply_token:
-                await reply_to_line(reply_token, "変更する場合は「はい」、別の日時を希望する場合は「いいえ」と返信してください。")
+                await reply_to_line(
+                    reply_token,
+                    await _compose_autopilot_reply(
+                        "reconfirm_yes_no",
+                        {"what": "予約変更の候補", "patient_message": text},
+                        parsed_intent,
+                    ),
+                )
             return
         try:
             start_dt = datetime.fromisoformat(start_time_iso)
@@ -1611,7 +1705,11 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             await set_user_mode(db, user_id, "waiting_menu")
             if reply_token:
                 quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
-                await reply_text_with_quick_reply(reply_token, "ご希望メニューを選んでください。", quick_items)
+                await reply_text_with_quick_reply(
+                    reply_token,
+                    await _compose_autopilot_reply("ask_menu", {"patient_message": text}, parsed_intent),
+                    quick_items,
+                )
             return
         if _is_affirmative(text):
             usual_draft = {
@@ -1640,7 +1738,11 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             await set_user_mode(db, user_id, "waiting_menu")
             if reply_token:
                 quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
-                await reply_text_with_quick_reply(reply_token, "ご希望メニューを選んでください。", quick_items)
+                await reply_text_with_quick_reply(
+                    reply_token,
+                    await _compose_autopilot_reply("ask_menu", {"patient_message": text}, parsed_intent),
+                    quick_items,
+                )
             return
         else:
             if reply_token:
@@ -1675,7 +1777,15 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         if reply_token:
             await reply_to_line(
                 reply_token,
-                f"{reservation.start_time.astimezone(JST).strftime('%Y/%m/%d %H:%M')}のご予約をキャンセルしますか？\nはい / いいえ",
+                await _compose_autopilot_reply(
+                    "cancel_confirm",
+                    {
+                        "date": reservation.start_time.astimezone(JST).strftime("%Y/%m/%d"),
+                        "start": reservation.start_time.astimezone(JST).strftime("%H:%M"),
+                        "patient_message": text,
+                    },
+                    parsed_intent,
+                ),
             )
         return
 
@@ -1725,7 +1835,16 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         full_name = extract_full_name(text, profile_name=display_name)
         if not full_name or len(full_name) < 2:
             if reply_token:
-                await reply_to_line(reply_token, "確認のため、フルネーム（姓・名）をもう一度お願いします。")
+                if is_autopilot_patient:
+                    await reply_to_line(
+                        reply_token,
+                        await _compose_autopilot_reply(
+                            "ask_full_name",
+                            {"patient_message": _redact_identity_control_text(text)},
+                        ),
+                    )
+                else:
+                    await reply_to_line(reply_token, "確認のため、フルネーム（姓・名）をもう一度お願いします。")
             return
 
         candidates = await find_name_candidates(db, full_name, limit=5)
@@ -1825,7 +1944,16 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         if not isinstance(candidate_ids, list) or not candidate_ids:
             await set_user_mode(db, user_id, "awaiting_name", user_state.get("request_id"))
             if reply_token:
-                await reply_to_line(reply_token, "確認情報が見つからないため、もう一度お名前の入力をお願いします。")
+                if is_autopilot_patient:
+                    await reply_to_line(
+                        reply_token,
+                        await _compose_autopilot_reply(
+                            "identity_retry",
+                            {"patient_message": _redact_identity_control_text(text)},
+                        ),
+                    )
+                else:
+                    await reply_to_line(reply_token, "確認情報が見つからないため、もう一度お名前の入力をお願いします。")
             return
 
         result = await db.execute(select(Patient).where(Patient.id.in_(candidate_ids)))
@@ -1870,7 +1998,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             )
         return
 
-    if current_mode == "waiting_menu":
+    if current_mode == "waiting_menu" and not is_autopilot_patient:
         preset = await _get_patient_default_preset(db, line_patient)
         if text.startswith("⭐️いつもの") and preset:
             draft_update: dict = {
@@ -1942,7 +2070,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             await reply_to_line(reply_token, f"{selected_menu.name}ですね。ご希望日時を教えてください。\n例: 4/10 10:00")
         return
 
-    if current_mode == "waiting_time_duration":
+    if current_mode == "waiting_time_duration" and not is_autopilot_patient:
         menu = await _resolve_menu(db, prev_draft.get("menu_name"))
         if not menu:
             await set_user_mode(db, user_id, "waiting_menu", user_state.get("request_id"))
@@ -1969,7 +2097,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             await reply_to_line(reply_token, "ありがとうございます。続いてご希望日時を教えてください。\n例: 明日 10時")
         return
 
-    if current_mode == "waiting_datetime":
+    if current_mode == "waiting_datetime" and not is_autopilot_patient:
         parsed_dt = await parse_line_message(text, profile_name=display_name, previous=prev_draft)
         merged_dt = await merge_user_draft(
             db,
@@ -2029,6 +2157,25 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         )
 
     if not merged.get("menu_name"):
+        if is_autopilot_patient:
+            await set_user_mode(db, user_id, "idle", user_state.get("request_id"))
+            if reply_token:
+                quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
+                await reply_text_with_quick_reply(
+                    reply_token,
+                    await _compose_autopilot_reply(
+                        "ask_menu",
+                        {
+                            "patient_name": line_patient.name,
+                            "date": merged.get("date"),
+                            "time": merged.get("time"),
+                            "patient_message": text,
+                        },
+                        parsed_intent,
+                    ),
+                    quick_items,
+                )
+            return
         preset = await _get_patient_default_preset(db, line_patient) if is_autopilot_patient else None
         if preset:
             await set_user_mode(db, user_id, "autopilot_confirm_usual")
@@ -2064,11 +2211,20 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             await set_user_mode(db, user_id, "waiting_time_duration", user_state.get("request_id"))
             if reply_token:
                 quick_items = _build_duration_quick_reply_items(min_minutes, max_minutes)
-                await reply_text_with_quick_reply(
-                    reply_token,
-                    f"{menu.name}は時間を選べます。{min_minutes}〜{max_minutes}分で教えてください。",
-                    quick_items,
-                )
+                prompt = f"{menu.name}は時間を選べます。{min_minutes}〜{max_minutes}分で教えてください。"
+                if is_autopilot_patient:
+                    prompt = await _compose_autopilot_reply(
+                        "ask_missing",
+                        {
+                            "missing_fields": ["duration_minutes"],
+                            "menu": menu.name,
+                            "min_minutes": min_minutes,
+                            "max_minutes": max_minutes,
+                            "patient_message": text,
+                        },
+                        parsed_intent,
+                    )
+                await reply_text_with_quick_reply(reply_token, prompt, quick_items)
             return
 
     missing_datetime = [k for k in ["date", "time"] if not merged.get(k)]
@@ -2076,19 +2232,45 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         await set_user_mode(db, user_id, "waiting_datetime", user_state.get("request_id"))
         if reply_token:
             if is_autopilot_patient:
+                situation = "ask_datetime"
+                context = {
+                    "patient_name": line_patient.name,
+                    "menu": merged.get("menu_name"),
+                    "patient_message": text,
+                }
+                if merged.get("date") and not merged.get("time"):
+                    situation = "ask_time_for_date"
+                    candidates: list[dict] = []
+                    date_label = str(merged.get("date"))
+                    try:
+                        target_date = date.fromisoformat(str(merged["date"]))
+                        date_label = _format_date_with_weekday_jp(target_date)
+                        duration_for_candidates = int(merged.get("duration_minutes") or (menu.duration_minutes if menu else 60))
+                        scored = await build_same_day_candidates(
+                            db,
+                            target_date,
+                            time(9, 0),
+                            duration_for_candidates,
+                            preferred_practitioner_id=merged.get("practitioner_id"),
+                            max_results=3,
+                        )
+                        candidates = [candidate.to_dict() for candidate in scored]
+                    except (TypeError, ValueError):
+                        pass
+                    context.update(
+                        {
+                            "date": date_label,
+                            "available_candidates": candidates,
+                        }
+                    )
+                elif merged.get("time") and not merged.get("date"):
+                    situation = "ask_date_for_time"
+                    context["time"] = merged.get("time")
                 await reply_to_line(
                     reply_token,
                     await _compose_autopilot_reply(
-                        "ask_missing",
-                        {
-                            "missing_fields": missing_datetime,
-                            "draft": {
-                                "date": merged.get("date"),
-                                "time": merged.get("time"),
-                                "menu": merged.get("menu_name"),
-                            },
-                            "patient_message": text,
-                        },
+                        situation,
+                        context,
                         parsed_intent,
                     ),
                 )
