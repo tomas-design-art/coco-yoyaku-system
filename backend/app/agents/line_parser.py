@@ -36,7 +36,10 @@ JSON:"""
 LINE_PARSE_PROMPT = """あなたは接骨院の熟練予約秘書AIです。患者からのLINEメッセージを解析し、必ずJSONのみで返します（説明文禁止）。
 今日は {today}（{weekday}曜日）。メッセージは任意の言語で届きます。言語を問わず意味を取り、日付時刻は必ず正規化してください。
 
-当院の有効メニュー一覧（この中の名称にマッピング。不明ならnull）:
+当院の確定情報（推測せず、必ずここを根拠にする）:
+{clinic_block}
+
+有効メニュー一覧（この中の名称にマッピング。不明ならnull）:
 {menu_list}
 
 出力JSON（全キー必須）:
@@ -50,7 +53,8 @@ polarity: 「大丈夫じゃない」「難しい」「無理」「やめてお�
 直前に案内した候補への条件変更は constraints で表す。より早い時間の希望は earlier、より遅い時間の希望は later、施術時間が短くなってもよいという意思は duration_flexible を入れる。
 施術時間の指定（例: 90分で）は duration_minutes と constraints の duration:90 を併記する。前回と同じ担当の希望は ref_practitioner:previous を入れる。強い痛み・動けない等は urgency:high を入れる。
 変更依頼では、既存予約の日時を current_date / current_time に入れ、新しい希望日時を date / time に入れる。
-直前に案内した候補への条件変更は constraints で表す。より早い時間の希望は earlier、より遅い時間の希望は later、施術時間が短くなってもよいという意思は duration_flexible を入れる。
+duration_minutes は患者が明示した施術時間だけを入れる。推測で入れない。上記メニューの最低施術時間を下回る値は入れない。
+duration_flexible は患者が「短くてもよい」と明確に述べた場合だけ入れる。単に早い時間を希望しただけでは入れない。
 name は患者の自己申告だけ。クレーム、緊急性の高い痛み、領収書・保険・料金の個別相談は needs_human=true。
 
 メッセージ:
@@ -356,14 +360,27 @@ def _normalize_result(parsed: dict, profile_name: str | None, previous: dict | N
     return result
 
 
-async def parse_line_message(message: str, profile_name: str | None = None, previous: dict | None = None, menu_names: list[str] | None = None) -> dict:
-    """LINEメッセージを解析して予約意図を判定"""
+async def parse_line_message(
+    message: str,
+    profile_name: str | None = None,
+    previous: dict | None = None,
+    menu_names: list[str] | None = None,
+    clinic_context: dict | None = None,
+) -> dict:
+    """LINEメッセージを解析して予約意図を判定
+
+    clinic_context を渡すと、休診日・施術者の休み・メニューの施術時間を根拠に解析できる。
+    """
     fallback = _rule_based_parse(message, profile_name=profile_name, previous=previous, menu_names=menu_names)
     from app.config import settings
     if not settings.gemini_api_key:
         return _normalize_result(fallback, profile_name, previous)
     try:
-        result = _normalize_result(await _ai_parse(message, menu_names=menu_names), profile_name, previous)
+        result = _normalize_result(
+            await _ai_parse(message, menu_names=menu_names, clinic_context=clinic_context),
+            profile_name,
+            previous,
+        )
         rule_result = _normalize_result(fallback, profile_name, previous)
         for key in ("customer_name", "menu_name", "duration_minutes"):
             if result.get(key) in (None, "") and rule_result.get(key) not in (None, ""):
@@ -454,9 +471,14 @@ def _rule_based_parse(message: str, profile_name: str | None = None, previous: d
     return result
 
 
-async def _ai_parse(message: str, menu_names: list[str] | None = None) -> dict:
+async def _ai_parse(
+    message: str,
+    menu_names: list[str] | None = None,
+    clinic_context: dict | None = None,
+) -> dict:
     """AI（Gemini）を使ったメッセージ解析"""
     from app.config import settings
+    from app.services.clinic_context import format_clinic_context_for_prompt
 
     if settings.gemini_api_key:
         import httpx
@@ -475,6 +497,7 @@ async def _ai_parse(message: str, menu_names: list[str] | None = None) -> dict:
                                      message=message,
                                      today=now_jst().date().isoformat(),
                                      weekday=["月", "火", "水", "木", "金", "土", "日"][now_jst().weekday()],
+                                     clinic_block=format_clinic_context_for_prompt(clinic_context or {}),
                                      menu_list="\n".join(f"- {name}" for name in menu_names or []) or "- 未登録",
                                  )}
                     ],

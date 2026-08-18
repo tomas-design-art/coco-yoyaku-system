@@ -32,6 +32,12 @@ from app.services.conflict_detector import check_conflict
 from app.services.line_alerts import build_reservation_review_flex, push_admin_reservation_review
 from app.services.line_composer import compose_reply
 from app.services.line_debounce import clear_debounce, is_duplicate_message, merge_debounced_message
+from app.services.business_hours import get_business_hours_for_date
+from app.services.clinic_context import (
+    build_clinic_context,
+    effective_menu_min_duration,
+    get_autopilot_min_duration,
+)
 from app.services.line_facts import PRICE_CATEGORY, collect_question_facts, next_open_dates
 from app.services.line_negotiation import SlotFilters, build_slot_filters
 from app.services.slot_scorer import (
@@ -72,6 +78,9 @@ logger = logging.getLogger(__name__)
 
 _AUTOPILOT_DB_CONTEXT: ContextVar[AsyncSession | None] = ContextVar("autopilot_db", default=None)
 _AUTOPILOT_USER_CONTEXT: ContextVar[str | None] = ContextVar("autopilot_user", default=None)
+# 院の確定情報（休診日・施術者の休み・メニューの施術時間）。
+# 解析と文面生成の両方が同じ事実を見るための共有点。
+_AUTOPILOT_CLINIC_CONTEXT: ContextVar[dict] = ContextVar("autopilot_clinic", default={})
 
 router = APIRouter(prefix="/api/line", tags=["line"])
 
@@ -758,6 +767,28 @@ def _format_usual_confirmation(preset: dict) -> str:
     return f"いつもの{preset['menu_name']} {preset['duration_minutes']}分{practitioner}でよろしいですか？\nはい / いいえ"
 
 
+async def _assert_bookable_duration(
+    db: AsyncSession,
+    menu_id: int | None,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> None:
+    """autopilot が確定してよい施術時間か最後に検算する。
+
+    可変メニューでは menus.duration_minutes が刻み幅として登録されているため、
+    経路によっては 10 分の施術が組まれてしまう。確定直前でここを必ず通す。
+    """
+    minutes = int((end_dt - start_dt).total_seconds() // 60)
+    floor = await get_autopilot_min_duration(db)
+    menu = await db.get(Menu, menu_id) if menu_id else None
+    minimum = effective_menu_min_duration(menu, floor)
+    if minutes < minimum:
+        raise ValueError(
+            f"autopilot booking duration too short: {minutes}min < {minimum}min "
+            f"(menu_id={menu_id})"
+        )
+
+
 async def _compose_autopilot_reply(
     situation: str,
     context: dict,
@@ -766,6 +797,8 @@ async def _compose_autopilot_reply(
     db = _AUTOPILOT_DB_CONTEXT.get()
     user_id = _AUTOPILOT_USER_CONTEXT.get()
     enriched_context = dict(context)
+    # 休診日を「満席」と言い換えたり施術時間を作り話しないよう、院の事実を毎回同梱する
+    enriched_context["clinic"] = _AUTOPILOT_CLINIC_CONTEXT.get()
     if db is not None and user_id:
         patient_message = context.get("patient_message")
         if patient_message:
@@ -1307,10 +1340,27 @@ async def _reoffer_autopilot_candidates(
         return False
 
     base_duration = int(draft.get("duration_minutes") or (menu.duration_minutes if menu else 60))
-    min_duration = _menu_duration_bounds(menu)[0] if menu else base_duration
-    merged_filters = SlotFilters.from_dict(draft.get("autopilot_filters")).merge(filters)
-    # 短縮の下限はメニューの最小時間。これより短くしない。
-    search_duration = min(base_duration, min_duration) if merged_filters.duration_flexible else base_duration
+    # menus.duration_minutes は可変メニューでは「10分刻みの単位」であり最低施術時間ではない。
+    # そのまま下限にすると10分の施術を予約してしまうため、安全弁を必ず噛ませる。
+    autopilot_floor = await get_autopilot_min_duration(db)
+    min_duration = effective_menu_min_duration(menu, autopilot_floor) if menu else base_duration
+
+    # 患者が新しい日付を明示したら、前回の条件（「短くてもいい」等）は引き継がない。
+    # 引き継ぐと、以前の会話で言った条件がいつまでも生き残って別日の検索を歪める。
+    offered_slots = draft.get("autopilot_offered_slots") or []
+    requested_date = _parse_iso_date((parsed_intent or {}).get("date"))
+    previous_date = _parse_iso_date(offered_slots[0].get("date") if offered_slots else None)
+    starts_new_search = bool(requested_date and previous_date and requested_date != previous_date)
+    merged_filters = (
+        filters
+        if starts_new_search
+        else SlotFilters.from_dict(draft.get("autopilot_filters")).merge(filters)
+    )
+    # 短縮の下限はメニューの実質最低時間。これより短くしない。
+    search_duration = max(
+        min(base_duration, min_duration) if merged_filters.duration_flexible else base_duration,
+        min_duration,
+    )
 
     offered = draft.get("autopilot_offered_slots") or []
     target_date = (
@@ -1719,8 +1769,36 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     merged: dict | None = None
     parsed_intent: dict | None = None
     if is_autopilot_patient:
-        parsed_intent = await parse_line_message(text, profile_name=display_name, previous=prev_draft)
-        if parsed_intent.get("needs_human"):
+        # 院の確定情報を1回だけ組み立て、解析にも文面生成にも同じものを渡す
+        clinic_facts = await build_clinic_context(
+            db,
+            patient=line_patient,
+            preset=await _get_patient_default_preset(db, line_patient),
+        )
+        _AUTOPILOT_CLINIC_CONTEXT.set(clinic_facts)
+        parsed_intent = await parse_line_message(
+            text,
+            profile_name=display_name,
+            previous=prev_draft,
+            clinic_context=clinic_facts,
+        )
+
+        # 候補提示中の番号返信は「明示的な選択」。
+        # 確信度や needs_human の判定より先に扱う（提示直後に聞き返すのは受付として誤り）。
+        explicit_choice = False
+        if current_mode == "adjusting":
+            pending_request = (
+                await get_request(db, user_state.get("request_id"), line_user_id=user_id)
+                if user_state.get("request_id")
+                else None
+            )
+            pending_alternatives = (pending_request or {}).get("alternatives") or []
+            explicit_choice = bool(
+                pending_alternatives
+                and _extract_alternative_choice(text, len(pending_alternatives)) is not None
+            )
+
+        if not explicit_choice and parsed_intent.get("needs_human"):
             await create_notification(db, "line_manual_mode", f"LINE手動対応: {line_patient.id}")
             if not parsed_intent.get("has_reservation_intent"):
                 await set_user_mode(db, user_id, "manual")
@@ -1734,7 +1812,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         ),
                     )
                 return
-        if parsed_intent.get("confidence") == "low":
+        if not explicit_choice and parsed_intent.get("confidence") == "low":
             await _reply_with_loop_guard(
                 db,
                 user_id,
@@ -1834,6 +1912,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         try:
             start_dt = datetime.fromisoformat(request_data["start_time_iso"])
             end_dt = datetime.fromisoformat(request_data["end_time_iso"])
+            await _assert_bookable_duration(db, request_data.get("menu_id"), start_dt, end_dt)
             reservation = await create_reservation(
                 db,
                 ReservationCreate(
@@ -1908,6 +1987,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 return
             # 番号選択＝患者の明示的な確定意思。追加の「はい/いいえ」は求めない。
             try:
+                await _assert_bookable_duration(db, request_data.get("menu_id"), start_dt, end_dt)
                 reservation = await create_reservation(
                     db,
                     ReservationCreate(
@@ -2804,6 +2884,36 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             )
         return
 
+    # ── 休診日チェック（候補を探す前に必ず見る）──
+    # これが無いと、休診日でも「空き0件」として扱われ「予約がいっぱい」と誤案内してしまう。
+    if is_autopilot_patient:
+        try:
+            business_hours = await get_business_hours_for_date(db, target_date)
+        except Exception as error:
+            # 判定できないときは会話を止めない。確定時の validate_business_hours が最終防波堤。
+            logger.warning("business hours lookup failed for %s: %s", target_date, error)
+            business_hours = None
+        if business_hours is not None and not business_hours.is_open:
+            await set_user_mode(db, user_id, "waiting_datetime", user_state.get("request_id"))
+            if reply_token:
+                await reply_to_line(
+                    reply_token,
+                    await _compose_autopilot_reply(
+                        "closed_day",
+                        {
+                            "date": _format_date_with_weekday_jp(target_date),
+                            "reason": business_hours.label or "休診日",
+                            "next_open_dates": [
+                                _format_date_with_weekday_jp(date.fromisoformat(iso))
+                                for iso in await next_open_dates(db, target_date)
+                            ],
+                            "patient_message": text,
+                        },
+                        parsed_intent,
+                    ),
+                )
+            return
+
     # ── 担当・施術時間の決定ルール ──
     preferred_practitioner_id = merged.get("practitioner_id")
     prefer_director = False
@@ -2919,6 +3029,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         if practitioner:
             if latest_reservation and merged.get("parse_confidence") == "high":
                 try:
+                    await _assert_bookable_duration(
+                        db, menu.id if menu else None, start_dt, end_dt
+                    )
                     reservation = await create_reservation(
                         db,
                         ReservationCreate(

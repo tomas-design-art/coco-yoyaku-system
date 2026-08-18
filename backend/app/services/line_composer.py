@@ -38,6 +38,7 @@ SITUATION_GUIDES = {
     "answer_question": "確定事実にあるシステムの値だけを根拠に質問へ答える。事実に無いことは答えず、推測もしない。",
     "price_to_staff": "料金は金額を一切述べず、スタッフから案内すると伝える。",
     "no_candidates": "ご希望の条件では空きがなかったことを伝え、別の日や時間帯を提案して次の選択肢を示す。黙って終わらせない。",
+    "closed_day": "希望された日が休診日であることを正しく伝える。『予約がいっぱい』『満席』とは絶対に言い換えない。診療している直近の日を示して希望を尋ねる。",
     "small_talk": "予約以外の短いやりとりに自然に応じる。用事があれば承る姿勢を一言添える。予約の話を無理に持ち出さない。",
     "waiting_ack": "待たせている催促へ素直に応じる。原因や障害を推測せず、確定事実にある現状だけを伝える。",
 }
@@ -115,6 +116,14 @@ def _fallback(situation: str, context: dict) -> str:
         return "いつもの内容で承りました。ご希望日時を教えてください。"
     if situation == "no_candidates":
         return "ご希望の条件では空きがございませんでした。別の日や時間帯を教えていただければ、あらためてお探しします。"
+    if situation == "closed_day":
+        next_days = context.get("next_open_dates") or []
+        guide = f"\n直近の診療日は {' / '.join(str(day) for day in next_days)} です。" if next_days else ""
+        return (
+            f"申し訳ございません。{context.get('date', 'ご希望の日')}は"
+            f"{context.get('reason') or '休診日'}のため、ご予約を承れません。{guide}\n"
+            "ご都合のよい日を教えていただけますか。"
+        )
     if situation == "price_to_staff":
         return "料金についてはスタッフからあらためてご案内いたします。"
     if situation == "small_talk":
@@ -195,10 +204,60 @@ _SYMPTOM_CONTEXT_WORDS = (
 )
 
 
+# 院の仕組みを勝手に説明する文（「マッスルセラピーは1枠10分で組んでおります」等）の検出。
+# 実際に10分枠の予約を確定させたうえで、それらしい理由を作文した事故があったため。
+_SPEC_CLAIM_PATTERNS = (
+    re.compile(r"(?:1|一)\s*枠"),
+    re.compile(r"枠(?:は|を|で)?\s*\d{1,3}\s*分"),
+    # 「10分単位で区切ってお取りしています」のような院の仕組みの説明のみを拾う。
+    # 「60分で承りました」のような通常の受け答えは弾かない。
+    re.compile(r"\d{1,3}\s*分(?:単位|刻み|区切り|ずつ)\s*で\s*(?:組|区切|設定|お取り|運用)"),
+    re.compile(r"\d{1,3}\s*分\s*で\s*(?:組んで|区切って|設定して)"),
+    re.compile(r"(?:仕組み|システム上|規定|ルール|方針)(?:上|で|では)"),
+)
+
+_MENU_DURATION_PATTERN = re.compile(r"(\d{1,3})\s*分")
+
+
 _RETRY_NOTES = {
     "contradiction": "\n前回の返信は確定事実と異なる日時を含んでいました。確定事実の日時だけを使って書き直してください。",
     "unsupported_claim": "\n前回の返信は確定事実に無いシステム状態や患者の症状の推測を含んでいました。原因・障害・体調の推測には触れず、確定事実にあることだけで書き直してください。",
+    "spec_claim": "\n前回の返信は院の枠の組み方や施術時間のルールを勝手に説明していました。院の仕組みには触れず、確定情報にある施術時間だけを使って書き直してください。",
 }
+
+
+def _allowed_durations(context: dict) -> set[int]:
+    """返信で言及してよい「◯分」の集合（確定事実＋院の確定情報のメニュー時間）。"""
+    allowed: set[int] = set()
+    for key in ("duration", "duration_minutes", "search_duration_minutes"):
+        value = context.get(key)
+        if isinstance(value, (int, float)):
+            allowed.add(int(value))
+        elif isinstance(value, str) and value.isdigit():
+            allowed.add(int(value))
+
+    clinic = context.get("clinic") or {}
+    for menu in clinic.get("menus") or []:
+        for key in ("min_minutes", "max_minutes"):
+            if isinstance(menu.get(key), int):
+                allowed.add(menu[key])
+    for candidate in context.get("alternatives") or []:
+        if isinstance(candidate, dict) and isinstance(candidate.get("duration_minutes"), int):
+            allowed.add(candidate["duration_minutes"])
+    return allowed
+
+
+def _has_spec_claim(context: dict, reply: str) -> bool:
+    """院の仕組み・枠の組み方を作文していないか。"""
+    if any(pattern.search(reply) for pattern in _SPEC_CLAIM_PATTERNS):
+        return True
+    # 確定事実にない施術時間を語っていないか（10分予約の作り話対策）
+    allowed = _allowed_durations(context)
+    if allowed:
+        mentioned = {int(match.group(1)) for match in _MENU_DURATION_PATTERN.finditer(reply)}
+        if mentioned and not mentioned.issubset(allowed):
+            return True
+    return False
 
 
 def _has_unsupported_claim(context: dict, reply: str) -> bool:
@@ -240,21 +299,37 @@ async def compose_reply(situation: str, context: dict) -> str:
 
         situation_guide = SITUATION_GUIDES.get(situation, "確定事実だけを自然で簡潔な受付文として伝える。")
         recent_history = context.get("recent_history") or []
-        facts = {key: value for key, value in context.items() if key != "recent_history"}
+        # 院の確定情報は別枠で提示する（LLMが休診日や施術時間を推測で語らないための土台）
+        from app.services.clinic_context import format_clinic_context_for_prompt
+
+        clinic_block = format_clinic_context_for_prompt(context.get("clinic") or {})
+        facts = {
+            key: value
+            for key, value in context.items()
+            if key not in {"recent_history", "clinic"}
+        }
         prompt = f"""あなたは接骨院の受付を長年担当しているベテラン事務員です。患者へのLINE返信を、あなた自身の言葉で自然に書いてください。
 
 【あなたの役割】
 患者の言葉をそのまま受け止め、必要なことだけを、感じよく、短く伝える。機械的な定型文は書かない。
 
 【厳守】
-- 下の「確定事実」に無い日時・空き状況・診療内容を新たに作らない（事実の捏造だけが禁止事項）。
-- 確定事実にある日時・担当名・メニュー名に言及するときは、その値を正確に使う（言及しないこと自体は自由）。- システムの状態・障害・エラー・処理状況について、確定事実に無いことを書かない。
+- 下の「院の確定情報」と「確定事実」に無い日時・空き状況・診療内容を新たに作らない（事実の捏造だけが禁止事項）。
+- 確定事実にある日時・担当名・メニュー名に言及するときは、その値を正確に使う（言及しないこと自体は自由）。
+- 休診日に予約は受けられない。休診日を「予約がいっぱい」「満席」と言い換えない。休診であることを正しく伝える。
+- 院の仕組み・枠の組み方・施術時間のルールを勝手に説明しない（「1枠◯分で組んでいます」等）。
+  施術時間について触れるときは、院の確定情報にあるメニューの施術時間だけを使う。
+- システムの状態・障害・エラー・処理状況について、確定事実に無いことを書かない。
 - 患者の症状や体調について、確定事実に無い推測を書かない（症状の話が出ていない場面で「お痛みは大丈夫ですか」などと書かない）。
 - 担当者に代わる理由を創作しない。理由が確定事実に無ければ、理由には一切触れず引き継ぎだけを伝える。
-- 料金・費用・保険適用の可否には答えない。金額を一切書かず、スタッフから案内すると伝える。- 敬語。1〜3文。絵文字は最大1つ。1メッセージ1論点。
+- 料金・費用・保険適用の可否には答えない。金額を一切書かず、スタッフから案内すると伝える。
+- 敬語。1〜3文。絵文字は最大1つ。1メッセージ1論点。
 - 医療的な指示・診断はしない。痛みには一言いたわる程度に留める。
 - 患者の直前メッセージがあれば、まず一言受け止めてから本題に入る。
 - 「はい/いいえ」で答えてほしいときは、そう分かるように書く。
+
+【院の確定情報】
+{clinic_block}
 
 【状況】{situation}: {situation_guide}
 【直近の会話】{json.dumps(recent_history, ensure_ascii=False, default=str)}
@@ -280,6 +355,9 @@ async def compose_reply(situation: str, context: dict) -> str:
                     continue
                 if _has_unsupported_claim(context, text):
                     reason = "unsupported_claim"
+                    continue
+                if _has_spec_claim(context, text):
+                    reason = "spec_claim"
                     continue
                 return text
         logger.error("LINE reply fallback situation=%s reason=%s", situation, reason)

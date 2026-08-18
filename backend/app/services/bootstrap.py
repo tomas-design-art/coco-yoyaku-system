@@ -57,6 +57,10 @@ def _initial_settings() -> list[tuple[str, str]]:
         ("chatbot_disabled_message", "申し訳ございません。現在チャットボット機能は準備中です。お電話にてお問い合わせください。"),
         ("line_reply_reservation", "ご予約のご連絡ありがとうございます。\nご希望の日時を確認し、折り返しご連絡いたします。"),
         ("line_reply_default", "メッセージを受け付けました。内容を確認いたします。"),
+        # autopilot が自動予約してよい最低施術時間（分）。
+        # menus.duration_minutes は可変メニューでは10分刻みの単位であり最低時間ではないため、
+        # ここを下回る施術時間では自動確定させない安全弁。
+        ("autopilot_min_duration_minutes", "30"),
         ("practitioner_roles", "院長,施術者"),
         ("holiday_mode", "closed"),
         ("holiday_start_time", "09:00"),

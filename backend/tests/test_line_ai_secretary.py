@@ -1789,3 +1789,73 @@ async def test_autopilot_business_hours_question_answers_from_database():
     assert facts["close_time"] == "20:00"
     mock_reply.assert_awaited_once()
     assert all(call.args[2] != "manual" for call in mock_mode.await_args_list)
+
+
+# ── 2026-08-18 実機事故の再発防止 ──────────────────────────────
+# ①休診日を「予約がいっぱい」と誤案内 ②最低35分のメニューを10分で予約確定
+# ③「1枠10分で組んでおります」という仕様の作り話
+
+
+def test_clinic_context_menu_minimum_never_falls_to_step_width():
+    """可変メニューの duration_minutes（刻み幅）を最低施術時間として使わない。"""
+    from types import SimpleNamespace
+
+    from app.services.clinic_context import effective_menu_min_duration
+
+    # マッスルセラピー相当: duration_minutes=10 は「10分刻み」の意味で、最低施術時間ではない
+    variable_menu = SimpleNamespace(duration_minutes=10, is_duration_variable=True)
+    assert effective_menu_min_duration(variable_menu, 30) == 30
+
+    # 固定メニューは登録値がそのまま施術時間
+    fixed_menu = SimpleNamespace(duration_minutes=45, is_duration_variable=False)
+    assert effective_menu_min_duration(fixed_menu, 30) == 45
+
+
+@pytest.mark.asyncio
+async def test_autopilot_rejects_booking_shorter_than_menu_minimum():
+    """10分の施術で予約を確定させない（最後の砦）。"""
+    from datetime import datetime as dt
+    from types import SimpleNamespace
+
+    from app.api.line import _assert_bookable_duration
+
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=SimpleNamespace(duration_minutes=10, is_duration_variable=True))
+    from app.utils.datetime_jst import JST
+    start = dt(2026, 8, 19, 10, 45, tzinfo=JST)
+
+    with pytest.raises(ValueError):
+        await _assert_bookable_duration(db, 1, start, start + timedelta(minutes=10))
+
+    # 下限以上なら通る
+    await _assert_bookable_duration(db, 1, start, start + timedelta(minutes=60))
+
+
+def test_composer_rejects_invented_clinic_specification():
+    """「1枠10分で組んでおります」のような院の仕組みの作り話を棄却する。"""
+    from app.services.line_composer import _has_spec_claim
+
+    context = {
+        "menu": "マッスルセラピー",
+        "duration": 60,
+        "clinic": {"menus": [{"name": "マッスルセラピー", "min_minutes": 30, "max_minutes": 120}]},
+    }
+    assert _has_spec_claim(context, "マッスルセラピーは1枠10分で組んでおりますので…") is True
+    assert _has_spec_claim(context, "システム上、10分単位で区切ってお取りしています。") is True
+    # 確定事実にある施術時間の言及は許す
+    assert _has_spec_claim(context, "60分で承りました。ご来院をお待ちしております。") is False
+
+
+def test_closed_day_fallback_never_says_fully_booked():
+    """休診日の案内で『満席』『予約がいっぱい』と言わない。"""
+    from app.services.line_composer import _fallback
+
+    text = _fallback(
+        "closed_day",
+        {"date": "8/18(火)", "reason": "定休日", "next_open_dates": ["8/19(水)", "8/20(木)"]},
+    )
+    assert "8/18(火)" in text
+    assert "定休日" in text
+    assert "満席" not in text
+    assert "いっぱい" not in text
+    assert "8/19(水)" in text

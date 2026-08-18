@@ -69,11 +69,13 @@ def _install_llm_probe(retries: int, backoff: float) -> dict:
     stats = {"llm_ok": 0, "llm_fail": 0}
     original = lp._ai_parse
 
-    async def _wrapped(message, menu_names=None):
+    async def _wrapped(message, menu_names=None, clinic_context=None):
         last_exc: Exception | None = None
         for attempt in range(retries + 1):
             try:
-                result = await original(message, menu_names=menu_names)
+                result = await original(
+                    message, menu_names=menu_names, clinic_context=clinic_context
+                )
                 stats["llm_ok"] += 1
                 return result
             except Exception as exc:  # noqa: BLE001
