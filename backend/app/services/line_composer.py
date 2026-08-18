@@ -260,8 +260,30 @@ def _has_spec_claim(context: dict, reply: str) -> bool:
     return False
 
 
+# 「月曜日のご予約ですね」のように、患者が述べていない曜日を確定として書く事故の検出。
+# _DATE_PATTERN は 8/18 形式しか見ないため、曜日の断言は素通りしていた。
+_WEEKDAY_ASSERTION_PATTERN = re.compile(r"[月火水木金土日]曜")
+_DATE_BEARING_KEYS = ("date", "start", "assumed_date", "next_open_dates", "alternatives")
+
+
+def _asserts_unestablished_weekday(context: dict, reply: str) -> bool:
+    """日付が確定していないのに曜日を決まったこととして書いていないか。"""
+    if not _WEEKDAY_ASSERTION_PATTERN.search(reply):
+        return False
+    # 確定事実に日付系の情報が1つでもあれば、曜日への言及は根拠がある
+    for key in _DATE_BEARING_KEYS:
+        if context.get(key):
+            return False
+    # 休診日の案内は院の確定情報が根拠なので許可する
+    if context.get("closed_days") or (context.get("clinic") or {}).get("closed_days"):
+        return False
+    return True
+
+
 def _has_unsupported_claim(context: dict, reply: str) -> bool:
     """確定事実に無いシステム状態や症状の推測を患者へ送らないための検出。"""
+    if _asserts_unestablished_weekday(context, reply):
+        return True
     if any(word in reply for word in _SYSTEM_STATE_WORDS) and not context.get("system_status"):
         return True
     if any(word in reply for word in _SYMPTOM_REPLY_WORDS):
@@ -317,6 +339,9 @@ async def compose_reply(situation: str, context: dict) -> str:
 - 下の「院の確定情報」と「確定事実」に無い日時・空き状況・診療内容を新たに作らない（事実の捏造だけが禁止事項）。
 - 確定事実にある日時・担当名・メニュー名に言及するときは、その値を正確に使う（言及しないこと自体は自由）。
 - 休診日に予約は受けられない。休診日を「予約がいっぱい」「満席」と言い換えない。休診であることを正しく伝える。
+- 患者が述べていない日付・曜日を、決まったことのように書かない。
+  確定事実に日付が無いのに「◯曜日のご予約ですね」と書くのは禁止。分からなければ日付を尋ねる。
+  assumed_date がある場合は患者が今回述べた日ではないため、断言せず「前回◯◯とのことでしたが、それでよろしいですか」と確認する。
 - 院の仕組み・枠の組み方・施術時間のルールを勝手に説明しない（「1枠◯分で組んでいます」等）。
   施術時間について触れるときは、院の確定情報にあるメニューの施術時間だけを使う。
 - システムの状態・障害・エラー・処理状況について、確定事実に無いことを書かない。

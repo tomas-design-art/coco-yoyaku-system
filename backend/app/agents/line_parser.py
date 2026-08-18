@@ -36,6 +36,9 @@ JSON:"""
 LINE_PARSE_PROMPT = """あなたは接骨院の熟練予約秘書AIです。患者からのLINEメッセージを解析し、必ずJSONのみで返します（説明文禁止）。
 今日は {today}（{weekday}曜日）。メッセージは任意の言語で届きます。言語を問わず意味を取り、日付時刻は必ず正規化してください。
 
+直前までの会話（省略された言葉はここから補う）:
+{history_block}
+
 当院の確定情報（推測せず、必ずここを根拠にする）:
 {clinic_block}
 
@@ -56,11 +59,31 @@ polarity: 「大丈夫じゃない」「難しい」「無理」「やめてお�
 duration_minutes は患者が明示した施術時間だけを入れる。推測で入れない。上記メニューの最低施術時間を下回る値は入れない。
 duration_flexible は患者が「短くてもよい」と明確に述べた場合だけ入れる。単に早い時間を希望しただけでは入れない。
 name は患者の自己申告だけ。クレーム、緊急性の高い痛み、領収書・保険・料金の個別相談は needs_human=true。
+■文脈の引き継ぎ（重要）
+直前の会話で扱っていた話題は、次のメッセージでも続いているとみなす。省略された主語・目的語は直前の話題で補う。
+例: 直前が「8月の休診日は18日と25日です」なら、「9月は？」は9月の休診日を尋ねている（intent=question）。予約希望ではない。
+例: 直前が空き枠の提示なら、「もっと早く」は候補への条件変更であって新規予約ではない。
+ただし日付・時刻は、患者が今回または直前の会話で実際に述べたものだけを入れる。会話に無い日付を補わない。
 
 メッセージ:
 {message}
 
 JSON:"""
+
+
+def _format_history_for_prompt(history: list | None) -> str:
+    """直近の会話をプロンプト用に整形する。省略された質問を解決する材料。"""
+    if not history:
+        return "（履歴なし。これが会話の最初のメッセージ）"
+    lines: list[str] = []
+    for entry in history[-6:]:
+        if not isinstance(entry, dict):
+            continue
+        speaker = "患者" if entry.get("role") == "patient" else "当院"
+        content = " ".join(str(entry.get("content") or "").split())
+        if content:
+            lines.append(f"{speaker}: {content[:120]}")
+    return "\n".join(lines) or "（履歴なし）"
 
 
 def _normalize_name(name: str | None) -> str | None:
@@ -347,6 +370,11 @@ def _normalize_result(parsed: dict, profile_name: str | None, previous: dict | N
     result = dict(parsed)
     result["customer_name"] = _normalize_name(result.get("customer_name") or result.get("name")) or previous.get("customer_name") or _normalize_name(profile_name)
     result["menu_name"] = result.get("menu_name") or result.get("menu_hint") or previous.get("menu_name")
+    # 前の会話から引き継いだ日時は「患者が今回述べた事実」ではない。
+    # これを断言すると「月曜日のご予約ですね」と勝手に決めつける事故になるため、
+    # 引き継いだことを明示して後段で確認扱いにできるようにする。
+    result["date_inherited"] = not result.get("date") and bool(previous.get("date"))
+    result["time_inherited"] = not result.get("time") and bool(previous.get("time"))
     result["date"] = result.get("date") or previous.get("date")
     result["time"] = result.get("time") or previous.get("time")
     result["intent"] = result.get("intent") if result.get("intent") in {"new", "change", "cancel", "question", "other"} else "other"
@@ -366,6 +394,7 @@ async def parse_line_message(
     previous: dict | None = None,
     menu_names: list[str] | None = None,
     clinic_context: dict | None = None,
+    recent_history: list | None = None,
 ) -> dict:
     """LINEメッセージを解析して予約意図を判定
 
@@ -377,7 +406,12 @@ async def parse_line_message(
         return _normalize_result(fallback, profile_name, previous)
     try:
         result = _normalize_result(
-            await _ai_parse(message, menu_names=menu_names, clinic_context=clinic_context),
+            await _ai_parse(
+                message,
+                menu_names=menu_names,
+                clinic_context=clinic_context,
+                recent_history=recent_history,
+            ),
             profile_name,
             previous,
         )
@@ -475,6 +509,7 @@ async def _ai_parse(
     message: str,
     menu_names: list[str] | None = None,
     clinic_context: dict | None = None,
+    recent_history: list | None = None,
 ) -> dict:
     """AI（Gemini）を使ったメッセージ解析"""
     from app.config import settings
@@ -498,6 +533,7 @@ async def _ai_parse(
                                      today=now_jst().date().isoformat(),
                                      weekday=["月", "火", "水", "木", "金", "土", "日"][now_jst().weekday()],
                                      clinic_block=format_clinic_context_for_prompt(clinic_context or {}),
+                                     history_block=_format_history_for_prompt(recent_history),
                                      menu_list="\n".join(f"- {name}" for name in menu_names or []) or "- 未登録",
                                  )}
                     ],

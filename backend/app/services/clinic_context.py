@@ -37,6 +37,46 @@ _WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
 DEFAULT_AUTOPILOT_MIN_DURATION = 30
 AUTOPILOT_MIN_DURATION_SETTING_KEY = "autopilot_min_duration_minutes"
 
+# 料金は LLM に生成させない（誤案内が金銭トラブルに直結するため院長判断）。
+# 「HPの料金ページへ誘導」＋「詳細はスタッフへ」の固定文だけを返す。
+PRICE_PAGE_URL_SETTING_KEY = "clinic_price_page_url"
+PRICE_REPLY_TEMPLATE_SETTING_KEY = "line_reply_price_guidance"
+DEFAULT_PRICE_PAGE_URL = "https://coco-seikotsuin2407.jp/menu"
+DEFAULT_PRICE_REPLY_TEMPLATE = (
+    "料金についてのお問い合わせをいただきありがとうございます。\n"
+    "料金の目安は当院ホームページの「メニュー・料金」ページをご覧ください。\n"
+    "{url}\n"
+    "施術内容やお身体の状態によって変わる場合がございますので、"
+    "詳しくは直接スタッフまでご確認ください。"
+)
+
+
+async def _get_setting_value(db: AsyncSession, key: str) -> str | None:
+    try:
+        row = (
+            await db.execute(select(Setting).where(Setting.key == key))
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        value = str(row.value or "").strip()
+    except Exception:
+        return None
+    return value or None
+
+
+async def build_price_guidance_message(db: AsyncSession) -> str:
+    """料金問い合わせへの固定返信を組み立てる（LLMを一切通さない）。"""
+    url = await _get_setting_value(db, PRICE_PAGE_URL_SETTING_KEY) or DEFAULT_PRICE_PAGE_URL
+    template = (
+        await _get_setting_value(db, PRICE_REPLY_TEMPLATE_SETTING_KEY)
+        or DEFAULT_PRICE_REPLY_TEMPLATE
+    )
+    try:
+        return template.format(url=url)
+    except (KeyError, IndexError):
+        # 管理画面で {url} を消された場合でもURLは必ず添える
+        return f"{template}\n{url}"
+
 
 def format_date_jp(target: date) -> str:
     """8/19(水) 形式。"""

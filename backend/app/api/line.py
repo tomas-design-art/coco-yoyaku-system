@@ -35,6 +35,7 @@ from app.services.line_debounce import clear_debounce, is_duplicate_message, mer
 from app.services.business_hours import get_business_hours_for_date
 from app.services.clinic_context import (
     build_clinic_context,
+    build_price_guidance_message,
     effective_menu_min_duration,
     get_autopilot_min_duration,
 )
@@ -799,6 +800,13 @@ async def _compose_autopilot_reply(
     enriched_context = dict(context)
     # 休診日を「満席」と言い換えたり施術時間を作り話しないよう、院の事実を毎回同梱する
     enriched_context["clinic"] = _AUTOPILOT_CLINIC_CONTEXT.get()
+    # 前の会話から引き継いだ日時は患者が今回述べたものではない。
+    # 断言すると「月曜日のご予約ですね」と決めつける事故になるので、確認扱いに落とす。
+    if parsed and parsed.get("date_inherited") and enriched_context.get("date"):
+        enriched_context["assumed_date"] = enriched_context.pop("date")
+        enriched_context["assumed_note"] = "この日付は患者が今回述べたものではない。断言せず確認すること。"
+    if parsed and parsed.get("time_inherited") and enriched_context.get("time"):
+        enriched_context["assumed_time"] = enriched_context.pop("time")
     if db is not None and user_id:
         patient_message = context.get("patient_message")
         if patient_message:
@@ -1776,11 +1784,15 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             preset=await _get_patient_default_preset(db, line_patient),
         )
         _AUTOPILOT_CLINIC_CONTEXT.set(clinic_facts)
+        # 直前の会話を解析にも渡す。これが無いと「9月は？」のような
+        # 省略された質問を単独文として読み、話題を取り違える。
+        conversation_history = (user_state.get("context_data") or {}).get("conversation_history") or []
         parsed_intent = await parse_line_message(
             text,
             profile_name=display_name,
             previous=prev_draft,
             clinic_context=clinic_facts,
+            recent_history=conversation_history[-6:],
         )
 
         # 候補提示中の番号返信は「明示的な選択」。
@@ -2264,15 +2276,32 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             return
 
     if is_autopilot_patient and (parsed_intent or {}).get("intent") == "question":
-        facts = await collect_question_facts(db, text, parsed_intent)
+        # 直前に答えた話題を覚えておき、「9月は？」のような主題が省略された
+        # 追い質問を同じ話題として解決する（人間の受付なら当然できること）。
+        facts = await collect_question_facts(
+            db,
+            text,
+            parsed_intent,
+            previous_category=prev_draft.get("last_question_category"),
+        )
+        if facts and facts.get("category"):
+            try:
+                await merge_user_draft(
+                    db,
+                    user_id,
+                    {"last_question_category": facts["category"]},
+                    user_state.get("request_id"),
+                )
+            except Exception as error:
+                # 話題の記憶に失敗しても回答自体は返す
+                logger.warning("failed to remember question topic: %s", error)
         if facts and facts.get("category") == PRICE_CATEGORY:
+            # 料金はLLMに一文字も書かせない。誤案内は金銭トラブルに直結するため、
+            # 院長判断で「HPの料金ページへ誘導＋スタッフ確認」の固定文だけを返す。
             await set_user_mode(db, user_id, "manual")
             await create_notification(db, "line_manual_mode", f"LINE料金問い合わせ: {line_patient.id}")
             if reply_token:
-                await reply_to_line(
-                    reply_token,
-                    await _compose_autopilot_reply("price_to_staff", {"patient_message": text}, parsed_intent),
-                )
+                await reply_to_line(reply_token, await build_price_guidance_message(db))
             return
         if facts:
             if reply_token:

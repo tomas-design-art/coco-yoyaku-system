@@ -43,6 +43,83 @@ def classify_question(text: str) -> str | None:
     return None
 
 
+_ASKS_FOR_CLOSED_DAYS = re.compile(r"休診|定休|休み|お休み|閉ま")
+_ASKS_FOR_DAYS_OFF = re.compile(r"休(?:み|日|診)|お休み|不在|いない日")
+_MONTH_PATTERN = re.compile(r"(\d{1,2})\s*月")
+
+
+def _month_in_text(text: str) -> int | None:
+    """「9月」のような月指定を拾う。「9月18日」のような日付指定は対象外。"""
+    if re.search(r"\d{1,2}\s*月\s*\d{1,2}\s*日", text or ""):
+        return None
+    match = _MONTH_PATTERN.search(text or "")
+    if not match:
+        return None
+    month = int(match.group(1))
+    return month if 1 <= month <= 12 else None
+
+
+def _resolve_period(text: str, base_date: date) -> tuple[date, date]:
+    """質問文から対象期間を決める。月指定があればその月、無ければ今日から30日。"""
+    message = text or ""
+    today = now_jst().date()
+
+    month = _month_in_text(message)
+    if "来月" in message:
+        month = (today.month % 12) + 1
+    if "今月" in message:
+        month = today.month
+
+    if month is not None:
+        # 過ぎた月を指していれば翌年として扱う（12月に「1月は？」等）
+        year = today.year + 1 if month < today.month else today.year
+        start = date(year, month, 1)
+        end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+        return max(start, today) if start <= today <= end else start, end
+
+    return today, today + timedelta(days=30)
+
+
+def _format_period_label(start: date, end: date) -> str:
+    if start.month == (end - timedelta(days=1)).month:
+        return f"{start.month}月"
+    return f"{start.isoformat()}〜{(end - timedelta(days=1)).isoformat()}"
+
+
+async def _closed_days_in_period(db: AsyncSession, start: date, end: date) -> list[str]:
+    """期間内の休診日を「8/18(火)」形式で返す。"""
+    from app.services.clinic_context import format_date_jp
+
+    closed: list[str] = []
+    cursor = start
+    while cursor < end:
+        hours = await get_business_hours_for_date(db, cursor)
+        if not hours.is_open:
+            label = format_date_jp(cursor)
+            closed.append(f"{label} {hours.label}" if hours.label else label)
+        cursor += timedelta(days=1)
+    return closed
+
+
+async def _practitioner_off_days(
+    db: AsyncSession, practitioner, start: date, end: date
+) -> list[str]:
+    """期間内で、院は開いているのにその施術者が休みの日を返す。"""
+    from app.services.clinic_context import format_date_jp
+
+    off: list[str] = []
+    cursor = start
+    while cursor < end:
+        hours = await get_business_hours_for_date(db, cursor)
+        if hours.is_open:
+            working, reason, _ = await is_practitioner_working(db, practitioner.id, cursor)
+            if not working:
+                label = format_date_jp(cursor)
+                off.append(f"{label}({reason})" if reason else label)
+        cursor += timedelta(days=1)
+    return off
+
+
 def _resolve_target_date(parsed: dict | None) -> date:
     raw = (parsed or {}).get("date")
     if raw:
@@ -77,13 +154,31 @@ async def _business_hours_facts(db: AsyncSession, target_date: date) -> dict:
     }
 
 
+_FOLLOW_UP_PATTERN = re.compile(r"^\s*(?:.{0,6}(?:月|週|日))?\s*(?:は|も|の方)?\s*[?？]?\s*$")
+
+
+def _is_follow_up_question(text: str) -> bool:
+    """「9月は？」「来月は？」のような、主題が省略された追い質問か。"""
+    message = (text or "").strip()
+    if len(message) > 12:
+        return False
+    return bool(_FOLLOW_UP_PATTERN.match(message) or _month_in_text(message) is not None)
+
+
 async def collect_question_facts(
     db: AsyncSession,
     text: str,
     parsed: dict | None = None,
+    previous_category: str | None = None,
 ) -> dict | None:
-    """質問に対してシステムが根拠を持つ事実を返す。答えられなければ None。"""
+    """質問に対してシステムが根拠を持つ事実を返す。答えられなければ None。
+
+    previous_category を渡すと、「9月は？」のように主題が省略された追い質問を
+    直前の話題（例: 休診日）として解決できる。人間の受付なら当然できること。
+    """
     category = classify_question(text)
+    if category is None and previous_category and _is_follow_up_question(text):
+        category = previous_category
     if category is None:
         return None
     if category == PRICE_CATEGORY:
@@ -92,6 +187,14 @@ async def collect_question_facts(
     target_date = _resolve_target_date(parsed)
 
     if category == "business_hours":
+        # 「8月の休診日は？」「9月は？」のような期間の質問には、その月の休診日一覧で答える。
+        if _ASKS_FOR_CLOSED_DAYS.search(text) or _month_in_text(text) is not None:
+            period_start, period_end = _resolve_period(text, target_date)
+            return {
+                "category": category,
+                "period": _format_period_label(period_start, period_end),
+                "closed_days": await _closed_days_in_period(db, period_start, period_end),
+            }
         facts = await _business_hours_facts(db, target_date)
         return {"category": category, **facts}
 
@@ -99,6 +202,19 @@ async def collect_question_facts(
         practitioner = await _find_mentioned_practitioner(db, text)
         if not practitioner:
             return None
+
+        # 「お休みの日はある？」のような期間の質問には、単一日の出勤可否では答えられない。
+        if _ASKS_FOR_DAYS_OFF.search(text):
+            period_start, period_end = _resolve_period(text, target_date)
+            off_days = await _practitioner_off_days(db, practitioner, period_start, period_end)
+            return {
+                "category": category,
+                "practitioner": practitioner.name,
+                "period": _format_period_label(period_start, period_end),
+                "off_days": off_days,
+                "has_days_off": bool(off_days),
+            }
+
         working, _, _ = await is_practitioner_working(db, practitioner.id, target_date)
         start_time, end_time = (
             await get_practitioner_working_hours(db, practitioner.id, target_date)

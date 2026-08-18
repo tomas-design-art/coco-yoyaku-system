@@ -61,6 +61,16 @@ def _initial_settings() -> list[tuple[str, str]]:
         # menus.duration_minutes は可変メニューでは10分刻みの単位であり最低時間ではないため、
         # ここを下回る施術時間では自動確定させない安全弁。
         ("autopilot_min_duration_minutes", "30"),
+        # 料金はLLMに生成させず、この固定文＋URLだけを返す（誤案内防止・院長判断）
+        ("clinic_price_page_url", "https://coco-seikotsuin2407.jp/menu"),
+        (
+            "line_reply_price_guidance",
+            "料金についてのお問い合わせをいただきありがとうございます。\n"
+            "料金の目安は当院ホームページの「メニュー・料金」ページをご覧ください。\n"
+            "{url}\n"
+            "施術内容やお身体の状態によって変わる場合がございますので、"
+            "詳しくは直接スタッフまでご確認ください。",
+        ),
         ("practitioner_roles", "院長,施術者"),
         ("holiday_mode", "closed"),
         ("holiday_start_time", "09:00"),

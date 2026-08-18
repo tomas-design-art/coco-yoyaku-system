@@ -1741,8 +1741,12 @@ async def test_autopilot_price_question_refuses_amount_and_hands_to_staff():
         mock_reply = stack.enter_context(patch("app.api.line.reply_to_line", new=AsyncMock()))
         await _handle_text_message(event, AsyncMock())
 
-    assert mock_compose.await_args.args[0] == "price_to_staff"
-    assert not re.search(r"\d+\s*円", mock_reply.await_args.args[1])
+    # 料金はLLMを通さず固定文で返す（院長判断: 誤案内が金銭トラブルに直結するため）
+    assert all(call.args[0] != "price_to_staff" for call in mock_compose.await_args_list)
+    sent = mock_reply.await_args.args[1]
+    assert not re.search(r"\d+\s*円", sent)
+    assert "https://" in sent
+    assert "スタッフ" in sent
 
 
 @pytest.mark.asyncio
@@ -1859,3 +1863,156 @@ def test_closed_day_fallback_never_says_fully_booked():
     assert "満席" not in text
     assert "いっぱい" not in text
     assert "8/19(水)" in text
+
+
+@pytest.mark.asyncio
+async def test_price_reply_is_fixed_template_with_hp_link_and_no_amount():
+    """料金はLLMを通さず、HP誘導＋スタッフ確認の固定文だけを返す。"""
+    from app.services.clinic_context import build_price_guidance_message
+
+    db = AsyncMock()  # 設定が引けない状況でも既定文へ落ちること
+    message = await build_price_guidance_message(db)
+
+    assert "https://" in message                      # HPへのリンクが必ず入る
+    assert "ホームページ" in message
+    assert "スタッフ" in message
+    assert "{url}" not in message                     # プレースホルダが露出しない
+    assert not re.search(r"\d{3,5}\s*円", message)    # 金額を一切書かない
+
+
+@pytest.mark.asyncio
+async def test_price_question_never_calls_llm_composer():
+    """料金問い合わせでLLM文面生成が呼ばれないことを固定する。"""
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田 信", line_autopilot_enabled=True)
+    db = AsyncMock()
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-price"},
+        "message": {"type": "text", "text": "マッスルセラピーっていくらですか？"},
+    }
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state",
+        new=AsyncMock(return_value={"mode": "idle", "draft": {}, "request_id": None}),
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="idle")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.create_notification", new=AsyncMock()), patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ), patch(
+        "app.api.line.parse_line_message",
+        new=AsyncMock(
+            return_value={
+                "intent": "question",
+                "has_reservation_intent": False,
+                "needs_human": False,
+                "confidence": "high",
+                "constraints": [],
+                "polarity": "none",
+            }
+        ),
+    ), patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply, patch(
+        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="LLMが書いた文")
+    ) as mock_compose:
+        await _handle_text_message(event, db)
+
+    mock_reply.assert_awaited_once()
+    sent = mock_reply.await_args.args[1]
+    assert "https://" in sent
+    assert "スタッフ" in sent
+    assert not re.search(r"\d{3,5}\s*円", sent)
+    # 料金経路でLLM文面生成を通さない
+    assert all(call.args[0] != "price_to_staff" for call in mock_compose.await_args_list)
+
+
+# ── 2026-08-18 夜の実機事故（会話として成立していない）の再発防止 ──
+
+
+def test_parser_marks_inherited_date_so_it_is_not_asserted():
+    """患者が今回述べていない日付は『引き継ぎ』として印を付ける。"""
+    from app.agents.line_parser import _normalize_result
+
+    result = _normalize_result(
+        {"intent": "new", "has_reservation_intent": True, "date": None},
+        None,
+        {"date": "2026-08-17"},
+    )
+    assert result["date"] == "2026-08-17"
+    assert result["date_inherited"] is True
+
+    # 今回のメッセージで日付を述べていれば引き継ぎではない
+    fresh = _normalize_result(
+        {"intent": "new", "has_reservation_intent": True, "date": "2026-08-20"},
+        None,
+        {"date": "2026-08-17"},
+    )
+    assert fresh["date_inherited"] is False
+
+
+def test_composer_rejects_weekday_asserted_without_any_date_fact():
+    """日付が確定していないのに『月曜日のご予約ですね』と断言させない。"""
+    from app.services.line_composer import _has_unsupported_claim
+
+    context = {"patient_name": "時田 信", "menu": "マッスルセラピー"}
+    assert _has_unsupported_claim(context, "月曜日のご予約ですね。いつものメニューでよろしいですか？") is True
+    # 日付が確定事実にあるなら曜日に触れてよい
+    grounded = {"date": "8/20(木)", "menu": "マッスルセラピー"}
+    assert _has_unsupported_claim(grounded, "8/20(木)でご予約を承ります。") is False
+
+
+def test_follow_up_question_inherits_previous_topic():
+    """「9月は？」を直前の話題（休診日）として解決できる。"""
+    from app.services.line_facts import _is_follow_up_question, classify_question
+
+    # 単独では話題が判定できない
+    assert classify_question("9月は？") is None
+    # 追い質問として認識される
+    assert _is_follow_up_question("9月は？") is True
+    assert _is_follow_up_question("来月は？") is True
+    # 通常の予約文を追い質問と誤認しない
+    assert _is_follow_up_question("明日の10時に予約したいんですけど大丈夫ですか") is False
+
+
+@pytest.mark.asyncio
+async def test_closed_days_answered_for_a_named_month():
+    """「9月の休診日は？」に、その月の休診日一覧で答える。"""
+    from datetime import date as date_cls
+
+    from app.services import line_facts
+
+    async def fake_hours(_db, target):
+        return SimpleNamespace(is_open=target.weekday() != 1, label="定休日", open_time="09:00", close_time="20:00")
+
+    with patch.object(line_facts, "get_business_hours_for_date", new=AsyncMock(side_effect=fake_hours)):
+        closed = await line_facts._closed_days_in_period(
+            AsyncMock(), date_cls(2026, 9, 1), date_cls(2026, 9, 8)
+        )
+
+    # 9/1(火) だけが休診
+    assert closed == ["9/1(火) 定休日"]
+
+
+@pytest.mark.asyncio
+async def test_practitioner_days_off_answered_for_a_period():
+    """「時田先生がお休みの日は？」に期間内の休みで答える。"""
+    from datetime import date as date_cls
+
+    from app.services import line_facts
+
+    async def fake_hours(_db, _target):
+        return SimpleNamespace(is_open=True, label=None, open_time="09:00", close_time="20:00")
+
+    async def fake_working(_db, _pid, target):
+        return (target.day != 3, "研修" if target.day == 3 else None, None)
+
+    with patch.object(line_facts, "get_business_hours_for_date", new=AsyncMock(side_effect=fake_hours)), patch.object(
+        line_facts, "is_practitioner_working", new=AsyncMock(side_effect=fake_working)
+    ):
+        off = await line_facts._practitioner_off_days(
+            AsyncMock(), SimpleNamespace(id=1, name="時田"), date_cls(2026, 9, 1), date_cls(2026, 9, 6)
+        )
+
+    assert off == ["9/3(木)(研修)"]
