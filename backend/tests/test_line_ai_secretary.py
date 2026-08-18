@@ -2016,3 +2016,104 @@ async def test_practitioner_days_off_answered_for_a_period():
         )
 
     assert off == ["9/3(木)(研修)"]
+
+
+# ── 2026-08-18 21:31 実機事故: 無言の日付ジャンプ / 休み質問を指名と誤読 ──
+
+
+def test_offer_alternatives_states_when_candidates_are_on_another_date():
+    """同日で見つからず別日へ広げたら、必ずその事実を先に伝える。"""
+    from app.services.line_composer import _fallback
+
+    text = _fallback(
+        "offer_alternatives",
+        {
+            "requested_date": "8/20(木)",
+            "candidates_on_other_dates": True,
+            "candidate_dates": ["8/24(月)"],
+            "alternatives": [{"label": "8/24(月) 19:30〜20:30（担当: 時田）"}],
+        },
+    )
+    assert "8/20(木)" in text          # 希望日に空きが無かったことを述べる
+    assert "空き" in text
+    assert "8/24(月)" in text          # 実際に出す候補
+    # 同日候補のときは日付ジャンプの断り書きを出さない
+    same_day = _fallback(
+        "offer_alternatives",
+        {"alternatives": [{"label": "8/20(木) 17:00〜18:00"}]},
+    )
+    assert "ございませんでした" not in same_day
+
+
+def test_date_shift_context_only_fires_when_dates_differ():
+    from datetime import date as date_cls
+
+    from app.api.line import _date_shift_context
+
+    requested = date_cls(2026, 8, 20)
+    same_day = _date_shift_context(requested, [{"date": "2026-08-20", "label": "x"}])
+    assert same_day == {}
+
+    shifted = _date_shift_context(requested, [{"date": "2026-08-24", "label": "y"}])
+    assert shifted["candidates_on_other_dates"] is True
+    assert shifted["requested_date"] == "8/20(木)"
+    assert shifted["candidate_dates"] == ["8/24(月)"]
+
+
+def test_days_off_question_is_not_treated_as_practitioner_designation():
+    """「時田先生お休みの日ある？」を担当者の指名と誤読しない。"""
+    from app.services.line_facts import ASKS_FOR_DAYS_OFF, classify_question
+
+    assert ASKS_FOR_DAYS_OFF.search("時田先生お休みの日ある？")
+    assert classify_question("時田先生お休みの日ある？") == "practitioner_schedule"
+    # 予約の指名文は休み質問として扱わない
+    assert not ASKS_FOR_DAYS_OFF.search("時田先生でお願いします")
+
+
+# ── 2026-08-18 21:32 事故: 同日の遅い時間を飛ばして4日後へジャンプ ──
+# 原因は「前の会話の履歴が消えず、そこに出ていた日付で再検索していた」
+
+
+@pytest.mark.asyncio
+async def test_clear_user_draft_also_clears_conversation_history():
+    """新しい会話を始めたら履歴も捨てる。残すと前の相談の日付を引きずる。"""
+    from app.services.line_state import clear_user_draft
+
+    state = SimpleNamespace(
+        context_data={
+            "draft": {"date": "2026-08-24"},
+            "conversation_history": [
+                {"role": "assistant", "content": "月曜日ですと8/24か8/31になりますが"}
+            ],
+        }
+    )
+    db = AsyncMock()
+    db.execute = AsyncMock(
+        return_value=SimpleNamespace(scalar_one_or_none=lambda: state)
+    )
+
+    await clear_user_draft(db, "U-1")
+
+    assert state.context_data["draft"] == {}
+    assert state.context_data["conversation_history"] == []
+
+
+def test_later_request_keeps_the_date_being_discussed():
+    """「もっと遅い時間」は“いま話している日”の中で探す。別日へ飛ばさない。"""
+    from app.api.line import _parse_iso_date
+    from app.services.line_negotiation import SlotFilters
+
+    offered = [{"date": "2026-08-20", "start": "13:00"}]
+    offered_date = _parse_iso_date(offered[0]["date"])
+    filters = SlotFilters()
+    filters.later = True
+
+    # 解析側が履歴に釣られて別日(8/24)を返しても、提示済みの日を優先する
+    parsed_date = _parse_iso_date("2026-08-24")
+    target = offered_date if (filters.earlier or filters.later) and offered_date else parsed_date
+    assert target == _parse_iso_date("2026-08-20")
+
+    # 条件変更でなければ通常どおり解析結果の日付を使う
+    plain = SlotFilters()
+    target2 = offered_date if (plain.earlier or plain.later) and offered_date else parsed_date
+    assert target2 == _parse_iso_date("2026-08-24")

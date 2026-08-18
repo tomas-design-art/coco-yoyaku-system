@@ -44,7 +44,7 @@ def classify_question(text: str) -> str | None:
 
 
 _ASKS_FOR_CLOSED_DAYS = re.compile(r"休診|定休|休み|お休み|閉ま")
-_ASKS_FOR_DAYS_OFF = re.compile(r"休(?:み|日|診)|お休み|不在|いない日")
+ASKS_FOR_DAYS_OFF = re.compile(r"休(?:み|日|診)|お休み|不在|いない日")
 _MONTH_PATTERN = re.compile(r"(\d{1,2})\s*月")
 
 
@@ -204,7 +204,7 @@ async def collect_question_facts(
             return None
 
         # 「お休みの日はある？」のような期間の質問には、単一日の出勤可否では答えられない。
-        if _ASKS_FOR_DAYS_OFF.search(text):
+        if ASKS_FOR_DAYS_OFF.search(text):
             period_start, period_end = _resolve_period(text, target_date)
             off_days = await _practitioner_off_days(db, practitioner, period_start, period_end)
             return {

@@ -248,6 +248,10 @@ async def clear_user_draft(db: AsyncSession, line_user_id: str) -> None:
 
     context = _normalize_context(state.context_data)
     context["draft"] = {}
+    # 会話履歴も一緒に捨てる。draftだけ消して履歴を残すと、
+    # 前の相談で出た日付（例:「月曜日ですと8/24…」）が次の会話の解析へ持ち込まれ、
+    # 患者が一言も言っていない日付で検索してしまう。
+    context["conversation_history"] = []
     state.context_data = context
     await db.flush()
 

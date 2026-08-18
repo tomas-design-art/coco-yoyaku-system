@@ -10,7 +10,12 @@ logger = logging.getLogger(__name__)
 
 SITUATION_GUIDES = {
     "confirm_slot": "提示した日時・担当・メニューを省略せず、この内容で良いか確認する。はい/いいえで答えられると伝える。",
-    "offer_alternatives": "候補を番号付きで見やすく並べ、希望する番号で選べると伝える。候補が空なら別の希望日時を尋ねる。所要時間が通常と異なる場合は、その所要時間を必ず明示する。料金には触れない。",
+    "offer_alternatives": (
+        "候補を番号付きで見やすく並べ、希望する番号で選べると伝える。候補が空なら別の希望日時を尋ねる。"
+        "所要時間が通常と異なる場合は、その所要時間を必ず明示する。料金には触れない。"
+        "candidates_on_other_dates が真の場合は、requested_date に空きが無かったことを先に伝えてから"
+        "別日の候補であると明示する。日付が変わったことを黙って提示しない。"
+    ),
     "usual_confirm": "いつものメニュー・所要時間・担当を提示し、この内容で良いか確認する。",
     "ask_datetime": "症状があれば一言いたわった上で、希望日時を尋ねる。",
     "ask_time_for_date": "受け取った希望日を認識したと示し、その日の空き候補があれば提示して希望時刻を尋ねる。",
@@ -67,7 +72,13 @@ def _fallback(situation: str, context: dict) -> str:
     if situation == "offer_alternatives":
         if not alternatives:
             return "申し訳ありません、ご希望に近い空き枠が見つかりませんでした。別のご希望日時を教えてください。"
-        header = "空いているお時間をご案内します。" if context.get("vague") else "ご希望の時間は満席でしたので、近い空き枠をご案内します。"
+        if context.get("candidates_on_other_dates"):
+            header = (
+                f"{context.get('requested_date', 'ご希望の日')}はご希望に沿う空きがございませんでした。"
+                "別の日でしたら以下がご案内できます。"
+            )
+        else:
+            header = "空いているお時間をご案内します。" if context.get("vague") else "ご希望の時間は満席でしたので、近い空き枠をご案内します。"
         lines = [header, *(f"{index}. {item.get('label', '')}" for index, item in enumerate(alternatives, 1))]
         lines.append("ご希望の番号を返信してください。別の日時でもお探しできます。")
         text = "\n".join(lines)

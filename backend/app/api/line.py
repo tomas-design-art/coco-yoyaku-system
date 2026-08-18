@@ -39,7 +39,12 @@ from app.services.clinic_context import (
     effective_menu_min_duration,
     get_autopilot_min_duration,
 )
-from app.services.line_facts import PRICE_CATEGORY, collect_question_facts, next_open_dates
+from app.services.line_facts import (
+    ASKS_FOR_DAYS_OFF,
+    PRICE_CATEGORY,
+    collect_question_facts,
+    next_open_dates,
+)
 from app.services.line_negotiation import SlotFilters, build_slot_filters
 from app.services.slot_scorer import (
     build_candidates_over_days,
@@ -1306,6 +1311,26 @@ async def _search_negotiated_candidates(
     return []
 
 
+def _date_shift_context(requested_date: date, candidates: list[dict]) -> dict:
+    """提示する候補が希望日と違う日になっていれば、その事実を返信の材料に含める。
+
+    同日で見つからないと探索を7日先まで広げる仕様のため、黙っていると
+    「何も言っていないのに別の日が出てきた」という受け取られ方になる。
+    """
+    candidate_dates = []
+    for candidate in candidates or []:
+        parsed = _parse_iso_date(candidate.get("date"))
+        if parsed and parsed not in candidate_dates:
+            candidate_dates.append(parsed)
+    if not candidate_dates or candidate_dates == [requested_date]:
+        return {}
+    return {
+        "requested_date": _format_date_with_weekday_jp(requested_date),
+        "candidates_on_other_dates": True,
+        "candidate_dates": [_format_date_with_weekday_jp(d) for d in candidate_dates],
+    }
+
+
 async def _handoff_autopilot_to_human(
     db: AsyncSession,
     *,
@@ -1371,12 +1396,19 @@ async def _reoffer_autopilot_candidates(
     )
 
     offered = draft.get("autopilot_offered_slots") or []
-    target_date = (
-        _parse_iso_date((parsed_intent or {}).get("date"))
-        or _parse_iso_date(draft.get("date"))
-        or _parse_iso_date(offered[0].get("date") if offered else None)
-        or now_jst().date()
-    )
+    offered_date = _parse_iso_date(offered[0].get("date") if offered else None)
+    # 「もっと早く/もっと遅く」は“いま話している日”の中での要望。
+    # 患者が別の日を明言していない限り、提示済み候補の日を動かさない。
+    # （ここを解析結果まかせにすると、履歴に残った別の日付へ勝手に飛ぶ）
+    if (merged_filters.earlier or merged_filters.later) and offered_date:
+        target_date = offered_date
+    else:
+        target_date = (
+            _parse_iso_date((parsed_intent or {}).get("date"))
+            or _parse_iso_date(draft.get("date"))
+            or offered_date
+            or now_jst().date()
+        )
     earliest_offered, latest_offered = _offered_slot_bounds(offered, target_date)
     if merged_filters.earlier and earliest_offered is not None:
         merged_filters.narrow_end(earliest_offered + search_duration)
@@ -1500,6 +1532,9 @@ async def _reoffer_autopilot_candidates(
                     "duration_shortened": search_duration < base_duration,
                     "standard_duration_minutes": base_duration,
                     "patient_message": text,
+                    # 同日で見つからず別日へ広げた場合は、それを必ず伝えさせる。
+                    # 黙って別日の候補を出すと「勝手に日付が変わった」と受け取られる。
+                    **_date_shift_context(target_date, candidates),
                 },
                 parsed_intent,
             ),
@@ -2274,6 +2309,12 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     ),
                 )
             return
+
+    # 「時田先生お休みの日ある？」を担当者の指名と誤読して予約フローへ流さない。
+    # 休み・出勤を尋ねているのに日時を述べていなければ、intentの判定に関わらず質問として扱う。
+    asks_schedule = bool(ASKS_FOR_DAYS_OFF.search(text)) and not (parsed_intent or {}).get("time")
+    if is_autopilot_patient and asks_schedule and (parsed_intent or {}).get("intent") != "question":
+        parsed_intent = {**(parsed_intent or {}), "intent": "question"}
 
     if is_autopilot_patient and (parsed_intent or {}).get("intent") == "question":
         # 直前に答えた話題を覚えておき、「9月は？」のような主題が省略された
