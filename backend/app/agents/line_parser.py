@@ -1,5 +1,5 @@
 """LINEメッセージ解析エージェント"""
-from datetime import timedelta
+from datetime import date, timedelta
 import logging
 import json
 import re
@@ -45,7 +45,12 @@ LINE_PARSE_PROMPT = """あなたは接骨院の熟練予約秘書AIです。患�
 intent: new=新規予約/空き確認、change=日時変更、cancel=取消/行けない、question=営業時間・料金・領収書等、other=お礼・雑談・相槌。
 polarity: 「大丈夫じゃない」「難しい」「無理」「やめておく」はnegative。「それで」「おけ」「はい」「お願いします」はaffirmative。
 相対日付は今日基準で未来へ解決。朝=09:00、午前=10:00、昼=12:00、午後イチ/午後=14:00、夕方=17:00、夜=19:00。具体時刻があれば優先する。
-曖昧時間帯は time と constraints の window を併記する。constraints は必ず文字列だけの配列とし、オブジェクトは入れない。文字列は end_by:HH:MM、after:HH:MM、before:HH:MM、window:HH:MM-HH:MM、asap、exclude_weekday:wed、exclude_date:YYYY-MM-DD、symptom:内容、ref_history 等を使う。
+週の定義（月曜始まり）: 「来週◯曜」＝今日を含む週の次の週の◯曜日。「今週◯曜」＝今日を含む週の◯曜日。「次の◯曜」「◯曜」＝直近の未来のその曜日（今日が同じ曜日なら7日後）。
+曖昧時間帯は time と constraints の window を併記する。日本語以外（morning/오전/下午 等）でも時間帯を表す語があれば必ず window を入れる。constraints は必ず文字列だけの配列とし、オブジェクトは入れない。文字列は end_by:HH:MM、after:HH:MM、before:HH:MM、window:HH:MM-HH:MM、asap、exclude_weekday:wed、exclude_date:YYYY-MM-DD、symptom:内容、urgency:high、duration:分、ref_history、ref_practitioner:previous 等を使う。
+直前に案内した候補への条件変更は constraints で表す。より早い時間の希望は earlier、より遅い時間の希望は later、施術時間が短くなってもよいという意思は duration_flexible を入れる。
+施術時間の指定（例: 90分で）は duration_minutes と constraints の duration:90 を併記する。前回と同じ担当の希望は ref_practitioner:previous を入れる。強い痛み・動けない等は urgency:high を入れる。
+変更依頼では、既存予約の日時を current_date / current_time に入れ、新しい希望日時を date / time に入れる。
+直前に案内した候補への条件変更は constraints で表す。より早い時間の希望は earlier、より遅い時間の希望は later、施術時間が短くなってもよいという意思は duration_flexible を入れる。
 name は患者の自己申告だけ。クレーム、緊急性の高い痛み、領収書・保険・料金の個別相談は needs_human=true。
 
 メッセージ:
@@ -136,6 +141,19 @@ def _strip_courtesy_phrases(message: str) -> str:
     return cleaned
 
 
+def resolve_weekday_date(today: date, target_weekday: int, qualifier: str | None) -> date:
+    """「来週/今週/次の◯曜」を月曜始まりの暦週で解決する。"""
+    this_monday = today - timedelta(days=today.weekday())
+    if qualifier == "来週":
+        return this_monday + timedelta(days=7 + target_weekday)
+    if qualifier == "今週":
+        resolved = this_monday + timedelta(days=target_weekday)
+        # 過ぎた曜日を希望日として返さない
+        return resolved if resolved >= today else resolved + timedelta(days=7)
+    days_ahead = (target_weekday - today.weekday()) % 7 or 7
+    return today + timedelta(days=days_ahead)
+
+
 def _extract_date_time(message: str) -> tuple[str | None, str | None]:
     message = _strip_courtesy_phrases(message)
     now = now_jst()
@@ -171,13 +189,7 @@ def _extract_date_time(message: str) -> tuple[str | None, str | None]:
         weekday_match = re.search(r"(?:(来週|次の|今週)\s*)?([月火水木金土日])曜(?:日)?", message)
         if weekday_match:
             qualifier, weekday_char = weekday_match.groups()
-            target_weekday = weekday_map[weekday_char]
-            days_ahead = (target_weekday - now.weekday()) % 7
-            if qualifier == "来週":
-                days_ahead += 7
-            elif qualifier in {"次の", None} and days_ahead == 0:
-                days_ahead = 7
-            date_val = (now.date() + timedelta(days=days_ahead)).isoformat()
+            date_val = resolve_weekday_date(now.date(), weekday_map[weekday_char], qualifier).isoformat()
 
     # 時刻 午後3時, 午後3:30, 10時半
     m2 = re.search(r"(午前|午後)?\s*(\d{1,2})\s*[:：]\s*(\d{1,2})", message)
@@ -247,13 +259,25 @@ def _rule_constraints(message: str) -> list[str]:
         constraints.append(f"end_by:{int(match.group(1)):02d}:00")
     if match := re.search(r"(\d{1,2})時以降", message):
         constraints.append(f"after:{int(match.group(1)):02d}:00")
-    windows = ((r"午前|朝", "00:00-12:00"), (r"昼", "11:00-14:00"), (r"午後", "12:00-24:00"), (r"夕方", "16:00-24:00"), (r"夜|晩", "18:00-24:00"))
+    windows = (
+        (r"午前|朝|morning|오전|上午", "00:00-12:00"),
+        (r"昼|lunch|점심", "11:00-14:00"),
+        (r"午後|afternoon|오후|下午", "12:00-24:00"),
+        (r"夕方|evening|저녁", "16:00-24:00"),
+        (r"夜|晩|night|밤", "18:00-24:00"),
+    )
     for pattern, window in windows:
-        if re.search(pattern, message):
+        if re.search(pattern, message, re.IGNORECASE):
             constraints.append(f"window:{window}")
             break
     if "なるべく早" in message:
         constraints.append("asap")
+    if re.search(r"もっと早|早めの時間|早い時間|もう少し早", message):
+        constraints.append("earlier")
+    if re.search(r"もっと遅|遅めの時間|遅い時間|もう少し遅", message):
+        constraints.append("later")
+    if re.search(r"短くなっても|短くても|短めでも|時間は短く", message):
+        constraints.append("duration_flexible")
     weekday_map = {"月": "mon", "火": "tue", "水": "wed", "木": "thu", "金": "fri", "土": "sat", "日": "sun"}
     if match := re.search(r"([月火水木金土日])曜以外", message):
         constraints.append(f"exclude_weekday:{weekday_map[match.group(1)]}")
@@ -262,6 +286,12 @@ def _rule_constraints(message: str) -> list[str]:
     for symptom in ("肩こり", "寝違え", "ぎっくり腰"):
         if symptom in message:
             constraints.append(f"symptom:{symptom}")
+    if "ぎっくり" in message and "symptom:ぎっくり腰" not in constraints:
+        constraints.append("symptom:ぎっくり腰")
+    if re.search(r"ぎっくり|激痛|動けな|我慢でき|かなり痛|すごく痛", message):
+        constraints.append("urgency:high")
+    if re.search(r"前回と同じ.*(先生|担当)|同じ先生|前回の(先生|担当)|いつもの先生", message):
+        constraints.append("ref_practitioner:previous")
     if re.search(r"いつもの|この前と同じ", message):
         constraints.append("ref_history")
     return constraints
@@ -296,6 +326,18 @@ def _normalize_constraints(value: object) -> list[str]:
     return normalized
 
 
+def _mirror_fields_into_constraints(result: dict) -> list[str]:
+    """候補生成が参照する所要時間・変更元の日時も constraints へ載せる。"""
+    constraints = list(result.get("constraints") or [])
+    duration = result.get("duration_minutes")
+    if isinstance(duration, int) and duration > 0:
+        constraints.append(f"duration:{duration}")
+    for key in ("current_date", "current_time"):
+        if result.get(key):
+            constraints.append(f"{key}:{result[key]}")
+    return list(dict.fromkeys(constraints))
+
+
 def _normalize_result(parsed: dict, profile_name: str | None, previous: dict | None) -> dict:
     previous = previous or {}
     result = dict(parsed)
@@ -309,6 +351,7 @@ def _normalize_result(parsed: dict, profile_name: str | None, previous: dict | N
     result["polarity"] = result.get("polarity") if result.get("polarity") in {"affirmative", "negative", "none"} else "none"
     result["confidence"] = result.get("confidence") if result.get("confidence") in {"high", "medium", "low"} else "medium"
     result["needs_human"] = bool(result.get("needs_human"))
+    result["constraints"] = _mirror_fields_into_constraints(result)
     result["missing_fields"] = _compute_missing_fields(result)
     return result
 

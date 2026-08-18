@@ -501,7 +501,7 @@ async def build_same_day_candidates(
     we = bh_end if window_end_min is None else min(window_end_min, bh_end)
     if ws >= we:
         ws, we = bh_start, bh_end
-    desired_min = max(desired_time.hour * 60 + desired_time.minute, bh_start)
+    desired_min = max(desired_time.hour * 60 + desired_time.minute, ws)
 
     day_infos = await _load_day_infos(db, target_date, practitioners)
     info_by_id = {di.practitioner.id: di for di in day_infos}
@@ -538,7 +538,7 @@ async def build_same_day_candidates(
     if pref_info and pref_info.is_working:
         last_start: int | None = None
         s = desired_min
-        while s + duration_minutes <= bh_end and len(results) < max_results:
+        while s + duration_minutes <= we and len(results) < max_results:
             if _is_slot_available(pref_info, s, s + duration_minutes):
                 if last_start is None or (s - last_start) >= duration_minutes:
                     _add(pref_info, s, duration_minutes)
@@ -569,5 +569,45 @@ async def build_same_day_candidates(
                 s += SLOT_INTERVAL
             if len(results) >= max_results:
                 break
+
+    return results[:max_results]
+
+
+async def build_candidates_over_days(
+    db: AsyncSession,
+    start_date: date,
+    desired_time: time,
+    duration_minutes: int,
+    *,
+    preferred_practitioner_id: int | None = None,
+    window_start_min: int | None = None,
+    window_end_min: int | None = None,
+    exclude_dates: set[str] | None = None,
+    exclude_weekdays: set[int] | None = None,
+    max_results: int = 3,
+    search_days: int = 1,
+) -> list[ScoredSlot]:
+    """希望条件（時間帯・除外日）を守ったまま、当日から順に候補を集める。"""
+    exclude_dates = exclude_dates or set()
+    exclude_weekdays = exclude_weekdays or set()
+    results: list[ScoredSlot] = []
+
+    for offset in range(max(search_days, 1)):
+        target_date = start_date + timedelta(days=offset)
+        if target_date.isoformat() in exclude_dates or target_date.weekday() in exclude_weekdays:
+            continue
+        day_results = await build_same_day_candidates(
+            db,
+            target_date,
+            desired_time,
+            duration_minutes,
+            preferred_practitioner_id=preferred_practitioner_id,
+            window_start_min=window_start_min,
+            window_end_min=window_end_min,
+            max_results=max_results - len(results),
+        )
+        results.extend(day_results)
+        if len(results) >= max_results:
+            break
 
     return results[:max_results]

@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 SITUATION_GUIDES = {
     "confirm_slot": "提示した日時・担当・メニューを省略せず、この内容で良いか確認する。はい/いいえで答えられると伝える。",
-    "offer_alternatives": "候補を番号付きで見やすく並べ、希望する番号で選べると伝える。候補が空なら別の希望日時を尋ねる。",
+    "offer_alternatives": "候補を番号付きで見やすく並べ、希望する番号で選べると伝える。候補が空なら別の希望日時を尋ねる。所要時間が通常と異なる場合は、その所要時間を必ず明示する。料金には触れない。",
     "usual_confirm": "いつものメニュー・所要時間・担当を提示し、この内容で良いか確認する。",
     "ask_datetime": "症状があれば一言いたわった上で、希望日時を尋ねる。",
     "ask_time_for_date": "受け取った希望日を認識したと示し、その日の空き候補があれば提示して希望時刻を尋ねる。",
@@ -22,7 +22,7 @@ SITUATION_GUIDES = {
     "cancel_confirm": "対象予約の日時を示し、本当にキャンセルしてよいか、はい/いいえで確認する。",
     "change_done": "予約変更の完了と、変更後の日時・担当を伝える。",
     "slot_taken": "候補が直前に埋まったことを詫び、別候補または別日時の選択を促す。",
-    "handoff_to_human": "無人では完結できない理由を簡潔に伝え、担当者が対応すると案内する。",
+    "handoff_to_human": "担当者からご連絡することだけを簡潔に伝える。引き継ぐ理由や原因は推測しないし説明もしない。",
     "parse_failed": "聞き取れなかったことを詫び、希望日と時間帯の例を添えて言い直しを促す。",
     "reconfirm_yes_no": "何に対する確認かを明示し、はい/いいえでの返答を促す。",
     "conversation_expired": "一定時間が経過したため前回の未確定内容を破棄したことと、最初から案内することを伝える。",
@@ -35,6 +35,11 @@ SITUATION_GUIDES = {
     "ask_full_name": "本人確認に必要なフルネームだけを丁寧に尋ねる。",
     "identity_retry": "本人確認情報を見つけられなかったため、最初から入力し直せるよう案内する。",
     "usual_accepted": "いつもの内容を受け付けたことを自然に伝え、足りない日時だけを尋ねる。",
+    "answer_question": "確定事実にあるシステムの値だけを根拠に質問へ答える。事実に無いことは答えず、推測もしない。",
+    "price_to_staff": "料金は金額を一切述べず、スタッフから案内すると伝える。",
+    "no_candidates": "ご希望の条件では空きがなかったことを伝え、別の日や時間帯を提案して次の選択肢を示す。黙って終わらせない。",
+    "small_talk": "予約以外の短いやりとりに自然に応じる。用事があれば承る姿勢を一言添える。予約の話を無理に持ち出さない。",
+    "waiting_ack": "待たせている催促へ素直に応じる。原因や障害を推測せず、確定事実にある現状だけを伝える。",
 }
 
 
@@ -108,6 +113,16 @@ def _fallback(situation: str, context: dict) -> str:
         return "確認情報が見つかりませんでした。恐れ入りますが、最初から入力をお願いします。"
     if situation == "usual_accepted":
         return "いつもの内容で承りました。ご希望日時を教えてください。"
+    if situation == "no_candidates":
+        return "ご希望の条件では空きがございませんでした。別の日や時間帯を教えていただければ、あらためてお探しします。"
+    if situation == "price_to_staff":
+        return "料金についてはスタッフからあらためてご案内いたします。"
+    if situation == "small_talk":
+        return "ご連絡ありがとうございます。ご用がありましたら、いつでもお知らせください。"
+    if situation == "waiting_ack":
+        return "お待たせして申し訳ございません。引き続き承っておりますので、ご希望を教えていただけますでしょうか。"
+    if situation == "answer_question":
+        return "ご質問の内容を確認のうえ、担当者からご案内いたします。"
     templates = {
         "ask_datetime": "ご希望の日時を教えてください。\n例: 明日の午後3時",
         "ask_menu": "ご希望のメニューを選んでください。",
@@ -168,6 +183,35 @@ def _has_temporal_contradiction(context: dict, reply: str) -> bool:
     return bool((reply_times and not reply_times.issubset(allowed_times)) or (reply_dates and not reply_dates.issubset(allowed_dates)))
 
 
+_SYSTEM_STATE_WORDS = (
+    "システム", "サーバ", "障害", "エラー", "不具合", "メンテナンス", "故障", "ダウン", "回線",
+)
+_SYMPTOM_REPLY_WORDS = (
+    "痛み", "痛く", "痛い", "症状", "患部", "お加減", "体調", "お大事", "お怪我", "怪我",
+)
+_SYMPTOM_CONTEXT_WORDS = (
+    "痛", "症状", "つら", "辛い", "こり", "肩こり", "しびれ", "ゆが", "ぐっくり", "寝違え",
+    "違和感", "怪我", "ケガ", "挿間板", "のばせ", "リハビ", "治療", "痛みを",
+)
+
+
+_RETRY_NOTES = {
+    "contradiction": "\n前回の返信は確定事実と異なる日時を含んでいました。確定事実の日時だけを使って書き直してください。",
+    "unsupported_claim": "\n前回の返信は確定事実に無いシステム状態や患者の症状の推測を含んでいました。原因・障害・体調の推測には触れず、確定事実にあることだけで書き直してください。",
+}
+
+
+def _has_unsupported_claim(context: dict, reply: str) -> bool:
+    """確定事実に無いシステム状態や症状の推測を患者へ送らないための検出。"""
+    if any(word in reply for word in _SYSTEM_STATE_WORDS) and not context.get("system_status"):
+        return True
+    if any(word in reply for word in _SYMPTOM_REPLY_WORDS):
+        context_text = json.dumps(context, ensure_ascii=False, default=str)
+        if not any(word in context_text for word in _SYMPTOM_CONTEXT_WORDS):
+            return True
+    return False
+
+
 async def _notify_fallback(situation: str, reason: str) -> None:
     try:
         from app.config import settings
@@ -204,8 +248,10 @@ async def compose_reply(situation: str, context: dict) -> str:
 
 【厳守】
 - 下の「確定事実」に無い日時・空き状況・診療内容を新たに作らない（事実の捏造だけが禁止事項）。
-- 確定事実にある日時・担当名・メニュー名に言及するときは、その値を正確に使う（言及しないこと自体は自由）。
-- 敬語。1〜3文。絵文字は最大1つ。1メッセージ1論点。
+- 確定事実にある日時・担当名・メニュー名に言及するときは、その値を正確に使う（言及しないこと自体は自由）。- システムの状態・障害・エラー・処理状況について、確定事実に無いことを書かない。
+- 患者の症状や体調について、確定事実に無い推測を書かない（症状の話が出ていない場面で「お痛みは大丈夫ですか」などと書かない）。
+- 担当者に代わる理由を創作しない。理由が確定事実に無ければ、理由には一切触れず引き継ぎだけを伝える。
+- 料金・費用・保険適用の可否には答えない。金額を一切書かず、スタッフから案内すると伝える。- 敬語。1〜3文。絵文字は最大1つ。1メッセージ1論点。
 - 医療的な指示・診断はしない。痛みには一言いたわる程度に留める。
 - 患者の直前メッセージがあれば、まず一言受け止めてから本題に入る。
 - 「はい/いいえ」で答えてほしいときは、そう分かるように書く。
@@ -216,8 +262,9 @@ async def compose_reply(situation: str, context: dict) -> str:
 
 返信文だけを出力:"""
         async with httpx.AsyncClient() as client:
+            reason = "contradiction"
             for attempt in range(2):
-                retry_note = "" if attempt == 0 else "\n前回の返信は確定事実と異なる日時を含んでいました。確定事実の日時だけを使って書き直してください。"
+                retry_note = "" if attempt == 0 else _RETRY_NOTES[reason]
                 response = await client.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent",
                     headers={"x-goog-api-key": settings.gemini_api_key},
@@ -228,10 +275,15 @@ async def compose_reply(situation: str, context: dict) -> str:
                 text = response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
                 if not text:
                     raise ValueError("Gemini returned an empty reply")
-                if not _has_temporal_contradiction(context, text):
-                    return text
-        logger.error("LINE reply fallback situation=%s reason=contradiction", situation)
-        await _notify_fallback(situation, "contradiction")
+                if _has_temporal_contradiction(context, text):
+                    reason = "contradiction"
+                    continue
+                if _has_unsupported_claim(context, text):
+                    reason = "unsupported_claim"
+                    continue
+                return text
+        logger.error("LINE reply fallback situation=%s reason=%s", situation, reason)
+        await _notify_fallback(situation, reason)
         return fallback
     except Exception as error:
         logger.error("LINE reply fallback situation=%s reason=api_error error=%s", situation, error)

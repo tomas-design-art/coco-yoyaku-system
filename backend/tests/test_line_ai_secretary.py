@@ -4,8 +4,9 @@ from __future__ import annotations
 from contextlib import ExitStack
 from unittest.mock import Mock
 from unittest.mock import AsyncMock, patch
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from types import SimpleNamespace
+import re
 
 import pytest
 
@@ -1548,3 +1549,243 @@ async def test_non_autopilot_waiting_menu_keeps_legacy_fixed_reply():
 
     assert mock_reply.await_args.args[1] == "ご希望メニューを選んでくださいね。"
     mock_compose.assert_not_awaited()
+
+
+def test_build_slot_filters_maps_constraints_to_search_conditions():
+    from app.services.line_negotiation import build_slot_filters
+
+    filters = build_slot_filters(
+        ["window:12:00-18:00", "after:14:00", "end_by:17:00", "exclude_weekday:wed", "exclude_date:2026-08-20", "asap"]
+    )
+
+    assert filters.window_start_min == 14 * 60
+    assert filters.window_end_min == 17 * 60
+    assert filters.exclude_weekdays == {2}
+    assert filters.exclude_dates == {"2026-08-20"}
+    assert filters.asap is True
+    assert filters.allows_date(date(2026, 8, 20)) is False
+    assert filters.allows_date(date(2026, 8, 21)) is True
+    assert build_slot_filters(["symptom:腰", "ref_history"]).has_condition is False
+    assert build_slot_filters(["earlier", "duration_flexible"]).has_condition is True
+
+
+def test_resolve_weekday_date_uses_calendar_weeks():
+    from app.agents.line_parser import resolve_weekday_date
+
+    thursday = date(2026, 8, 13)
+
+    assert resolve_weekday_date(thursday, 1, "来週") == date(2026, 8, 18)
+    assert resolve_weekday_date(thursday, 4, "今週") == date(2026, 8, 14)
+    assert resolve_weekday_date(thursday, 3, "次の") == date(2026, 8, 20)
+    assert resolve_weekday_date(thursday, 0, "今週") == date(2026, 8, 17)
+
+
+def test_rule_parser_resolves_next_week_tuesday_to_calendar_week():
+    from app.agents import line_parser
+
+    with patch.object(line_parser, "now_jst", return_value=datetime(2026, 8, 13, 10, 0)):
+        parsed_date, parsed_time = line_parser._extract_date_time("来週の火曜、夕方以降で")
+
+    assert parsed_date == "2026-08-18"
+    assert parsed_time == "17:00"
+
+
+def test_composer_rejects_invented_system_state_and_symptom_guess():
+    from app.services.line_composer import _has_unsupported_claim
+
+    context = {"patient_message": "落ちた？", "recent_history": [{"role": "patient", "content": "もしもし？"}]}
+
+    assert _has_unsupported_claim(context, "現在システムがうまく動いていないようですので担当に代わります") is True
+    assert _has_unsupported_claim(context, "ご連絡ありがとうございます、お痛みは大丈夫でしょうか。") is True
+    assert _has_unsupported_claim(context, "お待たせして申し訳ありません。担当者からご連絡いたします。") is False
+    assert _has_unsupported_claim({"patient_message": "腰が痛くて"}, "お痛みつらいですね。承ります。") is False
+
+
+@pytest.mark.asyncio
+async def test_composer_falls_back_when_unsupported_claim_repeats():
+    from app.services.line_composer import _fallback, compose_reply
+
+    hallucinated = Mock()
+    hallucinated.raise_for_status.return_value = None
+    hallucinated.json.return_value = {
+        "candidates": [{"content": {"parts": [{"text": "現在システムに障害が出ているようです。"}]}}]
+    }
+    client = AsyncMock()
+    client.post.return_value = hallucinated
+    client_context = AsyncMock()
+    client_context.__aenter__.return_value = client
+
+    context = {"patient_message": "落ちた？"}
+    with patch("app.config.settings.gemini_api_key", "test-key"), patch(
+        "httpx.AsyncClient", return_value=client_context
+    ), patch("app.services.line_composer._notify_fallback", new=AsyncMock()) as mock_notify:
+        actual = await compose_reply("handoff_to_human", context)
+
+    assert actual == _fallback("handoff_to_human", context)
+    assert client.post.await_count == 2
+    mock_notify.assert_awaited_once_with("handoff_to_human", "unsupported_claim")
+
+
+@pytest.mark.asyncio
+async def test_autopilot_negotiation_reoffers_earlier_shorter_slot_without_handoff():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    menu = SimpleNamespace(id=5, name="マッスルセラピー", duration_minutes=35, max_duration_minutes=90, is_duration_variable=True)
+    draft = {
+        "menu_id": 5,
+        "menu_name": menu.name,
+        "duration_minutes": 60,
+        "date": "2026-08-17",
+        "practitioner_id": 3,
+        "autopilot_offered_slots": [
+            {"date": "2026-08-17", "start": "13:00", "end": "14:00", "practitioner_id": 3},
+            {"date": "2026-08-17", "start": "14:15", "end": "15:15", "practitioner_id": 3},
+            {"date": "2026-08-17", "start": "15:15", "end": "16:15", "practitioner_id": 3},
+        ],
+    }
+    earlier_slot = SimpleNamespace(
+        date=date(2026, 8, 17),
+        start_time=time(11, 15),
+        to_dict=lambda: {
+            "date": "2026-08-17",
+            "start": "11:15",
+            "end": "11:50",
+            "practitioner_id": 3,
+            "practitioner_name": "時田",
+            "label": "2026-08-17 11:15〜11:50（35分／担当:時田）",
+        },
+    )
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "良いですね。施術時間短くなっても良いので、もっと早めの時間ありませんか？"},
+    }
+    parsed = {
+        "intent": "question",
+        "has_reservation_intent": False,
+        "date": None,
+        "time": None,
+        "polarity": "affirmative",
+        "confidence": "high",
+        "needs_human": False,
+        "constraints": ["earlier", "duration_flexible"],
+    }
+    with ExitStack() as stack:
+        stack.enter_context(patch("app.api.line.settings.line_autopilot_enabled", True))
+        stack.enter_context(patch("app.api.line.get_user_state", new=AsyncMock(return_value={"mode": "waiting_datetime", "draft": draft, "request_id": None})))
+        stack.enter_context(patch("app.api.line.get_user_mode", new=AsyncMock(return_value="waiting_datetime")))
+        stack.enter_context(patch("app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")))
+        stack.enter_context(patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)))
+        stack.enter_context(patch("app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)))
+        stack.enter_context(patch("app.api.line.classify_conversation_control", new=AsyncMock(return_value={"action": "continue", "confidence": "high"})))
+        stack.enter_context(patch("app.api.line.is_duplicate_message", return_value=False))
+        stack.enter_context(patch("app.api.line.merge_debounced_message", return_value=event["message"]["text"]))
+        stack.enter_context(patch("app.api.line.parse_line_message", new=AsyncMock(return_value=parsed)))
+        stack.enter_context(patch("app.api.line._resolve_menu", new=AsyncMock(return_value=menu)))
+        search = stack.enter_context(patch("app.api.line.build_candidates_over_days", new=AsyncMock(return_value=[earlier_slot])))
+        stack.enter_context(patch("app.api.line.create_pending_request", new=AsyncMock(return_value="rid-negotiation")))
+        stack.enter_context(patch("app.api.line.merge_user_draft", new=AsyncMock(return_value=draft)))
+        mock_mode = stack.enter_context(patch("app.api.line.set_user_mode", new=AsyncMock()))
+        mock_compose = stack.enter_context(patch("app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="35分の枠でしたら11:15からご案内できます。")))
+        mock_reply = stack.enter_context(patch("app.api.line.reply_to_line", new=AsyncMock()))
+        mock_notify = stack.enter_context(patch("app.api.line.create_notification", new=AsyncMock()))
+        await _handle_text_message(event, AsyncMock())
+
+    assert mock_compose.await_args.args[0] == "offer_alternatives"
+    offered_context = mock_compose.await_args.args[1]
+    assert offered_context["duration_minutes"] == 35
+    assert offered_context["duration_shortened"] is True
+    assert offered_context["alternatives"][0]["start"] == "11:15"
+    # 提示済み最早(13:00)より前だけを探す
+    assert search.await_args.kwargs["window_end_min"] == 13 * 60 + 35
+    assert search.await_args.args[3] == 35
+    mock_reply.assert_awaited_once()
+    assert all(call.args[2] != "manual" for call in mock_mode.await_args_list)
+    assert all("手動" not in str(call.args[2]) for call in mock_notify.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_autopilot_price_question_refuses_amount_and_hands_to_staff():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "マッスルセラピーいくらですか？"},
+    }
+    parsed = {
+        "intent": "question",
+        "has_reservation_intent": False,
+        "date": None,
+        "time": None,
+        "polarity": "none",
+        "confidence": "high",
+        "needs_human": False,
+        "constraints": [],
+    }
+    with ExitStack() as stack:
+        stack.enter_context(patch("app.api.line.settings.line_autopilot_enabled", True))
+        stack.enter_context(patch("app.api.line.get_user_state", new=AsyncMock(return_value={"mode": "idle", "draft": {}, "request_id": None})))
+        stack.enter_context(patch("app.api.line.get_user_mode", new=AsyncMock(return_value="idle")))
+        stack.enter_context(patch("app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")))
+        stack.enter_context(patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)))
+        stack.enter_context(patch("app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)))
+        stack.enter_context(patch("app.api.line.is_duplicate_message", return_value=False))
+        stack.enter_context(patch("app.api.line.merge_debounced_message", return_value=event["message"]["text"]))
+        stack.enter_context(patch("app.api.line.parse_line_message", new=AsyncMock(return_value=parsed)))
+        stack.enter_context(patch("app.api.line.set_user_mode", new=AsyncMock()))
+        stack.enter_context(patch("app.api.line.create_notification", new=AsyncMock()))
+        mock_compose = stack.enter_context(patch("app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="料金はスタッフからご案内いたします。")))
+        mock_reply = stack.enter_context(patch("app.api.line.reply_to_line", new=AsyncMock()))
+        await _handle_text_message(event, AsyncMock())
+
+    assert mock_compose.await_args.args[0] == "price_to_staff"
+    assert not re.search(r"\d+\s*円", mock_reply.await_args.args[1])
+
+
+@pytest.mark.asyncio
+async def test_autopilot_business_hours_question_answers_from_database():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "明日は何時からやってますか？"},
+    }
+    parsed = {
+        "intent": "question",
+        "has_reservation_intent": False,
+        "date": "2026-08-19",
+        "time": None,
+        "polarity": "none",
+        "confidence": "high",
+        "needs_human": False,
+        "constraints": [],
+    }
+    hours = SimpleNamespace(is_open=True, open_time="09:00", close_time="20:00", label=None)
+    with ExitStack() as stack:
+        stack.enter_context(patch("app.api.line.settings.line_autopilot_enabled", True))
+        stack.enter_context(patch("app.api.line.get_user_state", new=AsyncMock(return_value={"mode": "idle", "draft": {}, "request_id": None})))
+        stack.enter_context(patch("app.api.line.get_user_mode", new=AsyncMock(return_value="idle")))
+        stack.enter_context(patch("app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")))
+        stack.enter_context(patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)))
+        stack.enter_context(patch("app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)))
+        stack.enter_context(patch("app.api.line.is_duplicate_message", return_value=False))
+        stack.enter_context(patch("app.api.line.merge_debounced_message", return_value=event["message"]["text"]))
+        stack.enter_context(patch("app.api.line.parse_line_message", new=AsyncMock(return_value=parsed)))
+        stack.enter_context(patch("app.services.line_facts.get_business_hours_for_date", new=AsyncMock(return_value=hours)))
+        mock_mode = stack.enter_context(patch("app.api.line.set_user_mode", new=AsyncMock()))
+        mock_compose = stack.enter_context(patch("app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="8/19は9:00から20:00まで受け付けております。")))
+        mock_reply = stack.enter_context(patch("app.api.line.reply_to_line", new=AsyncMock()))
+        await _handle_text_message(event, AsyncMock())
+
+    assert mock_compose.await_args.args[0] == "answer_question"
+    facts = mock_compose.await_args.args[1]
+    assert facts["category"] == "business_hours"
+    assert facts["open_time"] == "09:00"
+    assert facts["close_time"] == "20:00"
+    mock_reply.assert_awaited_once()
+    assert all(call.args[2] != "manual" for call in mock_mode.await_args_list)

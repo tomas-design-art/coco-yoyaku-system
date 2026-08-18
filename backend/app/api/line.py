@@ -32,7 +32,14 @@ from app.services.conflict_detector import check_conflict
 from app.services.line_alerts import build_reservation_review_flex, push_admin_reservation_review
 from app.services.line_composer import compose_reply
 from app.services.line_debounce import clear_debounce, is_duplicate_message, merge_debounced_message
-from app.services.slot_scorer import build_same_day_candidates, find_best_practitioner, score_candidates
+from app.services.line_facts import PRICE_CATEGORY, collect_question_facts, next_open_dates
+from app.services.line_negotiation import SlotFilters, build_slot_filters
+from app.services.slot_scorer import (
+    build_candidates_over_days,
+    build_same_day_candidates,
+    find_best_practitioner,
+    score_candidates,
+)
 from app.services.line_reply import push_message, reply_flex_message, reply_text_with_quick_reply, reply_to_line
 from app.services.line_state import (
     append_conversation_history,
@@ -1177,6 +1184,368 @@ def _format_date_with_weekday_jp(d: date) -> str:
     return f"{d.month}/{d.day}({weekday})"
 
 
+def _slot_start_minutes(slot: dict) -> int | None:
+    try:
+        hour, minute = map(int, str(slot.get("start")).split(":"))
+    except (TypeError, ValueError):
+        return None
+    return hour * 60 + minute
+
+
+def _offered_slot_bounds(offered: list[dict], target_date: date) -> tuple[int | None, int | None]:
+    """提示済み候補のうち、対象日の最早・最遅の開始時刻（分）を返す。"""
+    minutes = [
+        value
+        for slot in offered
+        if slot.get("date") == target_date.isoformat()
+        and (value := _slot_start_minutes(slot)) is not None
+    ]
+    return (min(minutes), max(minutes)) if minutes else (None, None)
+
+
+def _to_offered_slots(candidates: list[dict]) -> list[dict]:
+    return [
+        {
+            "date": candidate.get("date"),
+            "start": candidate.get("start"),
+            "end": candidate.get("end"),
+            "practitioner_id": candidate.get("practitioner_id"),
+        }
+        for candidate in candidates
+    ][:5]
+
+
+def _parse_iso_date(value: object) -> date | None:
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _search_negotiated_candidates(
+    db: AsyncSession,
+    *,
+    target_date: date,
+    filters: SlotFilters,
+    duration_minutes: int,
+    preferred_practitioner_id: int | None,
+    desired_time: time,
+    earliest_offered: int | None,
+    latest_offered: int | None,
+) -> list[dict]:
+    """条件変更を反映した候補を、同日優先・見つからなければ後続日で探す。"""
+
+    def _matches_direction(candidate) -> bool:
+        start_min = candidate.start_time.hour * 60 + candidate.start_time.minute
+        if filters.earlier and earliest_offered is not None:
+            if candidate.date == target_date and start_min >= earliest_offered:
+                return False
+        if filters.later and latest_offered is not None:
+            if candidate.date == target_date and start_min <= latest_offered:
+                return False
+        return True
+
+    for search_days in (1, 7):
+        scored = await build_candidates_over_days(
+            db,
+            target_date,
+            desired_time,
+            duration_minutes,
+            preferred_practitioner_id=preferred_practitioner_id,
+            window_start_min=filters.window_start_min,
+            window_end_min=filters.window_end_min,
+            exclude_dates=filters.exclude_dates,
+            exclude_weekdays=filters.exclude_weekdays,
+            max_results=3,
+            search_days=search_days,
+        )
+        matched = [candidate.to_dict() for candidate in scored if _matches_direction(candidate)]
+        if matched:
+            return matched
+    return []
+
+
+async def _handoff_autopilot_to_human(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    patient: Patient | None,
+    text: str,
+    parsed_intent: dict | None,
+    notification: str,
+) -> None:
+    """手動退避は最後の手段。理由はLLMへ渡さず、引き継ぎだけ伝える。"""
+    await set_user_mode(db, user_id, "manual")
+    await create_notification(db, "line_manual_mode", notification)
+    if reply_token:
+        await reply_to_line(
+            reply_token,
+            await _compose_autopilot_reply(
+                "handoff_to_human",
+                {"patient_message": text},
+                parsed_intent,
+            ),
+        )
+
+
+async def _reoffer_autopilot_candidates(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    patient: Patient,
+    text: str,
+    parsed_intent: dict | None,
+    state: dict,
+    filters: SlotFilters,
+) -> bool:
+    """候補提示後の条件変更を受けて再検索し、必ず1通返す。"""
+    draft = state.get("draft") or {}
+    menu = await _resolve_menu(db, draft.get("menu_name"))
+    if not menu and not draft.get("duration_minutes"):
+        return False
+
+    base_duration = int(draft.get("duration_minutes") or (menu.duration_minutes if menu else 60))
+    min_duration = _menu_duration_bounds(menu)[0] if menu else base_duration
+    merged_filters = SlotFilters.from_dict(draft.get("autopilot_filters")).merge(filters)
+    # 短縮の下限はメニューの最小時間。これより短くしない。
+    search_duration = min(base_duration, min_duration) if merged_filters.duration_flexible else base_duration
+
+    offered = draft.get("autopilot_offered_slots") or []
+    target_date = (
+        _parse_iso_date((parsed_intent or {}).get("date"))
+        or _parse_iso_date(draft.get("date"))
+        or _parse_iso_date(offered[0].get("date") if offered else None)
+        or now_jst().date()
+    )
+    earliest_offered, latest_offered = _offered_slot_bounds(offered, target_date)
+    if merged_filters.earlier and earliest_offered is not None:
+        merged_filters.narrow_end(earliest_offered + search_duration)
+    if merged_filters.later and latest_offered is not None:
+        merged_filters.narrow_start(latest_offered)
+
+    desired_minutes = merged_filters.window_start_min
+    parsed_time = (parsed_intent or {}).get("time")
+    if parsed_time:
+        try:
+            hour, minute = map(int, str(parsed_time).split(":"))
+            desired_minutes = hour * 60 + minute
+        except ValueError:
+            pass
+    desired_time = time((desired_minutes or 0) // 60 % 24, (desired_minutes or 0) % 60)
+
+    candidates = await _search_negotiated_candidates(
+        db,
+        target_date=target_date,
+        filters=merged_filters,
+        duration_minutes=search_duration,
+        preferred_practitioner_id=draft.get("practitioner_id"),
+        desired_time=desired_time,
+        earliest_offered=earliest_offered,
+        latest_offered=latest_offered,
+    )
+
+    request_id = state.get("request_id")
+    if not candidates:
+        failures = int(draft.get("autopilot_negotiation_failures") or 0) + 1
+        await merge_user_draft(
+            db,
+            user_id,
+            {
+                "autopilot_filters": merged_filters.to_dict(),
+                "autopilot_negotiation_failures": failures,
+            },
+            request_id,
+        )
+        if failures >= 3:
+            await _handoff_autopilot_to_human(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                patient=patient,
+                text=text,
+                parsed_intent=parsed_intent,
+                notification=f"LINE候補提示が続けて不成立: {patient.id}",
+            )
+            return True
+        if reply_token:
+            await reply_to_line(
+                reply_token,
+                await _compose_autopilot_reply(
+                    "no_candidates",
+                    {
+                        "date": _format_date_with_weekday_jp(target_date),
+                        "menu": draft.get("menu_name"),
+                        "duration_minutes": search_duration,
+                        "next_open_dates": await next_open_dates(db, target_date),
+                        "patient_message": text,
+                    },
+                    parsed_intent,
+                ),
+            )
+        return True
+
+    payload = {
+        "user_id": user_id,
+        "customer_name": patient.name,
+        "date": target_date.isoformat(),
+        "time": desired_time.strftime("%H:%M"),
+        "menu_name": draft.get("menu_name"),
+        "menu_id": draft.get("menu_id") or (menu.id if menu else None),
+        "duration_minutes": search_duration,
+        "available": False,
+        "practitioner_id": None,
+        "alternatives": candidates,
+        "start_time_iso": datetime.combine(target_date, desired_time, tzinfo=JST).isoformat(),
+        "end_time_iso": (
+            datetime.combine(target_date, desired_time, tzinfo=JST) + timedelta(minutes=search_duration)
+        ).isoformat(),
+        "availability_text": "条件変更による再検索",
+    }
+    if request_id:
+        await update_request(
+            db,
+            request_id,
+            line_user_id=user_id,
+            alternatives=candidates,
+            duration_minutes=search_duration,
+            menu_id=payload["menu_id"],
+            menu_name=payload["menu_name"],
+            status="alternatives_sent",
+        )
+    else:
+        request_id = await create_pending_request(db, payload)
+
+    await merge_user_draft(
+        db,
+        user_id,
+        {
+            "autopilot_filters": merged_filters.to_dict(),
+            "autopilot_offered_slots": _to_offered_slots(candidates),
+            "autopilot_offer_duration": search_duration,
+            "autopilot_negotiation_failures": 0,
+        },
+        request_id,
+    )
+    await set_user_mode(db, user_id, "adjusting", request_id)
+    if reply_token:
+        await reply_to_line(
+            reply_token,
+            await _compose_autopilot_reply(
+                "offer_alternatives",
+                {
+                    "alternatives": candidates,
+                    "vague": True,
+                    "menu": draft.get("menu_name"),
+                    "duration_minutes": search_duration,
+                    "duration_shortened": search_duration < base_duration,
+                    "standard_duration_minutes": base_duration,
+                    "patient_message": text,
+                },
+                parsed_intent,
+            ),
+        )
+    return True
+
+
+async def _renegotiate_autopilot_change(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    patient: Patient,
+    text: str,
+    parsed_intent: dict | None,
+    state: dict,
+    filters: SlotFilters,
+) -> bool:
+    """変更候補の確認中に条件が変わったら、変更先を再探索して出し直す。"""
+    draft = state.get("draft") or {}
+    reservation_id = draft.get("autopilot_change_reservation_id")
+    reservation = await db.get(Reservation, int(reservation_id)) if reservation_id else None
+    if not reservation:
+        return False
+
+    duration = int((reservation.end_time - reservation.start_time).total_seconds() // 60)
+    proposed = draft.get("autopilot_change_start_time_iso")
+    target_date = (
+        _parse_iso_date((parsed_intent or {}).get("date"))
+        or (datetime.fromisoformat(proposed).date() if proposed else None)
+        or reservation.start_time.astimezone(JST).date()
+    )
+    offered = (
+        [{"date": target_date.isoformat(), "start": datetime.fromisoformat(proposed).strftime("%H:%M")}]
+        if proposed
+        else []
+    )
+    earliest_offered, latest_offered = _offered_slot_bounds(offered, target_date)
+    if filters.earlier and earliest_offered is not None:
+        filters.narrow_end(earliest_offered + duration)
+    if filters.later and latest_offered is not None:
+        filters.narrow_start(latest_offered)
+
+    desired_minutes = filters.window_start_min or 0
+    candidates = await _search_negotiated_candidates(
+        db,
+        target_date=target_date,
+        filters=filters,
+        duration_minutes=duration,
+        preferred_practitioner_id=reservation.practitioner_id,
+        desired_time=time(desired_minutes // 60 % 24, desired_minutes % 60),
+        earliest_offered=earliest_offered,
+        latest_offered=latest_offered,
+    )
+    if not candidates:
+        await set_user_mode(db, user_id, "autopilot_change_datetime")
+        if reply_token:
+            await reply_to_line(
+                reply_token,
+                await _compose_autopilot_reply(
+                    "no_candidates",
+                    {
+                        "date": _format_date_with_weekday_jp(target_date),
+                        "next_open_dates": await next_open_dates(db, target_date),
+                        "patient_message": text,
+                    },
+                    parsed_intent,
+                ),
+            )
+        return True
+
+    best = candidates[0]
+    start_dt = datetime.combine(date.fromisoformat(best["date"]), time.fromisoformat(best["start"]), tzinfo=JST)
+    end_dt = datetime.combine(date.fromisoformat(best["date"]), time.fromisoformat(best["end"]), tzinfo=JST)
+    await merge_user_draft(
+        db,
+        user_id,
+        {
+            "autopilot_change_start_time_iso": start_dt.isoformat(),
+            "autopilot_change_end_time_iso": end_dt.isoformat(),
+            "autopilot_change_practitioner_id": best["practitioner_id"],
+            "autopilot_change_practitioner_name": best["practitioner_name"],
+        },
+    )
+    await set_user_mode(db, user_id, "autopilot_change_confirm")
+    if reply_token:
+        await reply_to_line(
+            reply_token,
+            await _compose_autopilot_reply(
+                "confirm_slot",
+                {
+                    "date": _format_date_with_weekday_jp(start_dt.date()),
+                    "start": start_dt.strftime("%H:%M"),
+                    "end": end_dt.strftime("%H:%M"),
+                    "practitioner": best["practitioner_name"],
+                    "purpose": "予約変更後の候補確認",
+                    "patient_message": text,
+                },
+                parsed_intent,
+            ),
+        )
+    return True
+
+
 async def _handle_text_message(event: dict, db: AsyncSession):
     text = event.get("message", {}).get("text", "")
     source = event.get("source", {})
@@ -1391,6 +1760,38 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 parsed=parsed_intent,
             )
 
+        # 提示済み候補への条件変更（もっと早く/短くてもいい/別の日 等）は手動退避せず再検索する。
+        negotiation_filters = build_slot_filters(parsed_intent.get("constraints"))
+        if negotiation_filters.has_condition:
+            negotiation_state = {
+                "draft": merged or prev_draft,
+                "request_id": user_state.get("request_id"),
+            }
+            if current_mode == "autopilot_change_confirm":
+                if await _renegotiate_autopilot_change(
+                    db,
+                    user_id=user_id,
+                    reply_token=reply_token,
+                    patient=line_patient,
+                    text=text,
+                    parsed_intent=parsed_intent,
+                    state=negotiation_state,
+                    filters=negotiation_filters,
+                ):
+                    return
+            elif prev_draft.get("autopilot_offered_slots") or current_mode in {"adjusting", "autopilot_booking_confirm"}:
+                if await _reoffer_autopilot_candidates(
+                    db,
+                    user_id=user_id,
+                    reply_token=reply_token,
+                    patient=line_patient,
+                    text=text,
+                    parsed_intent=parsed_intent,
+                    state=negotiation_state,
+                    filters=negotiation_filters,
+                ):
+                    return
+
     if is_autopilot_patient and current_mode == "autopilot_booking_confirm":
         request_id = user_state.get("request_id")
         request_data = await get_request(db, request_id, line_user_id=user_id) if request_id else None
@@ -1548,6 +1949,27 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         parsed_intent,
                     ),
                 )
+            return
+
+        # 番号でも条件変更でもない返答。黙って落とさず、候補を示し直す。
+        if (
+            (parsed_intent or {}).get("intent") not in {"cancel", "change", "question"}
+            and not _has_cancellation_intent(text)
+            and not _has_change_intent(text)
+        ):
+            await _reply_with_loop_guard(
+                db,
+                user_id,
+                reply_token,
+                "offer_alternatives",
+                {
+                    "alternatives": alternatives or [],
+                    "vague": True,
+                    "duration_minutes": prev_draft.get("autopilot_offer_duration"),
+                    "patient_message": text,
+                },
+                parsed_intent,
+            )
             return
 
     if is_autopilot_patient and current_mode == "autopilot_cancel_confirm":
@@ -1762,15 +2184,50 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             return
 
     if is_autopilot_patient and (parsed_intent or {}).get("intent") == "question":
-        await set_user_mode(db, user_id, "manual")
-        await create_notification(db, "line_manual_mode", f"LINE手動対応: {line_patient.id}")
+        facts = await collect_question_facts(db, text, parsed_intent)
+        if facts and facts.get("category") == PRICE_CATEGORY:
+            await set_user_mode(db, user_id, "manual")
+            await create_notification(db, "line_manual_mode", f"LINE料金問い合わせ: {line_patient.id}")
+            if reply_token:
+                await reply_to_line(
+                    reply_token,
+                    await _compose_autopilot_reply("price_to_staff", {"patient_message": text}, parsed_intent),
+                )
+            return
+        if facts:
+            if reply_token:
+                await reply_to_line(
+                    reply_token,
+                    await _compose_autopilot_reply(
+                        "answer_question",
+                        {**facts, "patient_message": text},
+                        parsed_intent,
+                    ),
+                )
+            return
+        await _handoff_autopilot_to_human(
+            db,
+            user_id=user_id,
+            reply_token=reply_token,
+            patient=line_patient,
+            text=text,
+            parsed_intent=parsed_intent,
+            notification=f"LINE問い合わせ対応: {line_patient.id}",
+        )
         return
 
     if is_autopilot_patient and ((parsed_intent or {}).get("intent") == "cancel" or _has_cancellation_intent(text)):
         reservation = await _find_single_upcoming_reservation(db, line_patient.id)
         if not reservation:
-            await set_user_mode(db, user_id, "manual")
-            await create_notification(db, "line_manual_mode", f"LINEキャンセル要確認: {line_patient.id}")
+            await _handoff_autopilot_to_human(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                patient=line_patient,
+                text=text,
+                parsed_intent=parsed_intent,
+                notification=f"LINEキャンセル要確認: {line_patient.id}",
+            )
             return
         await merge_user_draft(db, user_id, {"autopilot_cancel_reservation_id": reservation.id})
         await set_user_mode(db, user_id, "autopilot_cancel_confirm")
@@ -1792,8 +2249,15 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     if is_autopilot_patient and ((parsed_intent or {}).get("intent") == "change" or _has_change_intent(text)):
         reservation = await _find_single_upcoming_reservation(db, line_patient.id)
         if not reservation:
-            await set_user_mode(db, user_id, "manual")
-            await create_notification(db, "line_manual_mode", f"LINE変更要確認: {line_patient.id}")
+            await _handoff_autopilot_to_human(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                patient=line_patient,
+                text=text,
+                parsed_intent=parsed_intent,
+                notification=f"LINE変更要確認: {line_patient.id}",
+            )
             return
         parsed_change = await parse_line_message(text, profile_name=display_name, previous=prev_draft)
         desired_date, desired_time = parsed_change.get("date"), parsed_change.get("time")
@@ -2136,8 +2600,16 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         result = await parse_line_message(text, profile_name=display_name, previous=prev_draft)
         if not result or not result.get("has_reservation_intent"):
             if is_autopilot_patient:
-                await set_user_mode(db, user_id, "manual")
-                await create_notification(db, "line_manual_mode", f"LINE意図不明: {line_patient.id}")
+                # 予約以外の一言は手動退避せず、短く応じて会話を継続する。
+                if reply_token:
+                    await reply_to_line(
+                        reply_token,
+                        await _compose_autopilot_reply(
+                            "small_talk",
+                            {"patient_message": text},
+                            result,
+                        ),
+                    )
                 return
             if reply_token:
                 default_msg = await _get_setting(db, "line_reply_default", "メッセージを受け付けました。内容を確認いたします。")
@@ -2246,15 +2718,28 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         target_date = date.fromisoformat(str(merged["date"]))
                         date_label = _format_date_with_weekday_jp(target_date)
                         duration_for_candidates = int(merged.get("duration_minutes") or (menu.duration_minutes if menu else 60))
+                        slot_filters = build_slot_filters(merged.get("constraints"))
                         scored = await build_same_day_candidates(
                             db,
                             target_date,
                             time(9, 0),
                             duration_for_candidates,
                             preferred_practitioner_id=merged.get("practitioner_id"),
+                            window_start_min=slot_filters.window_start_min,
+                            window_end_min=slot_filters.window_end_min,
                             max_results=3,
                         )
                         candidates = [candidate.to_dict() for candidate in scored]
+                        await merge_user_draft(
+                            db,
+                            user_id,
+                            {
+                                "autopilot_offered_slots": _to_offered_slots(candidates),
+                                "autopilot_offer_duration": duration_for_candidates,
+                                "autopilot_filters": slot_filters.to_dict(),
+                            },
+                            user_state.get("request_id"),
+                        )
                     except (TypeError, ValueError):
                         pass
                     context.update(
@@ -2365,13 +2850,22 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     if needs_candidates:
         vague_choice = practitioner is not None  # 空きはあるが曖昧時間帯 → 候補から選ばせる
         if is_autopilot_patient:
+            slot_filters = build_slot_filters(merged.get("constraints"))
             window = _vague_time_window(text)
-            scored = await build_same_day_candidates(
-                db, target_date, target_time, duration,
+            if slot_filters.window_start_min is None and slot_filters.window_end_min is None and window:
+                slot_filters.window_start_min, slot_filters.window_end_min = window
+            scored = await build_candidates_over_days(
+                db,
+                target_date,
+                target_time,
+                duration,
                 preferred_practitioner_id=candidate_practitioner_id,
-                window_start_min=(window[0] if window else None),
-                window_end_min=(window[1] if window else None),
+                window_start_min=slot_filters.window_start_min,
+                window_end_min=slot_filters.window_end_min,
+                exclude_dates=slot_filters.exclude_dates,
+                exclude_weekdays=slot_filters.exclude_weekdays,
                 max_results=3,
+                search_days=1,
             )
         else:
             scored = await score_candidates(
@@ -2491,6 +2985,16 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             return
 
         await update_request(db, request_id, line_user_id=user_id, status="alternatives_sent")
+        await merge_user_draft(
+            db,
+            user_id,
+            {
+                "autopilot_offered_slots": _to_offered_slots(alternatives),
+                "autopilot_offer_duration": duration,
+                "autopilot_negotiation_failures": 0,
+            },
+            request_id,
+        )
         await set_user_mode(db, user_id, "adjusting", request_id)
         if reply_token:
             await reply_to_line(
@@ -2500,6 +3004,8 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     {
                         "alternatives": alternatives,
                         "vague": vague_choice,
+                        "menu": menu.name if menu else menu_name,
+                        "duration_minutes": duration,
                         "first_visit_note": first_visit_note,
                         "patient_message": text,
                     },

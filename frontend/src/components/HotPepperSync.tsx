@@ -5,10 +5,31 @@ import { getReservations } from '../api/client';
 import api from '../api/client';
 import { extractErrorMessage } from '../utils/errorUtils';
 
+// SalonBoardカレンダー上限に合わせる（バックエンド rpa_horizon_days と同値）
+const SYNC_HORIZON_DAYS = 90;
+
+type PastUnsyncedSummary = {
+  cutoff: string;
+  count: number;
+  oldest: string | null;
+  newest: string | null;
+  by_month: { month: string; count: number }[];
+};
+
 export default function HotPepperSync() {
   const [pendingSync, setPendingSync] = useState<Reservation[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [pastSummary, setPastSummary] = useState<PastUnsyncedSummary | null>(null);
+  const [cleanupBusy, setCleanupBusy] = useState(false);
+  const [cleanupMessage, setCleanupMessage] = useState<string | null>(null);
+
+  // 一覧は「今日以降・90日先まで」だけを扱う。過去はここに出さない。
+  const isWithinSyncWindow = (r: Reservation) => {
+    const start = new Date(r.start_time).getTime();
+    const now = Date.now();
+    return start >= now && start <= now + SYNC_HORIZON_DAYS * 24 * 60 * 60 * 1000;
+  };
 
   const fetchData = async () => {
     setLoading(true);
@@ -21,9 +42,11 @@ export default function HotPepperSync() {
         const res = await getReservations({});
         const pending = (res.data ?? []).filter(
           (r) => !r.hotpepper_synced && r.channel !== 'HOTPEPPER' &&
-            !['CANCELLED', 'REJECTED', 'EXPIRED'].includes(r.status)
+            !['CANCELLED', 'REJECTED', 'EXPIRED'].includes(r.status) &&
+            isWithinSyncWindow(r)
         );
         setPendingSync(pending);
+        setError('一覧APIに接続できないため、簡易表示に切り替えています。');
       } catch (err) {
         setPendingSync([]);
         setError(extractErrorMessage(err, 'データの取得に失敗しました'));
@@ -33,7 +56,43 @@ export default function HotPepperSync() {
     }
   };
 
-  useEffect(() => { fetchData(); }, []);
+  const fetchPastSummary = async () => {
+    try {
+      const res = await api.get<PastUnsyncedSummary>('/hotpepper/past-unsynced/preview');
+      setPastSummary(res.data ?? null);
+    } catch {
+      setPastSummary(null);
+    }
+  };
+
+  const cleanupPastUnsynced = async () => {
+    if (!pastSummary || pastSummary.count === 0) return;
+    const months = pastSummary.by_month
+      .map((m) => `${m.month}: ${m.count}件`)
+      .join('\n');
+    const confirmed = window.confirm(
+      `過去の未同期予約 ${pastSummary.count}件を「同期済み」にします。よろしいですか？\n\n` +
+      `対象は ${pastSummary.cutoff.slice(0, 10)} より前の予約のみで、今日以降の予約は変更しません。\n` +
+      `この操作は監査ログに記録されます。\n\n${months}`
+    );
+    if (!confirmed) return;
+    setCleanupBusy(true);
+    setCleanupMessage(null);
+    try {
+      const res = await api.post<{ updated: number }>('/hotpepper/past-unsynced/mark-synced', { confirm: true });
+      setCleanupMessage(`過去分 ${res.data.updated}件を同期済みにしました。`);
+      await Promise.all([fetchData(), fetchPastSummary()]);
+    } catch (err) {
+      setCleanupMessage(extractErrorMessage(err, '過去分の一括処理に失敗しました'));
+    } finally {
+      setCleanupBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchData();
+    fetchPastSummary();
+  }, []);
 
   // 30秒ごとに自動再取得（新しい予約をリアルタイム反映）
   useEffect(() => {
@@ -78,6 +137,25 @@ export default function HotPepperSync() {
       </div>
       {error && (
         <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm flex-shrink-0">{error}</div>
+      )}
+      {pastSummary && pastSummary.count > 0 && (
+        <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded text-sm flex-shrink-0">
+          <p className="text-amber-800">
+            過去の未同期予約が <span className="font-bold">{pastSummary.count}</span> 件残っています
+            （{pastSummary.oldest?.slice(0, 10)} 〜 {pastSummary.newest?.slice(0, 10)}）。
+            転記の必要が無いため、まとめて同期済みにできます。
+          </p>
+          <button
+            onClick={cleanupPastUnsynced}
+            disabled={cleanupBusy}
+            className="mt-2 px-3 py-1.5 bg-amber-600 text-white text-sm rounded hover:bg-amber-700 disabled:bg-gray-400"
+          >
+            {cleanupBusy ? '処理中...' : `過去分 ${pastSummary.count}件を同期済みにする`}
+          </button>
+        </div>
+      )}
+      {cleanupMessage && (
+        <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded text-blue-700 text-sm flex-shrink-0">{cleanupMessage}</div>
       )}
       {loading && pendingSync.length === 0 ? (
         <p className="text-gray-500">読み込み中...</p>

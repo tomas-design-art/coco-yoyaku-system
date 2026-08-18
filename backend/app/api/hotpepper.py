@@ -1,25 +1,71 @@
 """HotPepper関連API"""
 import logging
 import json
+from collections import Counter
 from datetime import datetime, time as dtime, timedelta
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
+from app.api.auth import require_admin
 from app.config import settings as app_settings
 from app.database import get_db
 from app.models.reservation import Reservation
 from app.models.setting import Setting
+from app.services.audit_log_service import log_action
 from app.services.reservation_service import build_reservation_response
 from app.services.hold_expiration import scheduler
-from app.utils.datetime_jst import JST
+from app.utils.datetime_jst import JST, now_jst
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/hotpepper", tags=["hotpepper"])
+
+SYNC_TARGET_STATUSES = ["CONFIRMED", "PENDING", "HOLD"]
+
+
+def _unsynced_base_filters() -> list:
+    return [
+        Reservation.hotpepper_synced == False,
+        Reservation.channel != "HOTPEPPER",
+        Reservation.status.in_(SYNC_TARGET_STATUSES),
+    ]
+
+
+def pending_sync_filters(now: datetime, horizon_days: int) -> list:
+    """HP未押さえ一覧の対象（現在時刻〜horizon）。過去とhorizon超は含めない。"""
+    return [
+        *_unsynced_base_filters(),
+        Reservation.start_time >= now,
+        Reservation.start_time <= now + timedelta(days=horizon_days),
+    ]
+
+
+def past_unsynced_filters(today_start: datetime) -> list:
+    """一括帳消しの対象（過去のみ）。未来は絶対に含めない。"""
+    return [
+        *_unsynced_base_filters(),
+        Reservation.start_time < today_start,
+    ]
+
+
+def _today_start_jst() -> datetime:
+    return datetime.combine(now_jst().date(), dtime.min, tzinfo=JST)
+
+
+def _operator_label(x_operator: Optional[str]) -> str:
+    if not x_operator or not x_operator.strip():
+        return "unknown"
+    from urllib.parse import unquote
+
+    try:
+        return (unquote(x_operator.strip()) or x_operator.strip())[:64]
+    except Exception:  # noqa: BLE001
+        return x_operator.strip()[:64]
 
 
 async def _get_setting(db: AsyncSession, key: str, default: str = "") -> str:
@@ -43,18 +89,10 @@ class ParseEmailResponse(BaseModel):
 @router.get("/pending-sync")
 async def pending_sync(db: AsyncSession = Depends(get_db)):
     """HotPepper側未押さえの予約一覧（現在時刻〜90日先まで／SalonBoardカレンダー上限）"""
-    from app.utils.datetime_jst import now_jst
     now = now_jst()
-    horizon = now + timedelta(days=app_settings.rpa_horizon_days)
     result = await db.execute(
         select(Reservation)
-        .where(
-            Reservation.hotpepper_synced == False,
-            Reservation.channel != "HOTPEPPER",
-            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
-            Reservation.start_time >= now,
-            Reservation.start_time <= horizon,
-        )
+        .where(*pending_sync_filters(now, app_settings.rpa_horizon_days))
         .options(
             selectinload(Reservation.patient),
             selectinload(Reservation.practitioner),
@@ -64,6 +102,92 @@ async def pending_sync(db: AsyncSession = Depends(get_db)):
     )
     reservations = result.scalars().all()
     return [build_reservation_response(r) for r in reservations]
+
+
+class BulkMarkPastSyncedRequest(BaseModel):
+    confirm: bool = False
+
+
+async def _past_unsynced_summary(db: AsyncSession, today_start: datetime) -> dict:
+    rows = (
+        await db.execute(
+            select(Reservation.id, Reservation.start_time)
+            .where(*past_unsynced_filters(today_start))
+            .order_by(Reservation.start_time)
+        )
+    ).all()
+    starts = [row[1] for row in rows]
+    months = Counter(start.strftime("%Y-%m") for start in starts if start)
+    return {
+        "cutoff": today_start.isoformat(),
+        "count": len(rows),
+        "ids": [row[0] for row in rows],
+        "oldest": starts[0].isoformat() if starts else None,
+        "newest": starts[-1].isoformat() if starts else None,
+        "by_month": [{"month": month, "count": count} for month, count in sorted(months.items())],
+    }
+
+
+@router.get("/past-unsynced/preview")
+async def preview_past_unsynced(
+    db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_admin),
+):
+    """ドライラン: 過去の未同期件数と内訳だけを返す（何も変更しない）。"""
+    summary = await _past_unsynced_summary(db, _today_start_jst())
+    summary.pop("ids", None)
+    return summary
+
+
+@router.post("/past-unsynced/mark-synced")
+async def mark_past_unsynced(
+    body: BulkMarkPastSyncedRequest,
+    db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
+    _auth: dict = Depends(require_admin),
+):
+    """過去の未同期予約だけを同期済みにする。未来の予約には一切触れない。"""
+    if not body.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="confirm=true が必要です。先にドライランで件数を確認してください。",
+        )
+
+    today_start = _today_start_jst()
+    summary = await _past_unsynced_summary(db, today_start)
+    target_ids = summary.pop("ids")
+    if not target_ids:
+        return {"updated": 0, **summary}
+
+    await db.execute(
+        update(Reservation)
+        .where(Reservation.id.in_(target_ids), Reservation.start_time < today_start)
+        .values(hotpepper_synced=True, synced_by="human")
+    )
+    await db.commit()
+
+    try:
+        await log_action(
+            db,
+            operator=_operator_label(x_operator),
+            action="HOTPEPPER_BULK_MARK_PAST_SYNCED",
+            detail={
+                "count": len(target_ids),
+                "cutoff": summary["cutoff"],
+                "oldest": summary["oldest"],
+                "newest": summary["newest"],
+            },
+        )
+    except Exception as error:  # noqa: BLE001
+        logger.warning("audit_log_write_failed action=HOTPEPPER_BULK_MARK_PAST_SYNCED err=%s", error)
+
+    logger.info(
+        "HotPepper past unsynced cleanup: operator=%s count=%s cutoff=%s",
+        _operator_label(x_operator),
+        len(target_ids),
+        summary["cutoff"],
+    )
+    return {"updated": len(target_ids), **summary}
 
 
 @router.get("/reservations-by-date")
