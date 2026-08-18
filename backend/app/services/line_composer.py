@@ -42,7 +42,10 @@ SITUATION_GUIDES = {
     "usual_accepted": "いつもの内容を受け付けたことを自然に伝え、足りない日時だけを尋ねる。",
     "answer_question": "確定事実にあるシステムの値だけを根拠に質問へ答える。事実に無いことは答えず、推測もしない。",
     "price_to_staff": "料金は金額を一切述べず、スタッフから案内すると伝える。",
-    "no_candidates": "ご希望の条件では空きがなかったことを伝え、別の日や時間帯を提案して次の選択肢を示す。黙って終わらせない。",
+    "no_candidates": (
+        "ご希望の条件では空きがなかったことを伝え、別の日や時間帯を提案して次の選択肢を示す。黙って終わらせない。"
+        "空きが無いことを『不在』『お休み』と言い換えない（確定事実に休みの記載がある場合のみ休みと述べる）。"
+    ),
     "closed_day": "希望された日が休診日であることを正しく伝える。『予約がいっぱい』『満席』とは絶対に言い換えない。診療している直近の日を示して希望を尋ねる。",
     "small_talk": "予約以外の短いやりとりに自然に応じる。用事があれば承る姿勢を一言添える。予約の話を無理に持ち出さない。",
     "waiting_ack": "待たせている催促へ素直に応じる。原因や障害を推測せず、確定事実にある現状だけを伝える。",
@@ -157,15 +160,32 @@ _TIME_PATTERN = re.compile(r"(?<!\d)([0-2]?\d)[:：]([0-5]\d)|(?<!\d)([0-2]?\d)�
 _DATE_PATTERN = re.compile(r"(?<!\d)(\d{1,2})[月/]\s*(\d{1,2})日?")
 
 
-def _temporal_facts(value: object) -> tuple[set[tuple[int, int]], set[tuple[int, int]]]:
+# 日時の矛盾チェックを厳格にやる状況（誤ると予約日を取り違える＝事故になる場面）。
+# ここ以外は「渡した事実のどこかに出てくる日時なら述べてよい」とする。
+# 以前は date/start/end/time というキー名の値しか根拠として認めておらず、
+# off_days や closed_days に入った日付を述べた正しい回答まで棄却され、
+# 定型文へ落ちていた（同じ質問でも書き方次第で通ったり弾かれたりして支離滅裂に見えた）。
+_STRICT_TEMPORAL_SITUATIONS = {
+    "confirmed",
+    "confirm_slot",
+    "change_done",
+    "cancel_done",
+    "cancel_confirm",
+}
+_STRICT_TEMPORAL_KEYS = {"date", "start", "end", "time", "assumed_date", "assumed_time"}
+
+
+def _temporal_facts(value: object, strict: bool = True) -> tuple[set[tuple[int, int]], set[tuple[int, int]]]:
     times: set[tuple[int, int]] = set()
     dates: set[tuple[int, int]] = set()
 
     def collect(item: object, key: str | None = None) -> None:
         if isinstance(item, dict):
             for child_key, child in item.items():
-                if child_key not in {"patient_message", "recent_history"}:
-                    collect(child, child_key)
+                # 過去の会話は事実ではない（古い日付の持ち込みを防ぐ）
+                if child_key == "recent_history":
+                    continue
+                collect(child, child_key)
             return
         if isinstance(item, list):
             for child in item:
@@ -174,14 +194,12 @@ def _temporal_facts(value: object) -> tuple[set[tuple[int, int]], set[tuple[int,
         if item in (None, ""):
             return
         text = str(item)
-        if key in {"start", "end", "time"}:
+        if not strict or key in _STRICT_TEMPORAL_KEYS:
             for match in _TIME_PATTERN.finditer(text):
                 hour = int(match.group(1) or match.group(3))
                 minute = int(match.group(2) or match.group(4) or 0)
                 times.add((hour, minute))
-        if key == "date":
-            iso_match = re.search(r"\d{4}-(\d{1,2})-(\d{1,2})", text)
-            if iso_match:
+            for iso_match in re.finditer(r"\d{4}-(\d{1,2})-(\d{1,2})", text):
                 dates.add((int(iso_match.group(1)), int(iso_match.group(2))))
             for match in _DATE_PATTERN.finditer(text):
                 dates.add((int(match.group(1)), int(match.group(2))))
@@ -190,8 +208,10 @@ def _temporal_facts(value: object) -> tuple[set[tuple[int, int]], set[tuple[int,
     return times, dates
 
 
-def _has_temporal_contradiction(context: dict, reply: str) -> bool:
-    allowed_times, allowed_dates = _temporal_facts(context)
+def _has_temporal_contradiction(context: dict, reply: str, situation: str = "") -> bool:
+    allowed_times, allowed_dates = _temporal_facts(
+        context, strict=situation in _STRICT_TEMPORAL_SITUATIONS
+    )
     reply_times = {
         (int(match.group(1) or match.group(3)), int(match.group(2) or match.group(4) or 0))
         for match in _TIME_PATTERN.finditer(reply)
@@ -274,26 +294,56 @@ def _has_spec_claim(context: dict, reply: str) -> bool:
 # 「月曜日のご予約ですね」のように、患者が述べていない曜日を確定として書く事故の検出。
 # _DATE_PATTERN は 8/18 形式しか見ないため、曜日の断言は素通りしていた。
 _WEEKDAY_ASSERTION_PATTERN = re.compile(r"[月火水木金土日]曜")
-_DATE_BEARING_KEYS = ("date", "start", "assumed_date", "next_open_dates", "alternatives")
+# 曜日に言及してよい根拠となるキー。日付・候補・休診日・施術者の休みなど、
+# 曜日を含みうる事実はすべて根拠として認める（狭く取ると正しい回答まで棄却される）。
+_DATE_BEARING_KEYS = (
+    "date", "start", "assumed_date", "next_open_dates", "alternatives",
+    "closed_days", "off_days", "available_candidates", "available_times",
+    "period", "candidate_dates", "requested_date", "calendar",
+)
 
 
 def _asserts_unestablished_weekday(context: dict, reply: str) -> bool:
-    """日付が確定していないのに曜日を決まったこととして書いていないか。"""
+    """日付が何も確定していないのに曜日を決まったこととして書いていないか。"""
     if not _WEEKDAY_ASSERTION_PATTERN.search(reply):
         return False
-    # 確定事実に日付系の情報が1つでもあれば、曜日への言及は根拠がある
     for key in _DATE_BEARING_KEYS:
         if context.get(key):
             return False
-    # 休診日の案内は院の確定情報が根拠なので許可する
-    if context.get("closed_days") or (context.get("clinic") or {}).get("closed_days"):
+    # 院の確定情報（営業カレンダー・休診日）が渡っていれば曜日の言及には根拠がある
+    clinic = context.get("clinic") or {}
+    if clinic.get("closed_days") or clinic.get("calendar"):
         return False
+    return True
+
+
+_ABSENCE_WORDS = ("不在", "お休みをいただ", "休みのため", "出勤しており")
+
+
+def _asserts_unsupported_absence(context: dict, reply: str) -> bool:
+    """空きが無いだけなのに『担当者が不在』と言い換えていないか。
+
+    出勤しているのに「不在」と伝えるのは誤案内で、患者は来院可能な日を失う。
+    休みだと述べてよいのは、確定事実に休みの記載がある場合だけ。
+    """
+    if not any(word in reply for word in _ABSENCE_WORDS):
+        return False
+    if context.get("off_days") or context.get("has_days_off"):
+        return False
+    if context.get("is_working") is False or context.get("practitioner_off") is True:
+        return False
+    clinic = context.get("clinic") or {}
+    for practitioner in clinic.get("practitioners") or []:
+        if practitioner.get("off_days") or practitioner.get("unavailable_times"):
+            return False
     return True
 
 
 def _has_unsupported_claim(context: dict, reply: str) -> bool:
     """確定事実に無いシステム状態や症状の推測を患者へ送らないための検出。"""
     if _asserts_unestablished_weekday(context, reply):
+        return True
+    if _asserts_unsupported_absence(context, reply):
         return True
     if any(word in reply for word in _SYSTEM_STATE_WORDS) and not context.get("system_status"):
         return True
@@ -350,6 +400,10 @@ async def compose_reply(situation: str, context: dict) -> str:
 - 下の「院の確定情報」と「確定事実」に無い日時・空き状況・診療内容を新たに作らない（事実の捏造だけが禁止事項）。
 - 確定事実にある日時・担当名・メニュー名に言及するときは、その値を正確に使う（言及しないこと自体は自由）。
 - 休診日に予約は受けられない。休診日を「予約がいっぱい」「満席」と言い換えない。休診であることを正しく伝える。
+- 空きが無いことを「担当者が不在」「お休み」と言い換えない。
+  出勤していて予約が埋まっているだけの場合に「不在」と書くのは誤案内。
+  確定事実に施術者の休みが明示されていない限り、空き状況の話に留める。
+- 提示する候補と同じ日を「別の日程」と書かない。日付は確定事実のとおりに述べる。
 - 患者が述べていない日付・曜日を、決まったことのように書かない。
   確定事実に日付が無いのに「◯曜日のご予約ですね」と書くのは禁止。分からなければ日付を尋ねる。
   assumed_date がある場合は患者が今回述べた日ではないため、断言せず「前回◯◯とのことでしたが、それでよろしいですか」と確認する。
@@ -386,7 +440,7 @@ async def compose_reply(situation: str, context: dict) -> str:
                 text = response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
                 if not text:
                     raise ValueError("Gemini returned an empty reply")
-                if _has_temporal_contradiction(context, text):
+                if _has_temporal_contradiction(context, text, situation):
                     reason = "contradiction"
                     continue
                 if _has_unsupported_claim(context, text):

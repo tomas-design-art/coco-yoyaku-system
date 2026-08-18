@@ -2117,3 +2117,50 @@ def test_later_request_keeps_the_date_being_discussed():
     plain = SlotFilters()
     target2 = offered_date if (plain.earlier or plain.later) and offered_date else parsed_date
     assert target2 == _parse_iso_date("2026-08-24")
+
+
+# ── 2026-08-18 23:05 事故: 正しい回答がガードに棄却され定型文へ落ちていた ──
+# 症状は「同じ質問でも答えたり答えなかったり」＝支離滅裂に見える
+
+
+def test_informational_answers_are_not_rejected_for_dates_outside_date_key():
+    """off_days / closed_days に入った日付を述べた回答を棄却しない。"""
+    from app.services.line_composer import _has_temporal_contradiction, _has_unsupported_claim
+
+    off = {
+        "category": "practitioner_schedule",
+        "practitioner": "時田",
+        "period": "8月",
+        "off_days": ["8/20(木)", "8/27(木)"],
+        "has_days_off": True,
+    }
+    reply = "時田は8/20(木)と8/27(木)がお休みをいただいております。"
+    assert _has_temporal_contradiction(off, reply, "answer_question") is False
+    assert _has_unsupported_claim(off, reply) is False
+
+    closed = {"category": "business_hours", "period": "9月", "closed_days": ["9/1(火)", "9/8(火)"]}
+    closed_reply = "9月は9/1(火)と9/8(火)が休診です。"
+    assert _has_temporal_contradiction(closed, closed_reply, "answer_question") is False
+    assert _has_unsupported_claim(closed, closed_reply) is False
+
+
+def test_confirmation_still_rejects_fabricated_datetime():
+    """予約確定だけは従来どおり厳格に日時を検算する。"""
+    from app.services.line_composer import _has_temporal_contradiction
+
+    context = {"date": "8/19(水)", "start": "10:45", "end": "11:45", "practitioner": "時田"}
+    assert _has_temporal_contradiction(context, "8/19(水) 10:45〜11:45で承りました。", "confirmed") is False
+    assert _has_temporal_contradiction(context, "8/24(月) 19:30で承りました。", "confirmed") is True
+
+
+def test_no_slots_must_not_be_reported_as_practitioner_absence():
+    """空きが無いだけなのに『不在』と言い換えない。"""
+    from app.services.line_composer import _has_unsupported_claim
+
+    no_slots = {"date": "8/19(水)", "menu": "マッスルセラピー", "next_open_dates": ["8/20(木)"]}
+    assert _has_unsupported_claim(no_slots, "明日は担当の時田が不在のためご予約をお取りできません。") is True
+    assert _has_unsupported_claim(no_slots, "8/19(水)はご希望に沿う空きがございませんでした。") is False
+
+    # 実際に休みの事実があるときは「お休み」と伝えてよい
+    real_off = {"practitioner": "時田", "off_days": ["8/20(木)"], "has_days_off": True}
+    assert _has_unsupported_claim(real_off, "時田は8/20(木)にお休みをいただいております。") is False
