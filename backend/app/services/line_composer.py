@@ -278,6 +278,7 @@ _RETRY_NOTES = {
     "unsupported_claim": "\n前回の返信は確定事実に無いシステム状態や患者の症状の推測を含んでいました。原因・障害・体調の推測には触れず、確定事実にあることだけで書き直してください。",
     "spec_claim": "\n前回の返信は院の枠の組み方や施術時間のルールを勝手に説明していました。院の仕組みには触れず、確定情報にある施術時間だけを使って書き直してください。",
     "alternative_context": "\n前回の返信は候補の日付や患者が指定した条件と矛盾していました。同日の候補を別日と呼ばず、時刻未指定なら希望時間帯が満席とは書かず、料金にも触れずに書き直してください。",
+    "repeated_reply": "\n前回の返信は直近のあなた自身の返答と同じ定型的な冒頭を繰り返していました。患者の最新発言と確定事実にだけ応じ、同じ挨拶や体調への問いかけを繰り返さずに書き直してください。",
 }
 
 
@@ -406,6 +407,21 @@ def _has_unprompted_price_reference(context: dict, reply: str) -> bool:
     return not any(word in patient_message for word in _PRICE_REFERENCE_WORDS)
 
 
+def _has_repeated_reply_opening(context: dict, reply: str) -> bool:
+    """直近のAI返信をそのまま繰り返す定型調を送信前に止める。"""
+    normalized_reply = re.sub(r"[\s、。！？!?]+", "", reply)
+    if len(normalized_reply) < 16:
+        return False
+    for item in reversed(context.get("recent_history") or []):
+        if not isinstance(item, dict) or item.get("role") != "assistant":
+            continue
+        previous = re.sub(r"[\s、。！？!?]+", "", str(item.get("content") or ""))
+        if len(previous) >= 16 and normalized_reply[:24] == previous[:24]:
+            return True
+        return False
+    return False
+
+
 async def _notify_fallback(situation: str, reason: str) -> None:
     try:
         from app.config import settings
@@ -506,6 +522,9 @@ async def compose_reply(situation: str, context: dict) -> str:
                     continue
                 if _has_unprompted_price_reference(context, text):
                     reason = "alternative_context"
+                    continue
+                if _has_repeated_reply_opening(context, text):
+                    reason = "repeated_reply"
                     continue
                 if _has_spec_claim(context, text):
                     reason = "spec_claim"

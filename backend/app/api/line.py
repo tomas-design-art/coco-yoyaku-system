@@ -797,6 +797,17 @@ def _select_offered_alternative(text: str, alternatives: list[dict]) -> int | No
     return 1 if len(alternatives) == 1 and _is_affirmative(text) else None
 
 
+def _select_change_alternative(text: str, alternatives: list[dict]) -> int | None:
+    """変更候補への選択を解決する。相対表現は候補が複数でも最も早い枠だけに結び付ける。"""
+    choice = _select_offered_alternative(text, alternatives)
+    if choice is not None:
+        return choice
+    normalized = _normalize_confirmation_text(text)
+    if alternatives and any(phrase in normalized for phrase in ("近い方", "早い方", "先の方")):
+        return 1
+    return None
+
+
 def _has_cancellation_intent(text: str) -> bool:
     return bool(re.search(r"キャンセル|取り消|取消|やめたい|cancel|annul|cancelar|취소", text or "", re.IGNORECASE))
 
@@ -2214,6 +2225,55 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     await _compose_autopilot_reply("change_target_missing", {"patient_message": text}, parsed),
                 )
             return
+        offered_slots = prev_draft.get("autopilot_change_offered_slots") or []
+        selected_choice = _select_change_alternative(text, offered_slots)
+        if selected_choice is not None:
+            selected = offered_slots[selected_choice - 1]
+            await _complete_autopilot_reschedule(
+                db,
+                reservation=reservation,
+                desired_date=str(selected["date"]),
+                desired_time=str(selected["start"]),
+                user_id=user_id,
+                reply_token=reply_token,
+                patient_message=text,
+            )
+            return
+        if parsed.get("date") and not parsed.get("time"):
+            target_date = _parse_iso_date(parsed["date"])
+            duration = int((reservation.end_time - reservation.start_time).total_seconds() // 60)
+            candidates = await build_same_day_candidates(
+                db,
+                target_date,
+                time(9, 0),
+                duration,
+                preferred_practitioner_id=reservation.practitioner_id,
+                max_results=3,
+            )
+            alternatives = [candidate.to_dict() for candidate in candidates]
+            if alternatives:
+                await merge_user_draft(
+                    db,
+                    user_id,
+                    {"autopilot_change_offered_slots": _to_offered_slots(alternatives)},
+                )
+                if reply_token:
+                    await reply_to_line(
+                        reply_token,
+                        await _compose_autopilot_reply(
+                            "offer_alternatives",
+                            {
+                                "alternatives": alternatives,
+                                "vague": True,
+                                "date_only": True,
+                                "requested_date": _format_date_with_weekday_jp(target_date),
+                                "patient_message": text,
+                                "purpose": "予約変更",
+                            },
+                            parsed,
+                        ),
+                    )
+                return
         if not parsed.get("date") or not parsed.get("time"):
             if reply_token:
                 await reply_to_line(

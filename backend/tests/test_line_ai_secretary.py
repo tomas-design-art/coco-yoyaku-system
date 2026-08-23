@@ -826,6 +826,84 @@ async def test_autopilot_change_without_datetime_asks_and_keeps_conversation_act
     assert "日時" in mock_reply.await_args.args[1]
 
 
+def test_change_candidate_selection_resolves_nearer_option_to_first_slot():
+    from app.api.line import _select_change_alternative
+
+    alternatives = [
+        {"date": "2026-08-26", "start": "10:00"},
+        {"date": "2026-09-02", "start": "10:00"},
+    ]
+    assert _select_change_alternative("近い方だよ", alternatives) == 1
+    assert _select_change_alternative("2番でお願いします", alternatives) == 2
+
+
+@pytest.mark.asyncio
+async def test_autopilot_change_date_only_offers_and_persists_real_slots():
+    from app.api.line import _handle_text_message
+    from app.utils.datetime_jst import JST
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    reservation = SimpleNamespace(
+        id=91,
+        practitioner_id=3,
+        start_time=datetime(2026, 8, 24, 10, 0, tzinfo=JST),
+        end_time=datetime(2026, 8, 24, 11, 0, tzinfo=JST),
+    )
+    candidate = SimpleNamespace(
+        to_dict=lambda: {
+            "date": "2026-08-26",
+            "start": "10:00",
+            "end": "11:00",
+            "label": "2026-08-26 10:00〜11:00（担当:時田）",
+        }
+    )
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "水曜日空いてますか？"},
+    }
+    parsed = {"intent": "change", "date": "2026-08-26", "time": None, "constraints": []}
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=reservation)
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state",
+        new=AsyncMock(return_value={
+            "mode": "autopilot_change_datetime",
+            "draft": {"autopilot_change_reservation_id": 91},
+            "request_id": None,
+        }),
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="autopilot_change_datetime")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.parse_line_message", new=AsyncMock(return_value=parsed)), patch(
+        "app.api.line.build_same_day_candidates", new=AsyncMock(return_value=[candidate])
+    ) as mock_candidates, patch("app.api.line.merge_user_draft", new=AsyncMock()) as mock_merge, patch(
+        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="空き候補をご案内します。")
+    ) as mock_compose, patch("app.api.line.reply_to_line", new=AsyncMock()):
+        await _handle_text_message(event, db)
+
+    mock_candidates.assert_awaited_once()
+    assert mock_merge.await_args.args[2]["autopilot_change_offered_slots"][0]["start"] == "10:00"
+    assert mock_compose.await_args.args[0] == "offer_alternatives"
+
+
+def test_composer_rejects_repeated_assistant_opening():
+    from app.services.line_composer import _has_repeated_reply_opening
+
+    context = {
+        "recent_history": [
+            {"role": "patient", "content": "水曜日空いてますか？"},
+            {"role": "assistant", "content": "時田様、ご連絡ありがとうございます。お体の調子はいかがでしょうか。"},
+        ]
+    }
+    assert _has_repeated_reply_opening(
+        context, "時田様、ご連絡ありがとうございます。お体の調子はいかがでしょうか。8月26日は空いています。"
+    ) is True
+    assert _has_repeated_reply_opening(context, "8月26日の空き時間をご案内します。") is False
+
+
 @pytest.mark.asyncio
 async def test_autopilot_setup_keyword_starts_identity_flow_only():
     from app.api.line import _handle_autopilot_setup_message
