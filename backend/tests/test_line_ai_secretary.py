@@ -762,6 +762,50 @@ async def test_autopilot_change_proposes_slot_before_rescheduling():
 
 
 @pytest.mark.asyncio
+async def test_autopilot_change_selected_candidate_is_not_researched_or_remapped():
+    from app.api.line import _complete_autopilot_reschedule
+    from app.utils.datetime_jst import JST
+
+    reservation = SimpleNamespace(
+        id=91,
+        start_time=datetime(2026, 8, 24, 10, 0, tzinfo=JST),
+        end_time=datetime(2026, 8, 24, 11, 0, tzinfo=JST),
+    )
+    practitioner = SimpleNamespace(id=3, name="時田")
+    selected_candidate = {
+        "date": "2026-08-26",
+        "start": "10:45",
+        "end": "11:45",
+        "practitioner_id": 3,
+    }
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=practitioner)
+
+    with patch("app.api.line.find_best_practitioner", new=AsyncMock()) as mock_find, patch(
+        "app.api.line.merge_user_draft", new=AsyncMock()
+    ) as mock_merge, patch("app.api.line.set_user_mode", new=AsyncMock()), patch(
+        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="確認文")
+    ) as mock_compose, patch("app.api.line.reply_to_line", new=AsyncMock()):
+        proposed = await _complete_autopilot_reschedule(
+            db,
+            reservation=reservation,
+            desired_date="2026-08-26",
+            desired_time="10:45",
+            user_id="U-autopilot",
+            reply_token="reply-token",
+            selected_candidate=selected_candidate,
+        )
+
+    assert proposed is True
+    mock_find.assert_not_awaited()
+    stored = mock_merge.await_args.args[2]
+    assert stored["autopilot_change_start_time_iso"].endswith("10:45:00+09:00")
+    assert stored["autopilot_change_end_time_iso"].endswith("11:45:00+09:00")
+    assert mock_compose.await_args.args[1]["start"] == "10:45"
+    assert mock_compose.await_args.args[1]["end"] == "11:45"
+
+
+@pytest.mark.asyncio
 async def test_autopilot_cancel_failure_replies_and_keeps_confirmation_active():
     from fastapi import HTTPException
     from app.api.line import _handle_text_message

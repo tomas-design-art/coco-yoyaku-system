@@ -937,15 +937,24 @@ async def _complete_autopilot_reschedule(
     user_id: str,
     reply_token: str | None,
     patient_message: str = "",
+    selected_candidate: dict | None = None,
 ) -> bool:
-    """変更候補を提示し、患者の明示確認を待つ。"""
+    """DBで確認した変更候補を提示し、患者の明示確認を待つ。"""
     try:
-        target_date = date.fromisoformat(desired_date)
-        target_time = time.fromisoformat(desired_time)
-        duration = int((reservation.end_time - reservation.start_time).total_seconds() // 60)
-        practitioner, start_dt, end_dt, _, _ = await find_best_practitioner(
-            db, target_date, target_time, duration
-        )
+        if selected_candidate:
+            target_date = date.fromisoformat(str(selected_candidate["date"]))
+            start_time = time.fromisoformat(str(selected_candidate["start"]))
+            end_time = time.fromisoformat(str(selected_candidate["end"]))
+            practitioner = await db.get(Practitioner, int(selected_candidate["practitioner_id"]))
+            start_dt = datetime.combine(target_date, start_time, tzinfo=JST)
+            end_dt = datetime.combine(target_date, end_time, tzinfo=JST)
+        else:
+            target_date = date.fromisoformat(desired_date)
+            target_time = time.fromisoformat(desired_time)
+            duration = int((reservation.end_time - reservation.start_time).total_seconds() // 60)
+            practitioner, start_dt, end_dt, _, _ = await find_best_practitioner(
+                db, target_date, target_time, duration
+            )
         if not practitioner:
             raise HTTPException(status_code=409, detail="変更先に空き枠がありません")
     except (HTTPException, ValueError):
@@ -2237,6 +2246,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 user_id=user_id,
                 reply_token=reply_token,
                 patient_message=text,
+                selected_candidate=selected,
             )
             return
         if parsed.get("date") and not parsed.get("time"):
@@ -2250,7 +2260,24 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 preferred_practitioner_id=reservation.practitioner_id,
                 max_results=3,
             )
-            alternatives = [candidate.to_dict() for candidate in candidates]
+            # 変更元と同じ所要時間を満たす枠だけを出す。
+            # 短い隙間を候補に混ぜると、患者が番号で選んだ枠を元の時間で再検索し直す
+            # 事故を誘発する。短縮希望が明示された場合だけ別経路で扱う。
+            alternatives = []
+            for candidate in candidates:
+                candidate_data = candidate.to_dict()
+                try:
+                    candidate_duration = int(
+                        (
+                            datetime.combine(target_date, time.fromisoformat(candidate_data["end"]))
+                            - datetime.combine(target_date, time.fromisoformat(candidate_data["start"]))
+                        ).total_seconds()
+                        // 60
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if candidate_duration == duration:
+                    alternatives.append(candidate_data)
             if alternatives:
                 await merge_user_draft(
                     db,
