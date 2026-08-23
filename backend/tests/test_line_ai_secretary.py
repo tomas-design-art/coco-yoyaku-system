@@ -1601,6 +1601,136 @@ def test_composer_rejects_invented_system_state_and_symptom_guess():
     assert _has_unsupported_claim({"patient_message": "腰が痛くて"}, "お痛みつらいですね。承ります。") is False
 
 
+def test_reservation_status_question_is_distinct_from_availability_question():
+    from app.services.line_facts import RESERVATION_STATUS_CATEGORY, classify_question
+
+    assert classify_question("俺、予約入ってたっけ？") == RESERVATION_STATUS_CATEGORY
+    assert classify_question("次の予約はいつ？") == RESERVATION_STATUS_CATEGORY
+    assert classify_question("明日空いてる？") == "availability"
+
+
+def test_reservation_status_fallback_uses_only_upcoming_reservation_facts():
+    from app.services.line_composer import _fallback
+
+    assert "今後のご予約は確認できません" in _fallback("reservation_status", {"upcoming_reservations": []})
+    reply = _fallback(
+        "reservation_status",
+        {
+            "upcoming_reservations": [
+                {"date": "2026-08-21", "start": "10:45", "end": "11:45", "practitioner": "時田"}
+            ]
+        },
+    )
+    assert "2026-08-21 10:45〜11:45" in reply
+    assert "時田" in reply
+
+
+def test_reservation_status_rejects_a_datetime_not_in_reservation_facts():
+    from app.services.line_composer import _has_temporal_contradiction
+
+    context = {
+        "upcoming_reservations": [
+            {"date": "2026-08-21", "start": "10:45", "end": "11:45", "practitioner": "時田"}
+        ]
+    }
+    assert _has_temporal_contradiction(
+        context,
+        "次のご予約は8/21の10:45からです。",
+        "reservation_status",
+    ) is False
+    assert _has_temporal_contradiction(
+        context,
+        "次のご予約は8/22の14:10からです。",
+        "reservation_status",
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_autopilot_reservation_status_question_uses_db_facts_before_handoff():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "俺、予約入ってたっけ？"},
+    }
+    parsed = {
+        "intent": "question",
+        "has_reservation_intent": False,
+        "confidence": "high",
+        "needs_human": True,
+        "constraints": [],
+    }
+    facts = {
+        "category": "reservation_status",
+        "upcoming_reservations": [
+            {"date": "2026-08-21", "start": "10:45", "end": "11:45", "practitioner": "時田"}
+        ],
+    }
+    state = {"mode": "idle", "draft": {}, "request_id": None, "context_data": {}}
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state", new=AsyncMock(return_value=state)
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="idle")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.build_clinic_context", new=AsyncMock(return_value={})), patch(
+        "app.api.line.parse_line_message", new=AsyncMock(return_value=parsed)
+    ), patch("app.api.line.collect_question_facts", new=AsyncMock(return_value=facts)), patch(
+        "app.api.line.merge_user_draft", new=AsyncMock()
+    ), patch("app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="ご予約を確認しました。")) as mock_compose, patch(
+        "app.api.line.reply_to_line", new=AsyncMock()
+    ) as mock_reply, patch("app.api.line.create_notification", new=AsyncMock()) as mock_notify:
+        await _handle_text_message(event, AsyncMock())
+
+    assert mock_compose.await_args.args[0] == "reservation_status"
+    assert mock_compose.await_args.args[1]["upcoming_reservations"] == facts["upcoming_reservations"]
+    mock_reply.assert_awaited_once()
+    mock_notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_autopilot_urgent_availability_question_hands_off_to_human():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "ぎっくり腰で動けないんですが、今日空いてますか？"},
+    }
+    parsed = {
+        "intent": "question",
+        "has_reservation_intent": True,
+        "confidence": "high",
+        "needs_human": True,
+        "constraints": ["urgency:high", "symptom:ぎっくり腰"],
+    }
+    state = {"mode": "idle", "draft": {}, "request_id": None, "context_data": {}}
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state", new=AsyncMock(return_value=state)
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="idle")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.build_clinic_context", new=AsyncMock(return_value={})), patch(
+        "app.api.line.parse_line_message", new=AsyncMock(return_value=parsed)
+    ), patch("app.api.line.create_notification", new=AsyncMock()) as mock_notify, patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ) as mock_set_mode, patch(
+        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="担当者からご連絡します。")
+    ) as mock_compose, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+        await _handle_text_message(event, AsyncMock())
+
+    mock_notify.assert_awaited_once()
+    assert mock_set_mode.await_args.args[1:] == ("U-autopilot", "manual")
+    assert mock_compose.await_args.args[0] == "handoff_to_human"
+    mock_reply.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_composer_falls_back_when_unsupported_claim_repeats():
     from app.services.line_composer import _fallback, compose_reply

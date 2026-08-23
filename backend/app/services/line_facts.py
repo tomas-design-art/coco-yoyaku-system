@@ -13,14 +13,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.menu import Menu
 from app.models.practitioner import Practitioner
+from app.models.reservation import Reservation
+from app.services.conflict_detector import ACTIVE_STATUSES
 from app.services.business_hours import get_business_hours_for_date
 from app.services.schedule_service import get_practitioner_working_hours, is_practitioner_working
 from app.services.slot_scorer import build_same_day_candidates
-from app.utils.datetime_jst import now_jst
+from app.utils.datetime_jst import JST, now_jst
 
 PRICE_CATEGORY = "price"
+RESERVATION_STATUS_CATEGORY = "reservation_status"
 
 _PRICE_PATTERN = re.compile(r"料金|値段|いくら|おいくら|費用|価格|会計|自費|保険.*(効|適用|使え)|何円")
+_RESERVATION_STATUS_PATTERN = re.compile(
+    r"(?:予約.*(?:入って|して|取れて|ある)|(?:予約|次の予定).*(?:いつ|確認|どう|ある)|予約(?:状況|確認)|入ってん)"
+)
 _BUSINESS_HOURS_PATTERN = re.compile(r"営業|何時から|何時まで|開いて|やってま|やってる|休診|休み|定休|祝日|診療時間")
 _AVAILABILITY_PATTERN = re.compile(r"空き|空いて|予約(?:は)?(?:できま|取れ|空)|埋まって")
 _MENU_PATTERN = re.compile(r"メニュー|コース|何分|所要|施術時間|時間は選")
@@ -32,6 +38,8 @@ def classify_question(text: str) -> str | None:
     message = text or ""
     if _PRICE_PATTERN.search(message):
         return PRICE_CATEGORY
+    if _RESERVATION_STATUS_PATTERN.search(message):
+        return RESERVATION_STATUS_CATEGORY
     if _PRACTITIONER_PATTERN.search(message):
         return "practitioner_schedule"
     if _AVAILABILITY_PATTERN.search(message):
@@ -130,6 +138,34 @@ def _resolve_target_date(parsed: dict | None) -> date:
     return now_jst().date()
 
 
+async def _upcoming_reservation_facts(db: AsyncSession, patient_id: int) -> list[dict]:
+    """患者本人に案内できる、未来の有効予約を日時順で返す。"""
+    rows = await db.execute(
+        select(Reservation, Menu, Practitioner)
+        .outerjoin(Menu, Reservation.menu_id == Menu.id)
+        .join(Practitioner, Reservation.practitioner_id == Practitioner.id)
+        .where(
+            Reservation.patient_id == patient_id,
+            Reservation.status.in_(ACTIVE_STATUSES),
+            Reservation.start_time >= now_jst(),
+        )
+        .order_by(Reservation.start_time)
+        .limit(3)
+    )
+    facts: list[dict] = []
+    for reservation, menu, practitioner in rows.all():
+        facts.append(
+            {
+                "date": reservation.start_time.astimezone(JST).date().isoformat(),
+                "start": reservation.start_time.astimezone(JST).strftime("%H:%M"),
+                "end": reservation.end_time.astimezone(JST).strftime("%H:%M"),
+                "practitioner": practitioner.name,
+                "menu": menu.name if menu else None,
+            }
+        )
+    return facts
+
+
 async def _find_mentioned_practitioner(db: AsyncSession, text: str) -> Practitioner | None:
     practitioners = (
         await db.execute(select(Practitioner).where(Practitioner.is_active == True))
@@ -170,6 +206,7 @@ async def collect_question_facts(
     text: str,
     parsed: dict | None = None,
     previous_category: str | None = None,
+    patient_id: int | None = None,
 ) -> dict | None:
     """質問に対してシステムが根拠を持つ事実を返す。答えられなければ None。
 
@@ -183,6 +220,14 @@ async def collect_question_facts(
         return None
     if category == PRICE_CATEGORY:
         return {"category": PRICE_CATEGORY}
+
+    if category == RESERVATION_STATUS_CATEGORY:
+        if patient_id is None:
+            return None
+        return {
+            "category": category,
+            "upcoming_reservations": await _upcoming_reservation_facts(db, patient_id),
+        }
 
     target_date = _resolve_target_date(parsed)
 

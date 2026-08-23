@@ -703,6 +703,14 @@ def _requires_manual_autopilot_handling(text: str) -> bool:
     return any(word in (text or "") for word in ("遅刻", "遅れ", "相談", "問合せ", "問い合わせ"))
 
 
+def _requires_human_priority(parsed: dict, text: str) -> bool:
+    """事実照会より人の対応を優先すべき緊急・苦情を判定する。"""
+    constraints = parsed.get("constraints") or []
+    if any(str(item).strip().lower() == "urgency:high" for item in constraints):
+        return True
+    return any(word in (text or "") for word in ("クレーム", "苦情", "ひどい", "最悪", "怒って"))
+
+
 def _is_booking_or_change_menu_trigger(text: str) -> bool:
     return (text or "").strip().replace("／", "/") in {"予約/変更", "予約", "変更"}
 
@@ -1845,9 +1853,19 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 and _extract_alternative_choice(text, len(pending_alternatives)) is not None
             )
 
-        if not explicit_choice and parsed_intent.get("needs_human"):
+        if (
+            not explicit_choice
+            and parsed_intent.get("needs_human")
+            and (
+                parsed_intent.get("intent") != "question"
+                or _requires_human_priority(parsed_intent, text)
+            )
+        ):
             await create_notification(db, "line_manual_mode", f"LINE手動対応: {line_patient.id}")
-            if not parsed_intent.get("has_reservation_intent"):
+            if (
+                _requires_human_priority(parsed_intent, text)
+                or not parsed_intent.get("has_reservation_intent")
+            ):
                 await set_user_mode(db, user_id, "manual")
                 if reply_token:
                     await reply_to_line(
@@ -2324,6 +2342,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             text,
             parsed_intent,
             previous_category=prev_draft.get("last_question_category"),
+            patient_id=line_patient.id,
         )
         if facts and facts.get("category"):
             try:
@@ -2346,10 +2365,15 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             return
         if facts:
             if reply_token:
+                situation = (
+                    "reservation_status"
+                    if facts.get("category") == "reservation_status"
+                    else "answer_question"
+                )
                 await reply_to_line(
                     reply_token,
                     await _compose_autopilot_reply(
-                        "answer_question",
+                        situation,
                         {**facts, "patient_message": text},
                         parsed_intent,
                     ),

@@ -49,6 +49,7 @@ SITUATION_GUIDES = {
     "closed_day": "希望された日が休診日であることを正しく伝える。『予約がいっぱい』『満席』とは絶対に言い換えない。診療している直近の日を示して希望を尋ねる。",
     "small_talk": "予約以外の短いやりとりに自然に応じる。用事があれば承る姿勢を一言添える。予約の話を無理に持ち出さない。",
     "waiting_ack": "待たせている催促へ素直に応じる。原因や障害を推測せず、確定事実にある現状だけを伝える。",
+    "reservation_status": "未来の有効予約の有無を、確定事実にある日時・担当・メニューだけで答える。予約がなければ、その事実を明確に伝える。",
 }
 
 
@@ -146,6 +147,17 @@ def _fallback(situation: str, context: dict) -> str:
         return "お待たせして申し訳ございません。引き続き承っておりますので、ご希望を教えていただけますでしょうか。"
     if situation == "answer_question":
         return "ご質問の内容を確認のうえ、担当者からご案内いたします。"
+    if situation == "reservation_status":
+        reservations = context.get("upcoming_reservations") or []
+        if not reservations:
+            return "現在、今後のご予約は確認できませんでした。ご希望の日時がありましたらお知らせください。"
+        lines = ["現在、以下のご予約を承っております。"]
+        for reservation in reservations:
+            detail = f"{reservation.get('date', '')} {reservation.get('start', '')}〜{reservation.get('end', '')}".strip()
+            if reservation.get("practitioner"):
+                detail += f"（担当: {reservation['practitioner']}）"
+            lines.append(detail)
+        return "\n".join(lines)
     templates = {
         "ask_datetime": "ご希望の日時を教えてください。\n例: 明日の午後3時",
         "ask_menu": "ご希望のメニューを選んでください。",
@@ -171,6 +183,7 @@ _STRICT_TEMPORAL_SITUATIONS = {
     "change_done",
     "cancel_done",
     "cancel_confirm",
+    "reservation_status",
 }
 _STRICT_TEMPORAL_KEYS = {"date", "start", "end", "time", "assumed_date", "assumed_time"}
 
