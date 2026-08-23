@@ -768,6 +768,24 @@ def _extract_alternative_choice(text: str, count: int) -> int | None:
     return choice if 1 <= choice <= count else None
 
 
+def _extract_alternative_time_choice(text: str, alternatives: list[dict]) -> int | None:
+    """提示済み候補の開始時刻を自然文で指定した明示選択を返す。"""
+    message = (text or "").replace("：", ":")
+    if not _is_affirmative(message) and not re.search(r"(?:にして|にします|取(?:り|れ))", message):
+        return None
+
+    matches: list[int] = []
+    for index, alternative in enumerate(alternatives, 1):
+        start = str(alternative.get("start") or "")
+        hour, separator, minute = start.partition(":")
+        if not separator or not hour.isdigit() or not minute.isdigit():
+            continue
+        time_pattern = rf"(?<!\d){int(hour)}(?:[:：]{minute}|時{int(minute)}?分?)(?!\d)"
+        if re.search(time_pattern, message):
+            matches.append(index)
+    return matches[0] if len(matches) == 1 else None
+
+
 def _has_cancellation_intent(text: str) -> bool:
     return bool(re.search(r"キャンセル|取り消|取消|やめたい|cancel|annul|cancelar|취소", text or "", re.IGNORECASE))
 
@@ -2026,6 +2044,8 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         request_data = await get_request(db, request_id, line_user_id=user_id) if request_id else None
         alternatives = request_data.get("alternatives") if request_data else None
         selected_choice = _extract_alternative_choice(text, len(alternatives)) if alternatives else None
+        if alternatives and selected_choice is None:
+            selected_choice = _extract_alternative_time_choice(text, alternatives)
         if alternatives and selected_choice is not None:
             alternative = alternatives[selected_choice - 1]
             try:

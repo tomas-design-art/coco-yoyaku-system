@@ -13,6 +13,7 @@ SITUATION_GUIDES = {
     "offer_alternatives": (
         "候補を番号付きで見やすく並べ、希望する番号で選べると伝える。候補が空なら別の希望日時を尋ねる。"
         "所要時間が通常と異なる場合は、その所要時間を必ず明示する。料金には触れない。"
+        "この時点では予約は未確定。『承りました』『予約を取りました』『確定しました』とは書かない。"
         "candidates_on_other_dates が真の場合は、requested_date に空きが無かったことを先に伝えてから"
         "別日の候補であると明示する。日付が変わったことを黙って提示しない。"
     ),
@@ -239,6 +240,9 @@ def _has_temporal_contradiction(context: dict, reply: str, situation: str = "") 
 _SYSTEM_STATE_WORDS = (
     "システム", "サーバ", "障害", "エラー", "不具合", "メンテナンス", "故障", "ダウン", "回線",
 )
+_PREMATURE_CONFIRMATION_WORDS = (
+    "承りました", "予約を取りました", "予約をお取りしました", "予約を確定しました", "予約が確定しました",
+)
 _SYMPTOM_REPLY_WORDS = (
     "痛み", "痛く", "痛い", "症状", "患部", "お加減", "体調", "お大事", "お怪我", "怪我",
 )
@@ -367,6 +371,11 @@ def _has_unsupported_claim(context: dict, reply: str) -> bool:
     return False
 
 
+def _has_premature_confirmation(situation: str, reply: str) -> bool:
+    """候補提示中に、DB登録前の予約確定を患者へ誤案内していないか。"""
+    return situation == "offer_alternatives" and any(word in reply for word in _PREMATURE_CONFIRMATION_WORDS)
+
+
 async def _notify_fallback(situation: str, reason: str) -> None:
     try:
         from app.config import settings
@@ -457,6 +466,9 @@ async def compose_reply(situation: str, context: dict) -> str:
                     reason = "contradiction"
                     continue
                 if _has_unsupported_claim(context, text):
+                    reason = "unsupported_claim"
+                    continue
+                if _has_premature_confirmation(situation, text):
                     reason = "unsupported_claim"
                     continue
                 if _has_spec_claim(context, text):
