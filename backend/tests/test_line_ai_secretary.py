@@ -948,6 +948,19 @@ def test_composer_rejects_repeated_assistant_opening():
     assert _has_repeated_reply_opening(context, "8月26日の空き時間をご案内します。") is False
 
 
+def test_composer_rejects_booking_confirmation_when_cancellation_failed():
+    from app.services.line_composer import _has_wrong_booking_outcome
+
+    assert _has_wrong_booking_outcome("cancel_failed", "ご予約ありがとうございます。19:30にお待ちしております。") is True
+    assert _has_wrong_booking_outcome("cancel_failed", "キャンセル処理を完了できませんでした。") is False
+
+
+def test_composer_prompt_does_not_require_a_greeting_before_every_reply():
+    from app.services.line_composer import SITUATION_GUIDES
+
+    assert "一言いたわ" not in SITUATION_GUIDES["ask_datetime"]
+
+
 @pytest.mark.asyncio
 async def test_autopilot_setup_keyword_starts_identity_flow_only():
     from app.api.line import _handle_autopilot_setup_message
@@ -1278,7 +1291,7 @@ def test_autopilot_debounce_does_not_merge_thanks_or_changed_intent():
 
 
 @pytest.mark.asyncio
-async def test_repeated_autopilot_prompt_hands_off_on_third_attempt():
+async def test_repeated_autopilot_prompt_keeps_the_llm_conversation_active():
     from app.api.line import _reply_with_loop_guard
 
     db = AsyncMock()
@@ -1294,7 +1307,7 @@ async def test_repeated_autopilot_prompt_hands_off_on_third_attempt():
     ), patch("app.api.line.merge_user_draft", new=AsyncMock()), patch(
         "app.api.line.set_user_mode", new=AsyncMock()
     ) as mock_set_mode, patch("app.api.line.create_notification", new=AsyncMock()), patch(
-        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="担当者が確認します。")
+        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="どの点が分かりにくかったか教えてください。")
     ) as mock_compose, patch("app.api.line.reply_to_line", new=AsyncMock()):
         handed_off = await _reply_with_loop_guard(
             db,
@@ -1304,9 +1317,9 @@ async def test_repeated_autopilot_prompt_hands_off_on_third_attempt():
             {"what": "提示した予約候補", "patient_message": "よく分からない"},
         )
 
-    assert handed_off is True
-    mock_set_mode.assert_awaited_once_with(db, "U-autopilot", "manual", "rid-1")
-    assert mock_compose.await_args.args[0] == "handoff_to_human"
+    assert handed_off is False
+    mock_set_mode.assert_not_awaited()
+    assert mock_compose.await_args.args[0] == "reconfirm_yes_no"
 
 
 def test_autopilot_conversation_expires_after_one_hour():
@@ -2235,8 +2248,8 @@ async def test_price_question_never_calls_llm_composer():
 # ── 2026-08-18 夜の実機事故（会話として成立していない）の再発防止 ──
 
 
-def test_parser_marks_inherited_date_so_it_is_not_asserted():
-    """患者が今回述べていない日付は『引き継ぎ』として印を付ける。"""
+def test_parser_marks_inherited_date_without_turning_it_into_current_input():
+    """患者が今回述べていない日付は、現在の入力ではなく会話文脈としてだけ印を付ける。"""
     from app.agents.line_parser import _normalize_result
 
     result = _normalize_result(
@@ -2244,7 +2257,7 @@ def test_parser_marks_inherited_date_so_it_is_not_asserted():
         None,
         {"date": "2026-08-17"},
     )
-    assert result["date"] == "2026-08-17"
+    assert result["date"] is None
     assert result["date_inherited"] is True
 
     # 今回のメッセージで日付を述べていれば引き継ぎではない
@@ -2421,6 +2434,63 @@ def test_later_request_keeps_the_date_being_discussed():
     plain = SlotFilters()
     target2 = offered_date if (plain.earlier or plain.later) and offered_date else parsed_date
     assert target2 == _parse_iso_date("2026-08-24")
+
+
+def test_parser_does_not_turn_a_prior_date_into_the_current_message_date():
+    from app.agents.line_parser import _normalize_result
+
+    parsed = _normalize_result(
+        {"intent": "new", "date": None, "time": None, "constraints": []},
+        profile_name=None,
+        previous={"date": "2026-08-26", "time": "15:30"},
+    )
+
+    assert parsed["date"] is None
+    assert parsed["time"] is None
+    assert parsed["date_inherited"] is True
+    assert parsed["time_inherited"] is True
+
+
+def test_parser_preserves_gemini_conversation_goal_for_the_reply_agent():
+    from app.agents.line_parser import _normalize_result
+
+    parsed = _normalize_result(
+        {
+            "intent": "new",
+            "date": None,
+            "time": None,
+            "constraints": [],
+            "conversation_goal": "今日の空き時間を尋ねているので、メニューが分かればその日の候補を案内する。",
+        },
+        profile_name=None,
+        previous={},
+    )
+
+    assert parsed["conversation_goal"] == "今日の空き時間を尋ねているので、メニューが分かればその日の候補を案内する。"
+
+
+@pytest.mark.asyncio
+async def test_later_request_does_not_expand_to_other_dates_when_same_day_is_full():
+    from app.api.line import _search_negotiated_candidates
+    from app.services.line_negotiation import SlotFilters
+
+    db = AsyncMock()
+    with patch("app.api.line.build_candidates_over_days", new=AsyncMock(return_value=[])) as mock_search:
+        candidates = await _search_negotiated_candidates(
+            db,
+            target_date=date(2026, 8, 24),
+            filters=SlotFilters(later=True),
+            duration_minutes=60,
+            preferred_practitioner_id=3,
+            desired_time=time(15, 30),
+            earliest_offered=None,
+            latest_offered=15 * 60 + 30,
+            same_day_only=True,
+        )
+
+    assert candidates == []
+    mock_search.assert_awaited_once()
+    assert mock_search.await_args.kwargs["search_days"] == 1
 
 
 # ── 2026-08-18 23:05 事故: 正しい回答がガードに棄却され定型文へ落ちていた ──

@@ -46,7 +46,7 @@ LINE_PARSE_PROMPT = """あなたは接骨院の熟練予約秘書AIです。患�
 {menu_list}
 
 出力JSON（全キー必須）:
-{{"intent":"new | change | cancel | question | other","has_reservation_intent":true,"name":null,"menu_hint":null,"date":null,"time":null,"current_date":null,"current_time":null,"duration_minutes":null,"constraints":[],"polarity":"affirmative | negative | none","confidence":"high | medium | low","needs_human":false}}
+{{"intent":"new | change | cancel | question | other","has_reservation_intent":true,"name":null,"menu_hint":null,"date":null,"time":null,"current_date":null,"current_time":null,"duration_minutes":null,"constraints":[],"polarity":"affirmative | negative | none","confidence":"high | medium | low","needs_human":false,"conversation_goal":null}}
 
 intent: new=新規予約/空き確認、change=日時変更、cancel=取消/行けない、other=お礼・雑談・相槌。
 question=院の情報を尋ねている。営業時間・休診日・料金・領収書に加え、**施術者の出勤や休みを尋ねる質問も question**。
@@ -62,6 +62,9 @@ polarity: 「大丈夫じゃない」「難しい」「無理」「やめてお�
 duration_minutes は患者が明示した施術時間だけを入れる。推測で入れない。上記メニューの最低施術時間を下回る値は入れない。
 duration_flexible は患者が「短くてもよい」と明確に述べた場合だけ入れる。単に早い時間を希望しただけでは入れない。
 name は患者の自己申告だけ。クレーム、緊急性の高い痛み、領収書・保険・料金の個別相談は needs_human=true。
+conversation_goal は、直近の会話と今回の発言を踏まえて、次の返信で患者に何を自然に確認・案内すべきかを日本語で短く書く。
+これは患者へそのまま送る文章ではない。必要な日時・メニュー・候補が足りない場合も、何を聞くべきかは会話の流れからあなたが決める。
+患者がすでに答えた項目を聞き直す指示や、定型的な挨拶・体調確認は書かない。
 ■文脈の引き継ぎ（重要）
 直前の会話で扱っていた話題は、次のメッセージでも続いているとみなす。省略された主語・目的語は直前の話題で補う。
 例: 直前が「8月の休診日は18日と25日です」なら、「9月は？」は9月の休診日を尋ねている（intent=question）。予約希望ではない。
@@ -381,14 +384,19 @@ def _normalize_result(parsed: dict, profile_name: str | None, previous: dict | N
     # 引き継いだことを明示して後段で確認扱いにできるようにする。
     result["date_inherited"] = not result.get("date") and bool(previous.get("date"))
     result["time_inherited"] = not result.get("time") and bool(previous.get("time"))
-    result["date"] = result.get("date") or previous.get("date")
-    result["time"] = result.get("time") or previous.get("time")
+    # 履歴は話題の理解に使うが、患者が今回言っていない日時を解析結果へ埋め戻さない。
+    # ここで前回の値を入れると、Geminiが「今日の遅い時間」と理解しても、コード側が
+    # 古い別日の希望として再検索してしまう。
+    result["date"] = result.get("date")
+    result["time"] = result.get("time")
     result["intent"] = result.get("intent") if result.get("intent") in {"new", "change", "cancel", "question", "other"} else "other"
     result["has_reservation_intent"] = bool(result.get("has_reservation_intent"))
     result["constraints"] = _normalize_constraints(result.get("constraints"))
     result["polarity"] = result.get("polarity") if result.get("polarity") in {"affirmative", "negative", "none"} else "none"
     result["confidence"] = result.get("confidence") if result.get("confidence") in {"high", "medium", "low"} else "medium"
     result["needs_human"] = bool(result.get("needs_human"))
+    goal = result.get("conversation_goal")
+    result["conversation_goal"] = str(goal).strip()[:240] if isinstance(goal, str) and goal.strip() else None
     result["constraints"] = _mirror_fields_into_constraints(result)
     result["missing_fields"] = _compute_missing_fields(result)
     return result
@@ -495,8 +503,8 @@ def _rule_based_parse(message: str, profile_name: str | None = None, previous: d
     result = {
         "has_reservation_intent": True,
         "customer_name": name_val or previous.get("customer_name") or _normalize_name(profile_name),
-        "date": date_val or previous.get("date"),
-        "time": time_val or previous.get("time"),
+        "date": date_val,
+        "time": time_val,
         "menu_name": menu_val or previous.get("menu_name"),
         "intent": intent if intent != "other" else "new",
         "current_date": None,

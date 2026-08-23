@@ -19,7 +19,7 @@ SITUATION_GUIDES = {
         "別日の候補であると明示する。日付が変わったことを黙って提示しない。"
     ),
     "usual_confirm": "いつものメニュー・所要時間・担当を提示し、この内容で良いか確認する。",
-    "ask_datetime": "症状があれば一言いたわった上で、希望日時を尋ねる。",
+    "ask_datetime": "直近の会話を踏まえ、予約に必要な情報だけを自然に尋ねる。",
     "ask_time_for_date": "受け取った希望日を認識したと示し、その日の空き候補があれば提示して希望時刻を尋ねる。",
     "ask_date_for_time": "受け取った希望時刻を認識したと示し、希望日だけを尋ねる。",
     "ask_missing": "不足項目だけを責めずに尋ねる。複数ある場合も確定事実の項目名を使う。",
@@ -384,6 +384,17 @@ def _has_premature_confirmation(situation: str, reply: str) -> bool:
     return situation == "offer_alternatives" and any(word in reply for word in _PREMATURE_CONFIRMATION_WORDS)
 
 
+def _has_wrong_booking_outcome(situation: str, reply: str) -> bool:
+    """DB処理結果と逆の予約完了・取消完了を患者へ伝えていないか。"""
+    booking_claims = ("ご予約ありがとうございます", "ご予約を確定", "予約をお取り", "お待ちしております")
+    cancellation_claims = ("キャンセルしました", "キャンセルを承りました", "取消しました")
+    if situation in {"cancel_failed", "slot_taken", "no_candidates"}:
+        return any(claim in reply for claim in booking_claims)
+    if situation == "cancel_aborted":
+        return any(claim in reply for claim in cancellation_claims)
+    return False
+
+
 def _has_misleading_alternative_context(situation: str, context: dict, reply: str) -> bool:
     """同日候補・時刻未指定の案内を、別日や満席と取り違えていないか。"""
     if situation != "offer_alternatives":
@@ -462,7 +473,7 @@ async def compose_reply(situation: str, context: dict) -> str:
         prompt = f"""あなたは接骨院の受付を長年担当しているベテラン事務員です。患者へのLINE返信を、あなた自身の言葉で自然に書いてください。
 
 【あなたの役割】
-患者の言葉をそのまま受け止め、必要なことだけを、感じよく、短く伝える。機械的な定型文は書かない。
+直近の会話を読んで、必要なことだけを感じよく短く伝える。機械的な定型文は書かない。
 
 【厳守】
 - 下の「院の確定情報」と「確定事実」に無い日時・空き状況・診療内容を新たに作らない（事実の捏造だけが禁止事項）。
@@ -483,7 +494,11 @@ async def compose_reply(situation: str, context: dict) -> str:
 - 料金・費用・保険適用の可否には答えない。金額を一切書かず、スタッフから案内すると伝える。
 - 敬語。1〜3文。絵文字は最大1つ。1メッセージ1論点。
 - 医療的な指示・診断はしない。痛みには一言いたわる程度に留める。
-- 患者の直前メッセージがあれば、まず一言受け止めてから本題に入る。
+- 毎回の挨拶、患者名の呼びかけ、体調確認は不要。直近の会話で既に使った挨拶・質問は繰り返さない。
+    患者が症状や体調に触れた場合だけ、それに自然に応じてよい。
+- 患者が既に答えたことを聞き直さない。省略された言葉は直近の会話と確定事実から理解して応じる。
+- 確定事実に conversation_goal があれば、それは会話理解を担ったGeminiが決めた今回の返信目的である。
+    状況ラベルより優先して従い、その目的を自然な会話として実現する。
 - 「はい/いいえ」で答えてほしいときは、そう分かるように書く。
 
 【院の確定情報】
@@ -515,6 +530,9 @@ async def compose_reply(situation: str, context: dict) -> str:
                     reason = "unsupported_claim"
                     continue
                 if _has_premature_confirmation(situation, text):
+                    reason = "unsupported_claim"
+                    continue
+                if _has_wrong_booking_outcome(situation, text):
                     reason = "unsupported_claim"
                     continue
                 if _has_misleading_alternative_context(situation, context, text):

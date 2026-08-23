@@ -851,6 +851,10 @@ async def _compose_autopilot_reply(
     db = _AUTOPILOT_DB_CONTEXT.get()
     user_id = _AUTOPILOT_USER_CONTEXT.get()
     enriched_context = dict(context)
+    # 次に何を患者へ確認・案内するかは、履歴を読んだGeminiの会話判断を優先する。
+    # コードはDB事実の取得と予約確定だけを担う。
+    if parsed and parsed.get("conversation_goal"):
+        enriched_context["conversation_goal"] = parsed["conversation_goal"]
     # 休診日を「満席」と言い換えたり施術時間を作り話しないよう、院の事実を毎回同梱する
     enriched_context["clinic"] = _AUTOPILOT_CLINIC_CONTEXT.get()
     # 前の会話から引き継いだ日時は患者が今回述べたものではない。
@@ -910,19 +914,6 @@ async def _reply_with_loop_guard(
         {"autopilot_last_situation": situation, "autopilot_situation_streak": streak},
         state.get("request_id"),
     )
-    if streak >= 3:
-        await set_user_mode(db, user_id, "manual", state.get("request_id"))
-        await create_notification(db, "line_manual_mode", "LINE同一確認3回: 手動対応へ切替")
-        if reply_token:
-            await reply_to_line(
-                reply_token,
-                await _compose_autopilot_reply(
-                    "handoff_to_human",
-                    {"reason": "同じ確認が続いたため", "patient_message": context.get("patient_message")},
-                    parsed,
-                ),
-            )
-        return True
     if reply_token:
         await reply_to_line(reply_token, await _compose_autopilot_reply(situation, context, parsed))
     return False
@@ -1335,6 +1326,7 @@ async def _search_negotiated_candidates(
     desired_time: time,
     earliest_offered: int | None,
     latest_offered: int | None,
+    same_day_only: bool = False,
 ) -> list[dict]:
     """条件変更を反映した候補を、同日優先・見つからなければ後続日で探す。"""
 
@@ -1348,7 +1340,7 @@ async def _search_negotiated_candidates(
                 return False
         return True
 
-    for search_days in (1, 7):
+    for search_days in ((1,) if same_day_only else (1, 7)):
         scored = await build_candidates_over_days(
             db,
             target_date,
@@ -1491,6 +1483,9 @@ async def _reoffer_autopilot_candidates(
         desired_time=desired_time,
         earliest_offered=earliest_offered,
         latest_offered=latest_offered,
+        # 「もっと早い／遅い」は提示済みの日の中で探す要望。空きが無いからと
+        # 別日へ移すと、患者が今日について尋ねた会話を壊してしまう。
+        same_day_only=merged_filters.earlier or merged_filters.later,
     )
 
     request_id = state.get("request_id")
@@ -1645,6 +1640,7 @@ async def _renegotiate_autopilot_change(
         desired_time=time(desired_minutes // 60 % 24, desired_minutes % 60),
         earliest_offered=earliest_offered,
         latest_offered=latest_offered,
+        same_day_only=filters.earlier or filters.later,
     )
     if not candidates:
         await set_user_mode(db, user_id, "autopilot_change_datetime")
@@ -1923,17 +1919,6 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         ),
                     )
                 return
-        if not explicit_choice and parsed_intent.get("confidence") == "low":
-            await _reply_with_loop_guard(
-                db,
-                user_id,
-                reply_token,
-                "parse_failed",
-                {"patient_message": text},
-                parsed_intent,
-            )
-            return
-
         if (
             current_mode in {"idle", "waiting_menu", "waiting_datetime", "waiting_time_duration"}
             and parsed_intent.get("intent") not in {"cancel", "change", "question"}
