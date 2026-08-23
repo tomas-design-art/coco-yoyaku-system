@@ -2343,6 +2343,41 @@ def test_offer_alternatives_cannot_claim_the_reservation_is_already_confirmed():
     assert _has_premature_confirmation("confirmed", "19:30で予約を確定しました。") is False
 
 
+def test_single_offered_slot_accepts_natural_affirmative_without_number():
+    from app.api.line import _select_offered_alternative
+
+    alternatives = [{"date": "2026-08-24", "start": "19:30", "end": "20:30"}]
+    assert _select_offered_alternative("じゃあそれでお願いします", alternatives) == 1
+    assert _select_offered_alternative("もっと遅い時間はありますか？", alternatives) is None
+
+
+def test_offer_alternatives_rejects_misleading_same_day_and_unprompted_price_claims():
+    from app.services.line_composer import (
+        _has_misleading_alternative_context,
+        _has_unprompted_price_reference,
+    )
+
+    context = {
+        "alternatives": [{"date": "2026-08-24", "start": "19:30", "end": "20:30"}],
+        "date_only": True,
+        "patient_message": "明日、いつもので予約お願いします",
+    }
+    assert _has_misleading_alternative_context(
+        "offer_alternatives", context, "別の日程をご案内します。"
+    ) is True
+    assert _has_misleading_alternative_context(
+        "offer_alternatives", context, "ご希望の時間帯は埋まっています。"
+    ) is True
+    assert _has_unprompted_price_reference(context, "料金については当日スタッフよりご案内します。") is True
+    assert _has_unprompted_price_reference(context, "19:30からご案内できます。") is False
+
+
+def test_reservation_status_question_recognizes_my_booking_phrase():
+    from app.services.line_facts import RESERVATION_STATUS_CATEGORY, classify_question
+
+    assert classify_question("私の予約教えて") == RESERVATION_STATUS_CATEGORY
+
+
 def test_no_slots_must_not_be_reported_as_practitioner_absence():
     """空きが無いだけなのに『不在』と言い換えない。"""
     from app.services.line_composer import _has_unsupported_claim

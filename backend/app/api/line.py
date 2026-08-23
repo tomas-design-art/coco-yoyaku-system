@@ -786,6 +786,17 @@ def _extract_alternative_time_choice(text: str, alternatives: list[dict]) -> int
     return matches[0] if len(matches) == 1 else None
 
 
+def _select_offered_alternative(text: str, alternatives: list[dict]) -> int | None:
+    """番号・候補時刻・単一候補への肯定を、提示済み候補の明示選択に正規化する。"""
+    choice = _extract_alternative_choice(text, len(alternatives))
+    if choice is not None:
+        return choice
+    choice = _extract_alternative_time_choice(text, alternatives)
+    if choice is not None:
+        return choice
+    return 1 if len(alternatives) == 1 and _is_affirmative(text) else None
+
+
 def _has_cancellation_intent(text: str) -> bool:
     return bool(re.search(r"キャンセル|取り消|取消|やめたい|cancel|annul|cancelar|취소", text or "", re.IGNORECASE))
 
@@ -1866,10 +1877,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 else None
             )
             pending_alternatives = (pending_request or {}).get("alternatives") or []
-            explicit_choice = bool(
-                pending_alternatives
-                and _extract_alternative_choice(text, len(pending_alternatives)) is not None
-            )
+            explicit_choice = _select_offered_alternative(text, pending_alternatives) is not None
 
         if (
             not explicit_choice
@@ -2043,9 +2051,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         request_id = user_state.get("request_id")
         request_data = await get_request(db, request_id, line_user_id=user_id) if request_id else None
         alternatives = request_data.get("alternatives") if request_data else None
-        selected_choice = _extract_alternative_choice(text, len(alternatives)) if alternatives else None
-        if alternatives and selected_choice is None:
-            selected_choice = _extract_alternative_time_choice(text, alternatives)
+        selected_choice = _select_offered_alternative(text, alternatives) if alternatives else None
         if alternatives and selected_choice is not None:
             alternative = alternatives[selected_choice - 1]
             try:
@@ -3231,6 +3237,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     {
                         "alternatives": alternatives,
                         "vague": vague_choice,
+                        "date_only": not bool((parsed_intent or {}).get("time")),
                         "menu": menu.name if menu else menu_name,
                         "duration_minutes": duration,
                         "first_visit_note": first_visit_note,

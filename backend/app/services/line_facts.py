@@ -25,7 +25,7 @@ RESERVATION_STATUS_CATEGORY = "reservation_status"
 
 _PRICE_PATTERN = re.compile(r"料金|値段|いくら|おいくら|費用|価格|会計|自費|保険.*(効|適用|使え)|何円")
 _RESERVATION_STATUS_PATTERN = re.compile(
-    r"(?:予約.*(?:入って|して|取れて|ある)|(?:予約|次の予定).*(?:いつ|確認|どう|ある)|予約(?:状況|確認)|入ってん)"
+    r"(?:予約.*(?:入って|して|取れて|ある)|(?:予約|次の予定).*(?:いつ|確認|どう|ある)|(?:私|自分).{0,8}予約.{0,8}(?:教えて|見せて|知りたい)|予約(?:状況|確認)|入ってん)"
 )
 _BUSINESS_HOURS_PATTERN = re.compile(r"営業|何時から|何時まで|開いて|やってま|やってる|休診|休み|定休|祝日|診療時間")
 _AVAILABILITY_PATTERN = re.compile(r"空き|空いて|予約(?:は)?(?:できま|取れ|空)|埋まって")

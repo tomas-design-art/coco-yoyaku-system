@@ -14,6 +14,7 @@ SITUATION_GUIDES = {
         "候補を番号付きで見やすく並べ、希望する番号で選べると伝える。候補が空なら別の希望日時を尋ねる。"
         "所要時間が通常と異なる場合は、その所要時間を必ず明示する。料金には触れない。"
         "この時点では予約は未確定。『承りました』『予約を取りました』『確定しました』とは書かない。"
+        "date_only が真なら患者は時刻を指定していない。その日の空き候補として案内し、希望時間帯が満席とは書かない。"
         "candidates_on_other_dates が真の場合は、requested_date に空きが無かったことを先に伝えてから"
         "別日の候補であると明示する。日付が変わったことを黙って提示しない。"
     ),
@@ -83,7 +84,11 @@ def _fallback(situation: str, context: dict) -> str:
                 "別の日でしたら以下がご案内できます。"
             )
         else:
-            header = "空いているお時間をご案内します。" if context.get("vague") else "ご希望の時間は満席でしたので、近い空き枠をご案内します。"
+            header = (
+                "その日の空いているお時間をご案内します。"
+                if context.get("vague") or context.get("date_only")
+                else "ご希望の時間は満席でしたので、近い空き枠をご案内します。"
+            )
         lines = [header, *(f"{index}. {item.get('label', '')}" for index, item in enumerate(alternatives, 1))]
         lines.append("ご希望の番号を返信してください。別の日時でもお探しできます。")
         text = "\n".join(lines)
@@ -243,6 +248,7 @@ _SYSTEM_STATE_WORDS = (
 _PREMATURE_CONFIRMATION_WORDS = (
     "承りました", "予約を取りました", "予約をお取りしました", "予約を確定しました", "予約が確定しました",
 )
+_PRICE_REFERENCE_WORDS = ("料金", "費用", "値段", "価格", "保険適用")
 _SYMPTOM_REPLY_WORDS = (
     "痛み", "痛く", "痛い", "症状", "患部", "お加減", "体調", "お大事", "お怪我", "怪我",
 )
@@ -271,6 +277,7 @@ _RETRY_NOTES = {
     "contradiction": "\n前回の返信は確定事実と異なる日時を含んでいました。確定事実の日時だけを使って書き直してください。",
     "unsupported_claim": "\n前回の返信は確定事実に無いシステム状態や患者の症状の推測を含んでいました。原因・障害・体調の推測には触れず、確定事実にあることだけで書き直してください。",
     "spec_claim": "\n前回の返信は院の枠の組み方や施術時間のルールを勝手に説明していました。院の仕組みには触れず、確定情報にある施術時間だけを使って書き直してください。",
+    "alternative_context": "\n前回の返信は候補の日付や患者が指定した条件と矛盾していました。同日の候補を別日と呼ばず、時刻未指定なら希望時間帯が満席とは書かず、料金にも触れずに書き直してください。",
 }
 
 
@@ -376,6 +383,29 @@ def _has_premature_confirmation(situation: str, reply: str) -> bool:
     return situation == "offer_alternatives" and any(word in reply for word in _PREMATURE_CONFIRMATION_WORDS)
 
 
+def _has_misleading_alternative_context(situation: str, context: dict, reply: str) -> bool:
+    """同日候補・時刻未指定の案内を、別日や満席と取り違えていないか。"""
+    if situation != "offer_alternatives":
+        return False
+    candidate_dates = {
+        str(item.get("date"))
+        for item in context.get("alternatives") or []
+        if isinstance(item, dict) and item.get("date")
+    }
+    says_other_day = bool(re.search(r"別の日程を(?:ご)?案内|別の日でしたら|別日(?:程)?を(?:ご)?案内", reply))
+    if len(candidate_dates) == 1 and says_other_day:
+        return True
+    return bool(context.get("date_only") and re.search(r"(?:希望|ご希望).{0,8}(?:時間帯|時間).{0,12}(?:満席|埋ま)", reply))
+
+
+def _has_unprompted_price_reference(context: dict, reply: str) -> bool:
+    """料金を尋ねられていない候補案内で、料金の話題を勝手に持ち出さない。"""
+    if not any(word in reply for word in _PRICE_REFERENCE_WORDS):
+        return False
+    patient_message = str(context.get("patient_message") or "")
+    return not any(word in patient_message for word in _PRICE_REFERENCE_WORDS)
+
+
 async def _notify_fallback(situation: str, reason: str) -> None:
     try:
         from app.config import settings
@@ -470,6 +500,12 @@ async def compose_reply(situation: str, context: dict) -> str:
                     continue
                 if _has_premature_confirmation(situation, text):
                     reason = "unsupported_claim"
+                    continue
+                if _has_misleading_alternative_context(situation, context, text):
+                    reason = "alternative_context"
+                    continue
+                if _has_unprompted_price_reference(context, text):
+                    reason = "alternative_context"
                     continue
                 if _has_spec_claim(context, text):
                     reason = "spec_claim"
