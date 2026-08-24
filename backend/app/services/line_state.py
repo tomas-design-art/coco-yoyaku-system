@@ -216,6 +216,27 @@ async def append_conversation_history(
     return list(history)
 
 
+async def remember_completed_booking(
+    db: AsyncSession,
+    line_user_id: str,
+    booking: dict,
+) -> None:
+    """直近に確定した予約の事実を、次の自然な会話理解のためだけに残す。"""
+    state = await _get_or_create_state(db, line_user_id)
+    context = _normalize_context(state.context_data)
+    context["recent_completed_booking"] = dict(booking)
+    state.context_data = context
+    await db.flush()
+
+
+async def clear_recent_completed_booking(db: AsyncSession, line_user_id: str) -> None:
+    state = await _get_or_create_state(db, line_user_id)
+    context = _normalize_context(state.context_data)
+    context.pop("recent_completed_booking", None)
+    state.context_data = context
+    await db.flush()
+
+
 async def merge_user_draft(
     db: AsyncSession,
     line_user_id: str,

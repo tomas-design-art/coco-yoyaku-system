@@ -386,7 +386,7 @@ def _has_premature_confirmation(situation: str, reply: str) -> bool:
 
 def _has_wrong_booking_outcome(situation: str, reply: str) -> bool:
     """DB処理結果と逆の予約完了・取消完了を患者へ伝えていないか。"""
-    booking_claims = ("ご予約ありがとうございます", "ご予約を確定", "予約をお取り", "お待ちしております")
+    booking_claims = ("ご予約ありがとうございます", "ご予約を確定", "ご予約を承りました", "予約をお取り", "お待ちしております")
     cancellation_claims = ("キャンセルしました", "キャンセルを承りました", "取消しました")
     if situation in {"cancel_failed", "slot_taken", "no_candidates"}:
         return any(claim in reply for claim in booking_claims)

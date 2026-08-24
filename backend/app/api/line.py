@@ -56,11 +56,13 @@ from app.services.line_reply import push_message, reply_flex_message, reply_text
 from app.services.line_state import (
     append_conversation_history,
     clear_user_draft,
+    clear_recent_completed_booking,
     create_pending_request,
     get_request,
     get_user_mode,
     get_user_state,
     merge_user_draft,
+    remember_completed_booking,
     reset_user_conversation,
     set_user_mode,
     update_request,
@@ -1710,6 +1712,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         if "context_data" in user_state:
             _AUTOPILOT_DB_CONTEXT.set(db)
             _AUTOPILOT_USER_CONTEXT.set(user_id)
+        else:
+            _AUTOPILOT_DB_CONTEXT.set(None)
+            _AUTOPILOT_USER_CONTEXT.set(None)
         display_name = await _get_line_display_name(user_id)
         if _conversation_is_expired(user_state):
             expired_mode = user_state.get("mode")
@@ -1881,7 +1886,19 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             previous=prev_draft,
             clinic_context=clinic_facts,
             recent_history=conversation_history[-6:],
+            conversation_state=(user_state.get("context_data") or {}).get("recent_completed_booking"),
         )
+
+        # 予約確定直後の感謝・締めの挨拶は、Geminiが返信不要と判断できる。
+        # 新しい予約操作を含まない場合だけ受け入れ、次の会話へ確定文脈を持ち越さない。
+        if (
+            (user_state.get("context_data") or {}).get("recent_completed_booking")
+            and parsed_intent.get("reply_action") == "no_reply"
+            and parsed_intent.get("intent") == "other"
+            and not parsed_intent.get("has_reservation_intent")
+        ):
+            await clear_recent_completed_booking(db, user_id)
+            return
 
         # 候補提示中の番号返信は「明示的な選択」。
         # 確信度や needs_human の判定より先に扱う（提示直後に聞き返すのは受付として誤り）。
@@ -2107,9 +2124,14 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 return
             await update_request(db, request_id, line_user_id=user_id, status="confirmed", reservation_id=reservation.get("id"))
             await clear_user_draft(db, user_id)
+            practitioner_name = alternative.get("practitioner_name") or "担当者"
+            await remember_completed_booking(
+                db,
+                user_id,
+                {"date": start_dt.strftime("%Y/%m/%d"), "start": start_dt.strftime("%H:%M"), "end": end_dt.strftime("%H:%M"), "practitioner": practitioner_name},
+            )
             await set_user_mode(db, user_id, "idle")
             if reply_token:
-                practitioner_name = alternative.get("practitioner_name") or "担当者"
                 await reply_to_line(
                     reply_token,
                     await _compose_autopilot_reply(
@@ -2346,6 +2368,16 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 )
             return
         await clear_user_draft(db, user_id)
+        await remember_completed_booking(
+            db,
+            user_id,
+            {
+                "date": start_dt.strftime("%Y/%m/%d"),
+                "start": start_dt.strftime("%H:%M"),
+                "end": end_dt.strftime("%H:%M"),
+                "practitioner": prev_draft.get("autopilot_change_practitioner_name") or "担当者",
+            },
+        )
         await set_user_mode(db, user_id, "idle")
         if reply_token:
             await reply_to_line(
@@ -3249,6 +3281,11 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 else:
                     await update_request(db, request_id, line_user_id=user_id, status="confirmed", reservation_id=reservation.get("id"))
                     await clear_user_draft(db, user_id)
+                    await remember_completed_booking(
+                        db,
+                        user_id,
+                        {"date": start_dt.strftime("%Y/%m/%d"), "start": start_dt.strftime("%H:%M"), "end": end_dt.strftime("%H:%M"), "practitioner": practitioner.name},
+                    )
                     await set_user_mode(db, user_id, "idle")
                     if reply_token:
                         await reply_to_line(

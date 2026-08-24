@@ -39,6 +39,9 @@ LINE_PARSE_PROMPT = """あなたは接骨院の熟練予約秘書AIです。患�
 直前までの会話（省略された言葉はここから補う）:
 {history_block}
 
+直近の確定予約（あれば、直後の感謝・挨拶を新規予約と誤解しないための事実）:
+{conversation_state}
+
 当院の確定情報（推測せず、必ずここを根拠にする）:
 {clinic_block}
 
@@ -46,7 +49,7 @@ LINE_PARSE_PROMPT = """あなたは接骨院の熟練予約秘書AIです。患�
 {menu_list}
 
 出力JSON（全キー必須）:
-{{"intent":"new | change | cancel | question | other","has_reservation_intent":true,"name":null,"menu_hint":null,"date":null,"time":null,"current_date":null,"current_time":null,"duration_minutes":null,"constraints":[],"polarity":"affirmative | negative | none","confidence":"high | medium | low","needs_human":false,"conversation_goal":null}}
+{{"intent":"new | change | cancel | question | other","has_reservation_intent":true,"name":null,"menu_hint":null,"date":null,"time":null,"current_date":null,"current_time":null,"duration_minutes":null,"constraints":[],"polarity":"affirmative | negative | none","confidence":"high | medium | low","needs_human":false,"conversation_goal":null,"reply_action":"reply | no_reply"}}
 
 intent: new=新規予約/空き確認、change=日時変更、cancel=取消/行けない、other=お礼・雑談・相槌。
 question=院の情報を尋ねている。営業時間・休診日・料金・領収書に加え、**施術者の出勤や休みを尋ねる質問も question**。
@@ -65,6 +68,10 @@ name は患者の自己申告だけ。クレーム、緊急性の高い痛み、
 conversation_goal は、直近の会話と今回の発言を踏まえて、次の返信で患者に何を自然に確認・案内すべきかを日本語で短く書く。
 これは患者へそのまま送る文章ではない。必要な日時・メニュー・候補が足りない場合も、何を聞くべきかは会話の流れからあなたが決める。
 患者がすでに答えた項目を聞き直す指示や、定型的な挨拶・体調確認は書かない。
+直近の確定予約があり、患者が「ありがとう」「よろしく」など感謝・挨拶だけを送った場合は、
+intent=other、has_reservation_intent=false とし、予約を取り直さず自然に応じる。
+その感謝・挨拶が会話を自然に締めるだけの内容なら、reply_action=no_reply としてよい。
+新しい質問、予約希望、変更、取消、症状相談が少しでも含まれる場合は必ず reply_action=reply。
 ■文脈の引き継ぎ（重要）
 直前の会話で扱っていた話題は、次のメッセージでも続いているとみなす。省略された主語・目的語は直前の話題で補う。
 例: 直前が「8月の休診日は18日と25日です」なら、「9月は？」は9月の休診日を尋ねている（intent=question）。予約希望ではない。
@@ -397,6 +404,7 @@ def _normalize_result(parsed: dict, profile_name: str | None, previous: dict | N
     result["needs_human"] = bool(result.get("needs_human"))
     goal = result.get("conversation_goal")
     result["conversation_goal"] = str(goal).strip()[:240] if isinstance(goal, str) and goal.strip() else None
+    result["reply_action"] = result.get("reply_action") if result.get("reply_action") in {"reply", "no_reply"} else "reply"
     result["constraints"] = _mirror_fields_into_constraints(result)
     result["missing_fields"] = _compute_missing_fields(result)
     return result
@@ -409,6 +417,7 @@ async def parse_line_message(
     menu_names: list[str] | None = None,
     clinic_context: dict | None = None,
     recent_history: list | None = None,
+    conversation_state: dict | None = None,
 ) -> dict:
     """LINEメッセージを解析して予約意図を判定
 
@@ -425,6 +434,7 @@ async def parse_line_message(
                 menu_names=menu_names,
                 clinic_context=clinic_context,
                 recent_history=recent_history,
+                conversation_state=conversation_state,
             ),
             profile_name,
             previous,
@@ -524,6 +534,7 @@ async def _ai_parse(
     menu_names: list[str] | None = None,
     clinic_context: dict | None = None,
     recent_history: list | None = None,
+    conversation_state: dict | None = None,
 ) -> dict:
     """AI（Gemini）を使ったメッセージ解析"""
     from app.config import settings
@@ -548,6 +559,7 @@ async def _ai_parse(
                                      weekday=["月", "火", "水", "木", "金", "土", "日"][now_jst().weekday()],
                                      clinic_block=format_clinic_context_for_prompt(clinic_context or {}),
                                      history_block=_format_history_for_prompt(recent_history),
+                                     conversation_state=json.dumps(conversation_state or {}, ensure_ascii=False, default=str),
                                      menu_list="\n".join(f"- {name}" for name in menu_names or []) or "- 未登録",
                                  )}
                     ],

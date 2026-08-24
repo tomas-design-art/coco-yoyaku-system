@@ -631,14 +631,72 @@ async def test_autopilot_candidate_selection_books_directly_without_extra_confir
         "app.api.line.update_request", new=AsyncMock()
     ), patch("app.api.line.create_reservation", new=AsyncMock(return_value={"id": 555, "status": "CONFIRMED"})) as mock_create, patch(
         "app.api.line.clear_user_draft", new=AsyncMock()
-    ), patch("app.api.line.set_user_mode", new=AsyncMock()) as mock_set_mode, patch(
+    ), patch("app.api.line.remember_completed_booking", new=AsyncMock()) as mock_remember_completed, patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ) as mock_set_mode, patch(
         "app.api.line.reply_to_line", new=AsyncMock()
     ) as mock_reply:
         await _handle_text_message(event, db)
 
     mock_create.assert_awaited_once()
+    mock_remember_completed.assert_awaited_once()
     assert mock_set_mode.await_args.args[2] == "idle"
     assert mock_reply.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_autopilot_silently_closes_final_thanks_after_completed_booking():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot-close"},
+        "message": {"type": "text", "text": "ありがとうございます。よろしくお願いします"},
+    }
+    state = {
+        "mode": "idle",
+        "draft": {},
+        "request_id": None,
+        "context_data": {
+            "recent_completed_booking": {
+                "date": "2026/08/24",
+                "start": "16:30",
+                "end": "17:30",
+                "practitioner": "時田",
+            }
+        },
+    }
+    parsed = {
+        "intent": "other",
+        "has_reservation_intent": False,
+        "reply_action": "no_reply",
+        "needs_human": False,
+        "confidence": "high",
+        "constraints": [],
+    }
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state", new=AsyncMock(return_value=state)
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="idle")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.build_clinic_context", new=AsyncMock(return_value={})), patch(
+        "app.api.line.parse_line_message", new=AsyncMock(return_value=parsed)
+    ) as mock_parse, patch(
+        "app.api.line.clear_recent_completed_booking", new=AsyncMock()
+    ) as mock_clear_completed, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply, patch(
+        "app.api.line.create_reservation", new=AsyncMock()
+    ) as mock_create:
+        await _handle_text_message(event, AsyncMock())
+
+    mock_parse.assert_awaited_once()
+    assert mock_parse.await_args.kwargs["conversation_state"] == state["context_data"]["recent_completed_booking"]
+    mock_clear_completed.assert_awaited_once()
+    assert mock_clear_completed.await_args.args[1] == "U-autopilot-close"
+    mock_reply.assert_not_awaited()
+    mock_create.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -681,6 +739,8 @@ async def test_autopilot_candidate_time_selection_books_directly_without_extra_c
     ), patch("app.api.line.update_request", new=AsyncMock()), patch(
         "app.api.line.create_reservation", new=AsyncMock(return_value={"id": 556, "status": "CONFIRMED"})
     ) as mock_create, patch("app.api.line.clear_user_draft", new=AsyncMock()), patch(
+        "app.api.line.remember_completed_booking", new=AsyncMock()
+    ), patch(
         "app.api.line.set_user_mode", new=AsyncMock()
     ), patch("app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="ご予約を確定しました。")), patch(
         "app.api.line.reply_to_line", new=AsyncMock()
@@ -952,6 +1012,7 @@ def test_composer_rejects_booking_confirmation_when_cancellation_failed():
     from app.services.line_composer import _has_wrong_booking_outcome
 
     assert _has_wrong_booking_outcome("cancel_failed", "ご予約ありがとうございます。19:30にお待ちしております。") is True
+    assert _has_wrong_booking_outcome("cancel_failed", "19:30のご予約を承りました。当日はお気をつけてお越しください。") is True
     assert _has_wrong_booking_outcome("cancel_failed", "キャンセル処理を完了できませんでした。") is False
 
 
@@ -1705,6 +1766,7 @@ async def test_autopilot_full_natural_message_books_without_buttons():
         stack.enter_context(patch("app.api.line.update_request", new=AsyncMock()))
         mock_create = stack.enter_context(patch("app.api.line.create_reservation", new=AsyncMock(return_value={"id": 777, "status": "CONFIRMED"})))
         stack.enter_context(patch("app.api.line.clear_user_draft", new=AsyncMock()))
+        stack.enter_context(patch("app.api.line.remember_completed_booking", new=AsyncMock()))
         stack.enter_context(patch("app.api.line.set_user_mode", new=AsyncMock()))
         stack.enter_context(patch("app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="ご予約を承りました。")))
         mock_reply = stack.enter_context(patch("app.api.line.reply_to_line", new=AsyncMock()))
@@ -2467,6 +2529,33 @@ def test_parser_preserves_gemini_conversation_goal_for_the_reply_agent():
     )
 
     assert parsed["conversation_goal"] == "今日の空き時間を尋ねているので、メニューが分かればその日の候補を案内する。"
+
+
+def test_parser_prompt_includes_completed_booking_context_for_thanks():
+    from app.agents.line_parser import LINE_PARSE_PROMPT
+
+    assert "直近の確定予約" in LINE_PARSE_PROMPT
+    assert "感謝・挨拶だけ" in LINE_PARSE_PROMPT
+    assert "reply_action" in LINE_PARSE_PROMPT
+
+
+def test_parser_preserves_gemini_no_reply_for_completed_booking_thanks():
+    from app.agents.line_parser import _normalize_result
+
+    parsed = _normalize_result(
+        {
+            "intent": "other",
+            "has_reservation_intent": False,
+            "constraints": [],
+            "reply_action": "no_reply",
+        },
+        profile_name=None,
+        previous={},
+    )
+
+    assert parsed["reply_action"] == "no_reply"
+    assert parsed["intent"] == "other"
+    assert parsed["has_reservation_intent"] is False
 
 
 @pytest.mark.asyncio
