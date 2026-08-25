@@ -2173,23 +2173,6 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     if is_autopilot_patient and current_mode == "autopilot_cancel_confirm":
         reservation_id = prev_draft.get("autopilot_cancel_reservation_id")
         if _is_affirmative(text) and reservation_id:
-            # 取消を実行する前に対象の日時を控える。
-            # これを渡さないと cancel_done は「確定事実ゼロ」のまま厳格検算にかかり、
-            # 正しい日時を書いた返信まで捏造扱いで棄却されテンプレへ落ちる。
-            cancelled_slot: dict = {}
-            try:
-                target = await db.get(Reservation, int(reservation_id))
-                if target is not None and target.start_time and target.end_time:
-                    cancelled_slot = {
-                        "date": target.start_time.astimezone(JST).strftime("%Y/%m/%d"),
-                        "start": target.start_time.astimezone(JST).strftime("%H:%M"),
-                        "end": target.end_time.astimezone(JST).strftime("%H:%M"),
-                    }
-            except Exception as error:  # 事実の取得失敗で取消処理自体は止めない
-                logger.warning(
-                    "cancelled slot lookup failed: reservation_id=%s %s", reservation_id, error
-                )
-
             try:
                 await transition_status(db, int(reservation_id), "CANCELLED")
                 await db.commit()
@@ -2220,7 +2203,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     reply_token,
                     await _compose_autopilot_reply(
                         "cancel_done",
-                        {**cancelled_slot, "patient_message": text},
+                        {"patient_message": text},
                         parsed_intent,
                     ),
                 )
