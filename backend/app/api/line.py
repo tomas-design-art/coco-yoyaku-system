@@ -705,21 +705,6 @@ def _requires_manual_autopilot_handling(text: str) -> bool:
     return any(word in (text or "") for word in ("遅刻", "遅れ", "相談", "問合せ", "問い合わせ"))
 
 
-# 患者が「日」を自分の言葉で指定したか（時刻だけの発言と区別する）。
-# 候補提示後に「17時ならどお？」と言われたとき、話している日を勝手に変えないために使う。
-_EXPLICIT_DATE_PATTERN = re.compile(
-    r"今日|本日|明日|明後日|あさって|しあさって|明々後日|"
-    r"今週|来週|再来週|今月|来月|月末|"
-    r"[月火水木金土日]曜|"
-    r"\d{1,2}\s*[月/]\s*\d{1,2}|\d{4}-\d{1,2}-\d{1,2}"
-)
-
-
-def _mentions_explicit_date(text: str) -> bool:
-    """本文に日付の指定が含まれるか。時刻だけの発言では False。"""
-    return bool(_EXPLICIT_DATE_PATTERN.search(text or ""))
-
-
 def _requires_human_priority(parsed: dict, text: str) -> bool:
     """事実照会より人の対応を優先すべき緊急・苦情を判定する。"""
     constraints = parsed.get("constraints") or []
@@ -1463,15 +1448,10 @@ async def _reoffer_autopilot_candidates(
 
     offered = draft.get("autopilot_offered_slots") or []
     offered_date = _parse_iso_date(offered[0].get("date") if offered else None)
-    # 候補を出した後の「もっと遅く」「17時なら？」は“いま話している日”の中での要望。
+    # 「もっと早く/もっと遅く」は“いま話している日”の中での要望。
     # 患者が別の日を明言していない限り、提示済み候補の日を動かさない。
-    # 判定を解析結果の date に頼ると、時刻だけ言われた際にLLMが今日を補い、
-    # 話していた日（例:8/31）が今日（例:8/26）へ飛ぶ事故になる。本文で判定する。
-    if offered_date and (
-        merged_filters.earlier
-        or merged_filters.later
-        or not _mentions_explicit_date(text)
-    ):
+    # （ここを解析結果まかせにすると、履歴に残った別の日付へ勝手に飛ぶ）
+    if (merged_filters.earlier or merged_filters.later) and offered_date:
         target_date = offered_date
     else:
         target_date = (
