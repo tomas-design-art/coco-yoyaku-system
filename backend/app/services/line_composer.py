@@ -25,7 +25,12 @@ SITUATION_GUIDES = {
     "ask_missing": "不足項目だけを責めずに尋ねる。複数ある場合も確定事実の項目名を使う。",
     "ask_menu": "予約に必要なメニュー選択を簡潔に促す。",
     "confirmed": "予約が確定したことと、確定した日時・担当・メニューを伝えて来院を歓迎する。",
-    "cancel_done": "指定された予約のキャンセル完了を事実だけで伝える。",
+    "cancel_done": (
+        "指定された予約のキャンセルが完了したことを事実だけで伝える。"
+        "『ご予約を承りました』のように予約が成立したと読める書き方は絶対にしない"
+        "（取り消したことが患者に伝わらなければ誤案内になる）。"
+        "必ず『キャンセル』の語を用いて完了を明示する。"
+    ),
     "cancel_confirm": "対象予約の日時を示し、本当にキャンセルしてよいか、はい/いいえで確認する。",
     "change_done": "予約変更の完了と、変更後の日時・担当を伝える。",
     "slot_taken": "候補が直前に埋まったことを詫び、別候補または別日時の選択を促す。",
@@ -392,6 +397,14 @@ def _has_premature_confirmation(situation: str, reply: str) -> bool:
     return situation == "offer_alternatives" and any(word in reply for word in _PREMATURE_CONFIRMATION_WORDS)
 
 
+# 「ご予約、承りました」「ご予約を承りました」のような予約成立の宣言。
+# 読点や助詞の有無で取りこぼさないよう正規表現で判定する。
+_BOOKING_ACCEPTED_PATTERN = re.compile(
+    r"ご?予約[、,]?\s*(?:を|は)?\s*(?:承りました|お取りしました|お取りいたしました|確定(?:しました|いたしました))"
+)
+_CANCELLATION_WORDS = ("キャンセル", "取消", "取り消")
+
+
 def _has_wrong_booking_outcome(situation: str, reply: str) -> bool:
     """DB処理結果と逆の予約完了・取消完了を患者へ伝えていないか。"""
     booking_claims = ("ご予約ありがとうございます", "ご予約を確定", "ご予約を承りました", "予約をお取り", "お待ちしております")
@@ -400,6 +413,13 @@ def _has_wrong_booking_outcome(situation: str, reply: str) -> bool:
         return any(claim in reply for claim in booking_claims)
     if situation == "cancel_aborted":
         return any(claim in reply for claim in cancellation_claims)
+    if situation == "cancel_done":
+        # 取消を伝える場面で予約成立と読める文を送らない。
+        # 「8月31日16:15からのご予約、承りました」を患者へ送った事故があった。
+        if _BOOKING_ACCEPTED_PATTERN.search(reply):
+            return True
+        # 取消に一言も触れない返信も、完了が伝わらないため不可。
+        return not any(word in reply for word in _CANCELLATION_WORDS)
     return False
 
 
