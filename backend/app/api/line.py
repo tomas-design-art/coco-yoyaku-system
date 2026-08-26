@@ -49,6 +49,7 @@ from app.services.line_negotiation import SlotFilters, build_slot_filters
 from app.services.slot_scorer import (
     build_candidates_over_days,
     build_same_day_candidates,
+    build_day_availability_summary,
     find_best_practitioner,
     score_candidates,
 )
@@ -1646,6 +1647,11 @@ async def _reoffer_autopilot_candidates(
                         "menu": draft.get("menu_name"),
                         "duration_minutes": search_duration,
                         "next_open_dates": await next_open_dates(db, target_date),
+                        # 条件に合う枠が無くても、その日に何が空いているかは伝えられる。
+                        # 「空きがありません」だけ返すと、患者にはその日が全滅に読める。
+                        "day_availability": await build_day_availability_summary(
+                            db, target_date, search_duration
+                        ),
                         "patient_message": text,
                     },
                     parsed_intent,
@@ -1708,6 +1714,9 @@ async def _reoffer_autopilot_candidates(
                     "duration_minutes": search_duration,
                     "duration_shortened": search_duration < base_duration,
                     "standard_duration_minutes": base_duration,
+                    "day_availability": await build_day_availability_summary(
+                        db, target_date, search_duration
+                    ),
                     "patient_message": text,
                     # 同日で見つからず別日へ広げた場合は、それを必ず伝えさせる。
                     # 黙って別日の候補を出すと「勝手に日付が変わった」と受け取られる。
@@ -3140,6 +3149,8 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 if merged.get("date") and not merged.get("time"):
                     situation = "ask_time_for_date"
                     candidates: list[dict] = []
+                    # 日付の解決に失敗しても context.update で参照するため先に初期化する。
+                    day_availability: dict = {}
                     date_label = str(merged.get("date"))
                     try:
                         target_date = date.fromisoformat(str(merged["date"]))
@@ -3157,6 +3168,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                             max_results=3,
                         )
                         candidates = [candidate.to_dict() for candidate in scored]
+                        day_availability = await build_day_availability_summary(
+                            db, target_date, duration_for_candidates
+                        )
                         await merge_user_draft(
                             db,
                             user_id,
@@ -3173,6 +3187,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         {
                             "date": date_label,
                             "available_candidates": candidates,
+                            # 候補だけ渡すと列挙以外の応対ができない。
+                            # その日の空き全体を渡し、提示するか希望時間帯を尋ねるかを選ばせる。
+                            "day_availability": day_availability,
                         }
                     )
                 elif merged.get("time") and not merged.get("date"):

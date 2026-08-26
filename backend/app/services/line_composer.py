@@ -46,6 +46,8 @@ SITUATION_GUIDES = {
     "price_to_staff": "料金は金額を一切述べず、スタッフから案内すると伝える。",
     "no_candidates": (
         "ご希望の条件では空きがなかったことを伝え、別の日や時間帯を提案して次の選択肢を示す。黙って終わらせない。"
+        "day_availability にその日の空きが残っている場合は、先にそれを具体的に伝えてから別日を出す。"
+        "その日が全滅であるかのように書かない。"
         "空きが無いことを『不在』『お休み』と言い換えない（確定事実に休みの記載がある場合のみ休みと述べる）。"
     ),
     "closed_day": "希望された日が休診日であることを正しく伝える。『予約がいっぱい』『満席』とは絶対に言い換えない。診療している直近の日を示して希望を尋ねる。",
@@ -357,6 +359,10 @@ def _asserts_unsupported_absence(context: dict, reply: str) -> bool:
         return False
     if context.get("is_working") is False or context.get("practitioner_off") is True:
         return False
+    # その日の空き全体像に「出勤していない施術者」が含まれていれば、休みと述べてよい。
+    for entry in (context.get("day_availability") or {}).get("practitioners") or []:
+        if isinstance(entry, dict) and entry.get("working") is False:
+            return False
     clinic = context.get("clinic") or {}
     for practitioner in clinic.get("practitioners") or []:
         if practitioner.get("off_days") or practitioner.get("unavailable_times"):
@@ -479,6 +485,18 @@ async def compose_reply(situation: str, context: dict) -> str:
                 "- 患者がこれと違う希望を述べたら、そちらを優先する。\n"
                 "- first_visit が真なら初めての患者。初回はカウンセリングを含め60分ほどいただくことを自然に伝える。\n"
             )
+        # その日の空き全体像を渡した場合だけ、その読み方を指示する。
+        availability_block = ""
+        if context.get("day_availability"):
+            availability_block = (
+                "\n【その日の空き(day_availability)の使い方】\n"
+                "- open_blocks はその施術者が実際に空いている時間帯。ここから案内してよい。\n"
+                "- 候補を並べても、希望の時間帯を尋ねてもよい。会話の流れで自然な方を選ぶ。"
+                "全部をこちらから提示しようとしない。\n"
+                "- working が偽の施術者は出勤していない。空きが無いこととは区別して伝える。\n"
+                "- shorter_than_requested は希望の施術時間に満たない空き。"
+                "患者が「短くてもよい」と述べた場合にだけ触れる。こちらから短縮を勧めない。\n"
+            )
         facts = {
             key: value
             for key, value in context.items()
@@ -518,7 +536,7 @@ async def compose_reply(situation: str, context: dict) -> str:
 【院の確定情報】
 {clinic_block}
 
-{assumed_block}
+{assumed_block}{availability_block}
 【状況】{situation}: {situation_guide}
 【直近の会話】{json.dumps(recent_history, ensure_ascii=False, default=str)}
 【確定事実(JSON)】{json.dumps(facts, ensure_ascii=False, default=str)}

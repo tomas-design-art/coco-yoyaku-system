@@ -279,3 +279,55 @@ async def test_build_same_day_candidates_skips_short_gaps(monkeypatch):
         start = candidate.start_time.hour * 60 + candidate.start_time.minute
         end = candidate.end_time.hour * 60 + candidate.end_time.minute
         assert end - start == 60
+
+@pytest.mark.asyncio
+async def test_build_day_availability_summary_reports_whole_day(monkeypatch):
+    """候補だけでなく『その日どこがどう空いているか』を事実として返す。"""
+    ueda = SimpleNamespace(id=1, name="上田", role="施術者", display_order=1)
+    tokita = SimpleNamespace(id=2, name="時田", role="施術者", display_order=2)
+
+    # 上田は非番。時田は 13:30〜14:00 の30分と 16:00〜21:00 が空き。
+    day_infos = [
+        slot_scorer._DayInfo(ueda, False),
+        slot_scorer._DayInfo(tokita, True, [(600, 810), (840, 960)], [], 600, 1260),
+    ]
+    db, fake_bh, fake_load = _make_candidate_db(day_infos)
+    monkeypatch.setattr(slot_scorer, "get_business_hours_for_date", fake_bh)
+    monkeypatch.setattr(slot_scorer, "_load_day_infos", fake_load)
+
+    summary = await slot_scorer.build_day_availability_summary(db, date(2026, 8, 31), 60)
+
+    by_name = {entry["practitioner"]: entry for entry in summary["practitioners"]}
+    # 出勤していない事実は「空きが無い」と区別して渡す
+    assert by_name["上田"]["working"] is False
+    # 施術時間が収まる空きだけ open_blocks に入る
+    assert by_name["時田"]["open_blocks"] == ["16:00〜21:00"]
+    # 施術時間に満たない空きは別枠。こちらから短縮を勧めさせないため。
+    assert by_name["時田"]["shorter_than_requested"] == ["13:30〜14:00(30分)"]
+    assert summary["requested_duration_minutes"] == 60
+    assert summary["business_hours"] == "10:00〜21:00"
+
+
+@pytest.mark.asyncio
+async def test_build_day_availability_summary_marks_closed_day(monkeypatch):
+    """休診日は空き無しではなく休診として返す。"""
+    tokita = SimpleNamespace(id=2, name="時田", role="施術者", display_order=2)
+    day_infos = [slot_scorer._DayInfo(tokita, True, [], [], 600, 1260)]
+    db, _fake_bh, fake_load = _make_candidate_db(day_infos)
+
+    class _Closed:
+        is_open = False
+
+        @staticmethod
+        def to_minutes():
+            return 0, 0
+
+    async def closed_bh(_db, _d):
+        return _Closed()
+
+    monkeypatch.setattr(slot_scorer, "get_business_hours_for_date", closed_bh)
+    monkeypatch.setattr(slot_scorer, "_load_day_infos", fake_load)
+
+    summary = await slot_scorer.build_day_availability_summary(db, date(2026, 9, 1), 60)
+    assert summary["closed"] is True
+    assert summary["practitioners"] == []

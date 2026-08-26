@@ -1640,7 +1640,7 @@ async def test_autopilot_waiting_menu_uses_usual_and_date_without_button():
         new=AsyncMock(return_value={"menu_id": 5, "menu_name": menu.name, "duration_minutes": 60, "practitioner_id": 3, "practitioner_name": "時田"}),
     ), patch("app.api.line.merge_user_draft", new=AsyncMock(return_value=merged_draft)) as mock_merge, patch(
         "app.api.line._resolve_menu", new=AsyncMock(return_value=menu)
-    ), patch("app.api.line.build_same_day_candidates", new=AsyncMock(return_value=[])), patch(
+    ), patch("app.api.line.build_day_availability_summary", new=AsyncMock(return_value={})), patch("app.api.line.build_same_day_candidates", new=AsyncMock(return_value=[])), patch(
         "app.api.line.set_user_mode", new=AsyncMock()
     ), patch(
         "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="8/16ですね。何時ごろがよろしいですか？")
@@ -1675,7 +1675,7 @@ async def test_autopilot_waiting_datetime_acknowledges_date_and_offers_times():
         new=AsyncMock(return_value={"intent": "new", "has_reservation_intent": True, "date": "2026-08-16", "time": None, "menu_name": menu.name, "confidence": "high", "constraints": []}),
     ), patch("app.api.line._resolve_menu", new=AsyncMock(return_value=menu)), patch(
         "app.api.line.merge_user_draft", new=AsyncMock(return_value=merged)
-    ), patch("app.api.line.build_same_day_candidates", new=AsyncMock(return_value=[candidate])), patch(
+    ), patch("app.api.line.build_day_availability_summary", new=AsyncMock(return_value={})), patch("app.api.line.build_same_day_candidates", new=AsyncMock(return_value=[candidate])), patch(
         "app.api.line.set_user_mode", new=AsyncMock()
     ), patch(
         "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="8/16ですね。10:00はいかがでしょうか？")
@@ -2062,6 +2062,7 @@ async def test_autopilot_negotiation_reoffers_earlier_shorter_slot_without_hando
         stack.enter_context(patch("app.api.line.merge_debounced_message", return_value=event["message"]["text"]))
         stack.enter_context(patch("app.api.line.parse_line_message", new=AsyncMock(return_value=parsed)))
         stack.enter_context(patch("app.api.line._resolve_menu", new=AsyncMock(return_value=menu)))
+        stack.enter_context(patch("app.api.line.build_day_availability_summary", new=AsyncMock(return_value={})))
         search = stack.enter_context(patch("app.api.line.build_candidates_over_days", new=AsyncMock(return_value=[earlier_slot])))
         stack.enter_context(patch("app.api.line.create_pending_request", new=AsyncMock(return_value="rid-negotiation")))
         stack.enter_context(patch("app.api.line.merge_user_draft", new=AsyncMock(return_value=draft)))
@@ -2564,7 +2565,7 @@ async def test_later_request_does_not_expand_to_other_dates_when_same_day_is_ful
     from app.services.line_negotiation import SlotFilters
 
     db = AsyncMock()
-    with patch("app.api.line.build_candidates_over_days", new=AsyncMock(return_value=[])) as mock_search:
+    with patch("app.api.line.build_day_availability_summary", new=AsyncMock(return_value={})), patch("app.api.line.build_candidates_over_days", new=AsyncMock(return_value=[])) as mock_search:
         candidates = await _search_negotiated_candidates(
             db,
             target_date=date(2026, 8, 24),

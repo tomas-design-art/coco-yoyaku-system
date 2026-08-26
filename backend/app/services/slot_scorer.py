@@ -614,3 +614,80 @@ async def build_candidates_over_days(
             break
 
     return results[:max_results]
+
+
+def _format_minutes(value: int) -> str:
+    return f"{value // 60:02d}:{value % 60:02d}"
+
+
+async def build_day_availability_summary(
+    db: AsyncSession,
+    target_date: date,
+    duration_minutes: int,
+    *,
+    window_start_min: int | None = None,
+    window_end_min: int | None = None,
+    min_short_gap_minutes: int = 20,
+) -> dict:
+    """その日の空き全体像を返す。
+
+    候補を数件渡すだけだと、LLMは「他にどこが空いているか」を知らないため
+    列挙する以外の応対ができない（「夕方も広く空いております」も
+    「ご希望の時間帯はありますか」も、言うための材料が無い）。
+    提示するか尋ねるかをLLMが選べるよう、その日の空きを確定事実として渡す。
+    """
+    prac_q = await db.execute(
+        select(Practitioner)
+        .where(Practitioner.is_active == True)
+        .order_by(Practitioner.display_order)
+    )
+    practitioners = list(prac_q.scalars().all())
+    if not practitioners:
+        return {"date": target_date.isoformat(), "practitioners": []}
+
+    bh = await get_business_hours_for_date(db, target_date)
+    if not bh.is_open:
+        return {"date": target_date.isoformat(), "closed": True, "practitioners": []}
+    bh_start, bh_end = bh.to_minutes()
+
+    ws = bh_start if window_start_min is None else max(window_start_min, bh_start)
+    we = bh_end if window_end_min is None else min(window_end_min, bh_end)
+    if ws >= we:
+        ws, we = bh_start, bh_end
+
+    day_infos = await _load_day_infos(db, target_date, practitioners)
+    summary: list[dict] = []
+    for info in day_infos:
+        if not info.is_working:
+            # 出勤していない事実も渡す。「満席」と「不在」を取り違えさせないため。
+            summary.append({"practitioner": info.practitioner.name, "working": False})
+            continue
+        open_blocks: list[str] = []
+        short_blocks: list[str] = []
+        for start, end in _free_blocks(info, ws, we):
+            length = end - start
+            label = f"{_format_minutes(start)}〜{_format_minutes(end)}"
+            if length >= duration_minutes:
+                open_blocks.append(label)
+            elif length >= min_short_gap_minutes:
+                short_blocks.append(f"{label}({length}分)")
+        summary.append(
+            {
+                "practitioner": info.practitioner.name,
+                "working": True,
+                "working_hours": (
+                    f"{_format_minutes(info.work_start)}〜{_format_minutes(info.work_end)}"
+                    if info.work_start is not None and info.work_end is not None
+                    else f"{_format_minutes(bh_start)}〜{_format_minutes(bh_end)}"
+                ),
+                "open_blocks": open_blocks,
+                "shorter_than_requested": short_blocks,
+            }
+        )
+
+    return {
+        "date": target_date.isoformat(),
+        "business_hours": f"{_format_minutes(bh_start)}〜{_format_minutes(bh_end)}",
+        "requested_duration_minutes": duration_minutes,
+        "practitioners": summary,
+    }
