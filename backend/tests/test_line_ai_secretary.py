@@ -878,7 +878,7 @@ async def test_autopilot_cancel_failure_replies_and_keeps_confirmation_active():
     }
     db = AsyncMock()
 
-    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+    with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch("app.api.line._resolve_booking_defaults", new=AsyncMock(return_value={})), patch("app.api.line.settings.line_autopilot_enabled", True), patch(
         "app.api.line.get_user_state",
         new=AsyncMock(return_value={"mode": "autopilot_cancel_confirm", "draft": {"autopilot_cancel_reservation_id": 91}, "request_id": None}),
     ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="autopilot_cancel_confirm")), patch(
@@ -1138,7 +1138,7 @@ async def test_autopilot_natural_booking_message_restarts_from_manual_mode():
     }
     db = AsyncMock()
 
-    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+    with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch("app.api.line._resolve_booking_defaults", new=AsyncMock(return_value={})), patch("app.api.line.settings.line_autopilot_enabled", True), patch(
         "app.api.line.get_user_state", new=AsyncMock(return_value={"mode": "manual", "draft": {}, "request_id": None})
     ), patch("app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")), patch(
         "app.api.line._find_line_patient", new=AsyncMock(return_value=patient)
@@ -1626,7 +1626,7 @@ async def test_autopilot_waiting_menu_uses_usual_and_date_without_button():
         "date": "2026-08-16",
         "parse_confidence": "high",
     }
-    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+    with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch("app.api.line._resolve_booking_defaults", new=AsyncMock(return_value={})), patch("app.api.line.settings.line_autopilot_enabled", True), patch(
         "app.api.line.get_user_state", new=AsyncMock(return_value={"mode": "waiting_menu", "draft": {}, "request_id": None})
     ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="waiting_menu")), patch(
         "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
@@ -1664,7 +1664,7 @@ async def test_autopilot_waiting_datetime_acknowledges_date_and_offers_times():
     event = {"replyToken": "reply-token", "source": {"userId": "U-autopilot"}, "message": {"type": "text", "text": "明日！"}}
     draft = {"menu_id": 5, "menu_name": menu.name, "duration_minutes": 60}
     merged = {**draft, "date": "2026-08-16", "parse_confidence": "high"}
-    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+    with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch("app.api.line._resolve_booking_defaults", new=AsyncMock(return_value={})), patch("app.api.line.settings.line_autopilot_enabled", True), patch(
         "app.api.line.get_user_state", new=AsyncMock(return_value={"mode": "waiting_datetime", "draft": draft, "request_id": None})
     ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="waiting_datetime")), patch(
         "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
@@ -1693,7 +1693,7 @@ async def test_autopilot_usual_button_still_fills_slots():
 
     patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
     preset = {"menu_id": 5, "menu_name": "マッスルセラピー", "duration_minutes": 60, "practitioner_id": 3, "practitioner_name": "時田"}
-    with patch("app.api.line._get_patient_default_preset", new=AsyncMock(return_value=preset)), patch(
+    with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch("app.api.line._get_patient_default_preset", new=AsyncMock(return_value=preset)), patch(
         "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)
     ):
         merged = await _merge_autopilot_slots(
@@ -2670,3 +2670,126 @@ def test_no_slots_must_not_be_reported_as_practitioner_absence():
     # 実際に休みの事実があるときは「お休み」と伝えてよい
     real_off = {"practitioner": "時田", "off_days": ["8/20(木)"], "has_days_off": True}
     assert _has_unsupported_claim(real_off, "時田は8/20(木)にお休みをいただいております。") is False
+
+
+# ── 登録情報からの既定値補完（「いつもの」を押さなくても同じ前提で探す） ──
+
+
+def _fake_db_returning_director(director):
+    class _Scalars:
+        def first(self_inner):
+            return director
+
+        def all(self_inner):
+            return [director]
+
+    class _Result:
+        def scalars(self_inner):
+            return _Scalars()
+
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=_Result())
+    return db
+
+
+@pytest.mark.asyncio
+async def test_autopilot_uses_registered_preset_without_usual_button():
+    """「いつもの」を押さなくても、スタッフが設定した既定メニュー・既定担当で探す。"""
+    from app.api.line import _merge_autopilot_slots
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    preset = {
+        "menu_id": 5,
+        "menu_name": "マッスルセラピー",
+        "duration_minutes": 60,
+        "practitioner_id": 3,
+        "practitioner_name": "時田",
+    }
+    with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
+        "app.api.line._get_patient_default_preset", new=AsyncMock(return_value=preset)
+    ), patch("app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)):
+        merged = await _merge_autopilot_slots(
+            AsyncMock(),
+            user_id="U-autopilot",
+            text="来週の月曜日は空いてますか？",
+            patient=patient,
+            previous={},
+            parsed={"intent": "new", "date": "2026-08-31", "time": None, "confidence": "high", "constraints": []},
+        )
+
+    assert merged["menu_name"] == "マッスルセラピー"
+    assert merged["duration_minutes"] == 60
+    # 担当が入るので候補生成が「その担当の枠を時間帯で散らす」経路に乗る
+    assert merged["practitioner_id"] == 3
+    # 患者が述べた条件ではないので、返信では確認させる
+    assert merged["assumed_menu"] == "マッスルセラピー"
+    assert merged["assumed_practitioner"] == "時田"
+
+
+@pytest.mark.asyncio
+async def test_autopilot_first_visit_defaults_to_60min_and_director():
+    """完全初回はHP経由の新規獲得と同じ扱い（60分・院長優先）。"""
+    from app.api.line import _merge_autopilot_slots
+
+    patient = SimpleNamespace(id=8, name="初診 太郎", line_autopilot_enabled=True)
+    director = SimpleNamespace(id=9, name="時田", role="院長", display_order=1)
+    with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
+        "app.api.line._get_patient_default_preset", new=AsyncMock(return_value=None)
+    ), patch("app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)), patch(
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)
+    ):
+        merged = await _merge_autopilot_slots(
+            _fake_db_returning_director(director),
+            user_id="U-first",
+            text="今日の夜って行けますか？",
+            patient=patient,
+            previous={},
+            parsed={"intent": "new", "date": None, "time": None, "confidence": "high", "constraints": []},
+        )
+
+    assert merged["duration_minutes"] == 60
+    assert merged["first_visit"] is True
+    assert merged["practitioner_id"] == 9
+    assert merged["assumed_duration"] == 60
+
+
+@pytest.mark.asyncio
+async def test_autopilot_explicit_practitioner_request_beats_registered_default():
+    """本人が担当を指名したら、登録上の既定担当より本人の希望を優先する。"""
+    from app.api.line import _merge_autopilot_slots
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    preset = {
+        "menu_id": 5,
+        "menu_name": "マッスルセラピー",
+        "duration_minutes": 60,
+        "practitioner_id": 3,
+        "practitioner_name": "時田",
+    }
+    requested = SimpleNamespace(id=4, name="上田 花子")
+    with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=requested)), patch(
+        "app.api.line._get_patient_default_preset", new=AsyncMock(return_value=preset)
+    ), patch("app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)):
+        merged = await _merge_autopilot_slots(
+            AsyncMock(),
+            user_id="U-autopilot",
+            text="来週の月曜、上田先生でお願いします",
+            patient=patient,
+            previous={},
+            parsed={"intent": "new", "date": "2026-08-31", "time": None, "confidence": "high", "constraints": []},
+        )
+
+    assert merged["practitioner_id"] == 4
+    # 本人が述べた担当なので確認扱いにしない
+    assert merged["assumed_practitioner"] is False
+
+
+def test_assumed_booking_defaults_detected():
+    """推定値が混ざっている間は確認なしの即時確定をさせない。"""
+    from app.api.line import _has_assumed_booking_defaults
+
+    assert _has_assumed_booking_defaults({"assumed_menu": "マッスルセラピー"}) is True
+    assert _has_assumed_booking_defaults({"assumed_practitioner": "時田"}) is True
+    assert _has_assumed_booking_defaults({"assumed_duration": 60}) is True
+    assert _has_assumed_booking_defaults({"menu_name": "マッスルセラピー", "assumed_practitioner": False}) is False
+    assert _has_assumed_booking_defaults({}) is False

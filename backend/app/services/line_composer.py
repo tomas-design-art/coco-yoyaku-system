@@ -465,6 +465,20 @@ async def compose_reply(situation: str, context: dict) -> str:
         from app.services.clinic_context import format_clinic_context_for_prompt
 
         clinic_block = format_clinic_context_for_prompt(context.get("clinic") or {})
+        # 登録情報から補った条件がある場合だけ、その扱いを指示する。
+        # 常時プロンプトへ入れると、取消・引き継ぎなど無関係な場面の文面まで揺れる。
+        assumed_keys = ("assumed_menu", "assumed_practitioner", "assumed_duration", "first_visit")
+        assumed_block = ""
+        if any(context.get(key) for key in assumed_keys):
+            assumed_block = (
+                "\n【この返信で気をつけること】\n"
+                "- assumed_menu / assumed_practitioner / assumed_duration は患者が今回述べた条件ではない。"
+                "当院の登録情報（いつものメニュー・担当、初回の目安）から補ったもの。\n"
+                "- これらを使って探すときは「いつもの◯◯（担当◯◯・◯分）でお探ししますね」のように"
+                "ひと言添えて確認する。決まったことのように書かない。\n"
+                "- 患者がこれと違う希望を述べたら、そちらを優先する。\n"
+                "- first_visit が真なら初めての患者。初回はカウンセリングを含め60分ほどいただくことを自然に伝える。\n"
+            )
         facts = {
             key: value
             for key, value in context.items()
@@ -504,6 +518,7 @@ async def compose_reply(situation: str, context: dict) -> str:
 【院の確定情報】
 {clinic_block}
 
+{assumed_block}
 【状況】{situation}: {situation_guide}
 【直近の会話】{json.dumps(recent_history, ensure_ascii=False, default=str)}
 【確定事実(JSON)】{json.dumps(facts, ensure_ascii=False, default=str)}

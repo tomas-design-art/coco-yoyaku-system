@@ -93,6 +93,22 @@ _AUTOPILOT_CLINIC_CONTEXT: ContextVar[dict] = ContextVar("autopilot_clinic", def
 router = APIRouter(prefix="/api/line", tags=["line"])
 
 AUTOPILOT_SETUP_KEYWORD = "#autopilot-setup"
+# 初回来院はカウンセリングを含めて60分。HP経由の新規獲得と同じ扱いに揃える。
+FIRST_VISIT_DURATION_MINUTES = 60
+
+# 登録情報から補った条件(assumed_*)を事実として渡してよい場面。
+# 予約条件を組み立てている場面に限る（取消・質問の返信に混ぜると話が飛ぶ）。
+_ASSUMED_DEFAULT_SITUATIONS = {
+    "ask_datetime",
+    "ask_time_for_date",
+    "ask_date_for_time",
+    "ask_missing",
+    "offer_alternatives",
+    "confirm_slot",
+    "no_candidates",
+    "usual_confirm",
+    "usual_accepted",
+}
 _AUTOPILOT_SETUP_MODES = {
     "autopilot_setup_name_phone",
     "autopilot_setup_reading_birth",
@@ -371,6 +387,85 @@ async def _get_patient_default_preset(db: AsyncSession, patient: Patient | None)
         "practitioner_id": practitioner_id,
         "practitioner_name": practitioner_name,
     }
+
+
+async def _resolve_booking_defaults(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    patient: Patient | None,
+) -> dict:
+    """患者が指定しなかった条件を、当院の登録情報から補う。
+
+    受付が台帳を見て「いつもの時田先生・60分でお探ししますね」と言えるのと同じ。
+    「いつもの」ボタンを押さない患者にも同じ前提で探せるようにする。
+    ここで入る値は患者が今回述べたものではないため assumed_* を立て、
+    返信では断言させず必ず確認させる（プロンプト側で扱う）。
+    """
+    defaults: dict = {}
+
+    preset = await _get_patient_default_preset(db, patient)
+    if preset:
+        defaults.update(
+            {
+                "menu_id": preset["menu_id"],
+                "menu_name": preset["menu_name"],
+                "duration_minutes": preset["duration_minutes"],
+                "assumed_menu": preset["menu_name"],
+            }
+        )
+        if preset.get("practitioner_id"):
+            defaults.update(
+                {
+                    "practitioner_id": preset["practitioner_id"],
+                    "practitioner_name": preset["practitioner_name"],
+                    "assumed_practitioner": preset["practitioner_name"],
+                }
+            )
+    else:
+        latest = await _get_latest_reservation_for_line_user(db, user_id)
+        if latest:
+            defaults.update(
+                {
+                    "menu_id": latest.get("menu_id"),
+                    "menu_name": latest["menu_name"],
+                    "duration_minutes": latest["duration_minutes"],
+                    "assumed_menu": latest["menu_name"],
+                }
+            )
+
+    if not defaults.get("duration_minutes"):
+        # 完全初回はHP経由の新規獲得と同じ扱い（院長優先＋60分）。
+        # 担当未設定のリピーターまで院長へ寄せると既存の割当が変わるため、
+        # 院長を既定にするのは初回のときだけに限る。
+        defaults["duration_minutes"] = FIRST_VISIT_DURATION_MINUTES
+        defaults["assumed_duration"] = FIRST_VISIT_DURATION_MINUTES
+        defaults["first_visit"] = True
+        director = (
+            await db.execute(
+                select(Practitioner)
+                .where(Practitioner.is_active == True, Practitioner.role == "院長")
+                .order_by(Practitioner.display_order)
+            )
+        ).scalars().first()
+        if director:
+            defaults.update(
+                {
+                    "practitioner_id": director.id,
+                    "practitioner_name": director.name,
+                    "assumed_practitioner": director.name,
+                }
+            )
+
+    return defaults
+
+
+def _has_assumed_booking_defaults(draft: dict) -> bool:
+    """患者が述べていない条件（登録情報からの推定）が混ざっているか。
+
+    混ざっているうちは確認なしで予約を確定させない。
+    """
+    return any(draft.get(key) for key in ("assumed_menu", "assumed_practitioner", "assumed_duration"))
 
 
 async def _build_menu_quick_reply_items(
@@ -873,6 +968,13 @@ async def _compose_autopilot_reply(
         state = await get_user_state(db, user_id)
         history = state.get("context_data", {}).get("conversation_history") or []
         enriched_context["recent_history"] = history[-6:]
+        # 登録情報から補った条件は患者が述べたことではない。
+        # 予約条件を扱う場面にだけ事実として渡し、断言させず確認させる。
+        if situation in _ASSUMED_DEFAULT_SITUATIONS:
+            draft = state.get("draft") or {}
+            for key in ("assumed_menu", "assumed_practitioner", "assumed_duration", "first_visit"):
+                if draft.get(key) and enriched_context.get(key) in (None, ""):
+                    enriched_context[key] = draft[key]
 
     reply = await compose_reply(situation, enriched_context)
     if db is not None and user_id:
@@ -1053,6 +1155,27 @@ async def _merge_autopilot_slots(
                     "duration_minutes": update.get("duration_minutes") or selected_menu.duration_minutes,
                 }
             )
+
+    # 本人が担当を明言していれば、登録上の既定より本人の希望を優先する。
+    requested_practitioner = await _extract_requested_practitioner(db, text)
+    if requested_practitioner:
+        update.update(
+            {
+                "practitioner_id": requested_practitioner.id,
+                "practitioner_name": requested_practitioner.name,
+                "assumed_practitioner": False,
+            }
+        )
+
+    # 患者が指定しなかった条件は登録情報（スタッフ設定のいつもの／初回ルール）で補う。
+    # 「いつもの」を押した人だけが良い候補を受け取れる状態を解消するため。
+    preview = {**previous, **{key: value for key, value in update.items() if value not in (None, "")}}
+    if not (preview.get("menu_name") and preview.get("duration_minutes") and preview.get("practitioner_id")):
+        defaults = await _resolve_booking_defaults(db, user_id=user_id, patient=patient)
+        for key, value in defaults.items():
+            if preview.get(key) in (None, "") and update.get(key) in (None, ""):
+                update[key] = value
+
     return await merge_user_draft(db, user_id, update)
 
 
@@ -3144,7 +3267,11 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     first_visit_note: str | None = None
     if is_autopilot_patient:
         requested_prac = await _extract_requested_practitioner(db, text)
-        is_new_patient = latest_reservation is None and not preferred_practitioner_id
+        # 既定値で院長が入ると preferred_practitioner_id が埋まるため、
+        # 初回かどうかは _resolve_booking_defaults が立てたフラグを優先して見る。
+        is_new_patient = bool(merged.get("first_visit")) or (
+            latest_reservation is None and not preferred_practitioner_id
+        )
         if requested_prac:
             # 本人が担当を指名 → その担当固定（院長探索は不要）
             preferred_practitioner_id = requested_prac.id
@@ -3153,8 +3280,8 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             # ただし本人が長い施術（90分マッスル等）を指定済みならその時間を優先。
             if not requested_prac:
                 prefer_director = True
-            if duration < 60:
-                duration = 60
+            if duration < FIRST_VISIT_DURATION_MINUTES:
+                duration = FIRST_VISIT_DURATION_MINUTES
             first_visit_note = "初回はカウンセリングを含め60分ほどお時間をいただいております。"
 
     # 候補提示時の優先担当（院長優先の場合は院長IDを解決）
@@ -3251,7 +3378,13 @@ async def _handle_text_message(event: dict, db: AsyncSession):
 
     if is_autopilot_patient:
         if practitioner:
-            if latest_reservation and merged.get("parse_confidence") == "high":
+            # 登録情報から補った条件（assumed_*）が混ざっている間は、患者の同意がまだ無い。
+            # 確認を挟んでから確定させる。
+            if (
+                latest_reservation
+                and merged.get("parse_confidence") == "high"
+                and not _has_assumed_booking_defaults(merged)
+            ):
                 try:
                     await _assert_bookable_duration(
                         db, menu.id if menu else None, start_dt, end_dt
