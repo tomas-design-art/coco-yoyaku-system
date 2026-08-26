@@ -474,14 +474,16 @@ async def build_same_day_candidates(
     window_start_min: int | None = None,
     window_end_min: int | None = None,
     max_results: int = 3,
-    min_gap_minutes: int = 30,
 ) -> list[ScoredSlot]:
-    """LINE秘書の患者向け「同日優先」候補を優先順位で構築。
+    """その日の空きを、時間帯を散らして提示順に返す。
 
-    Tier1: 同日・希望担当・希望時間以降のフル枠（最短順）
-    Tier2: 同日・希望担当・希望時間帯内の短い空き（隙間: min_gap〜フル未満）
-    Tier3: 同日・他担当・希望時間帯内のフル枠（最短順）
-    最後に呼び出し側で「④希望が無ければ別日時を提案してください」を付ける。
+    担当指定は「探索の入口」ではなく候補集合の絞り込みとして扱う。
+    希望担当がいればその人の枠で先に埋め、足りない分だけ他の担当で補う。
+
+    以前は「希望担当あり＝その担当の枠を時間帯で散らす」「希望担当なし＝各担当の
+    最速枠を1つずつ」という別々のアルゴリズムに分かれていた。そのため担当を
+    指定しない患者には候補が出勤人数ぶんしか出ず、その日の実際の空きと
+    合わない案内になっていた（2026-08-26 に実機で確認）。
     """
     prac_q = await db.execute(
         select(Practitioner)
@@ -501,75 +503,76 @@ async def build_same_day_candidates(
     we = bh_end if window_end_min is None else min(window_end_min, bh_end)
     if ws >= we:
         ws, we = bh_start, bh_end
-    desired_min = max(desired_time.hour * 60 + desired_time.minute, ws)
+    desired_min = min(max(desired_time.hour * 60 + desired_time.minute, ws), we)
 
     day_infos = await _load_day_infos(db, target_date, practitioners)
-    info_by_id = {di.practitioner.id: di for di in day_infos}
+    working = [info for info in day_infos if info.is_working]
+    if not working:
+        return []
 
+    # 開始時刻ごとに「その時刻に空いている施術者」を集める。
+    free_at: dict[int, list[_DayInfo]] = {}
+    slot = ws
+    while slot + duration_minutes <= we:
+        available = [info for info in working if _is_slot_available(info, slot, slot + duration_minutes)]
+        if available:
+            free_at[slot] = available
+        slot += SLOT_INTERVAL
+    if not free_at:
+        return []
+
+    def _pick_practitioner(candidates: list[_DayInfo]) -> _DayInfo:
+        """同じ時刻に複数人空いていたら、当日の予約が少ない人を優先する。"""
+        if preferred_practitioner_id:
+            for info in candidates:
+                if info.practitioner.id == preferred_practitioner_id:
+                    return info
+        return sorted(
+            candidates,
+            key=lambda info: (info.load, getattr(info.practitioner, "display_order", 0) or 0),
+        )[0]
+
+    starts = sorted(free_at)
+    # 希望時刻以降を優先し、足りなければ希望時刻より近い順に前へ広げる。
+    ordered_starts = [s for s in starts if s >= desired_min] + [
+        s for s in starts if s < desired_min
+    ][::-1]
+
+    chosen: list[int] = []
     results: list[ScoredSlot] = []
-    seen: set[tuple[int, int, int]] = set()
 
-    def _add(info: _DayInfo, s: int, dur: int) -> None:
-        key = (info.practitioner.id, s, dur)
-        if key in seen:
-            return
-        e = s + dur
-        st = time(s // 60, s % 60)
-        et = time(e // 60, e % 60)
-        if dur != duration_minutes:
-            label = (
-                f"{target_date.isoformat()} {st.strftime('%H:%M')}〜{et.strftime('%H:%M')}"
-                f"（{dur}分／担当:{info.practitioner.name}）"
-            )
-        else:
-            label = (
-                f"{target_date.isoformat()} {st.strftime('%H:%M')}〜{et.strftime('%H:%M')}"
-                f"（担当:{info.practitioner.name}）"
-            )
-        results.append(ScoredSlot(
-            target_date, st, et,
-            info.practitioner.id, info.practitioner.name, 0.0, label,
-        ))
-        seen.add(key)
-
-    pref_info = info_by_id.get(preferred_practitioner_id) if preferred_practitioner_id else None
-
-    # Tier1: 希望担当・フル枠・希望時間以降（最短順・重複を避けて間隔をあける）
-    if pref_info and pref_info.is_working:
-        last_start: int | None = None
-        s = desired_min
-        while s + duration_minutes <= we and len(results) < max_results:
-            if _is_slot_available(pref_info, s, s + duration_minutes):
-                if last_start is None or (s - last_start) >= duration_minutes:
-                    _add(pref_info, s, duration_minutes)
-                    last_start = s
-            s += SLOT_INTERVAL
-
-    # Tier2: 希望担当・希望時間帯内の短い隙間（フル未満だが min_gap 以上）
-    if pref_info and pref_info.is_working and len(results) < max_results:
-        for gs, ge in _free_blocks(pref_info, ws, we):
-            block_len = ge - gs
-            if min_gap_minutes <= block_len < duration_minutes:
-                _add(pref_info, gs, block_len)
-                if len(results) >= max_results:
-                    break
-
-    # Tier3: 他担当・希望時間帯内・フル枠（各担当の最短枠）
-    if len(results) < max_results:
-        for info in day_infos:
-            if not info.is_working:
-                continue
-            if preferred_practitioner_id and info.practitioner.id == preferred_practitioner_id:
-                continue
-            s = ws
-            while s + duration_minutes <= we:
-                if _is_slot_available(info, s, s + duration_minutes):
-                    _add(info, s, duration_minutes)
-                    break
-                s += SLOT_INTERVAL
+    def _collect(only_preferred: bool) -> None:
+        for start in ordered_starts:
             if len(results) >= max_results:
-                break
+                return
+            # 提示が固まらないよう、施術時間ぶんは間隔をあける。
+            if any(abs(start - taken) < duration_minutes for taken in chosen):
+                continue
+            available = free_at[start]
+            if only_preferred:
+                available = [
+                    info for info in available if info.practitioner.id == preferred_practitioner_id
+                ]
+                if not available:
+                    continue
+            info = _pick_practitioner(available)
+            end = start + duration_minutes
+            st = time(start // 60, start % 60)
+            et = time(end // 60, end % 60)
+            results.append(ScoredSlot(
+                target_date, st, et,
+                info.practitioner.id, info.practitioner.name, 0.0,
+                f"{target_date.isoformat()} {st.strftime('%H:%M')}〜{et.strftime('%H:%M')}"
+                f"（担当:{info.practitioner.name}）",
+            ))
+            chosen.append(start)
 
+    # 希望担当の枠で先に埋め、埋まりきらなければ他の担当でも探す。
+    if preferred_practitioner_id:
+        _collect(only_preferred=True)
+    _collect(only_preferred=False)
+
+    results.sort(key=lambda candidate: (candidate.start_time.hour, candidate.start_time.minute))
     return results[:max_results]
 
 

@@ -165,13 +165,13 @@ def _make_candidate_db(day_infos):
 
 
 @pytest.mark.asyncio
-async def test_build_same_day_candidates_prefers_preferred_then_others(monkeypatch):
-    """Tier1（希望担当のフル枠）→ Tier3（他担当のフル枠）の順で候補が並ぶ。"""
+async def test_build_same_day_candidates_spreads_preferred_practitioner_slots(monkeypatch):
+    """希望担当がいれば、その担当の枠を時間帯を散らして埋める。"""
     target_date = date(2026, 8, 13)
     pref = SimpleNamespace(id=2, name="上田", role="院長", display_order=2)
     other = SimpleNamespace(id=1, name="時田", role="施術者", display_order=1)
 
-    # 上田: 15:00(900)〜21:00(1260)は予約で埋まり、14:00枠だけ空き。時田は終日空き。
+    # 上田: 15:00(900)〜21:00(1260)は予約で埋まり、10:00〜15:00が空き。時田は終日空き。
     day_infos = [
         slot_scorer._DayInfo(other, True, [], [], 600, 1260),
         slot_scorer._DayInfo(pref, True, [(900, 1260)], [], 600, 1260),
@@ -184,19 +184,77 @@ async def test_build_same_day_candidates_prefers_preferred_then_others(monkeypat
         db, target_date, time(14, 0), 60, preferred_practitioner_id=2, max_results=3,
     )
 
-    assert len(results) == 2
-    # 1件目は希望担当（上田）の14:00フル枠
-    assert results[0].practitioner_id == 2
-    assert "14:00〜15:00" in results[0].label
-    assert "担当:上田" in results[0].label
-    # 2件目は他担当（時田）のフル枠
-    assert results[1].practitioner_id == 1
-    assert "担当:時田" in results[1].label
+    assert len(results) == 3
+    # 希望担当で埋まりきるので他担当は出さない
+    assert {r.practitioner_id for r in results} == {2}
+    starts = [r.start_time.hour * 60 + r.start_time.minute for r in results]
+    assert starts == sorted(starts)
+    # 施術時間ぶん間隔があいている（同じ時間帯に固まらない）
+    assert all(b - a >= 60 for a, b in zip(starts, starts[1:]))
+    # 希望時刻の枠は必ず含む
+    assert 14 * 60 in starts
 
 
 @pytest.mark.asyncio
-async def test_build_same_day_candidates_offers_short_gap_slot(monkeypatch):
-    """希望担当にフル枠が無くても、min_gap以上の短い空き（Tier2）を提示する。"""
+async def test_build_same_day_candidates_fills_from_other_practitioners(monkeypatch):
+    """希望担当だけで埋まらなければ、他の担当の枠で補う。"""
+    target_date = date(2026, 8, 13)
+    pref = SimpleNamespace(id=2, name="上田", role="院長", display_order=2)
+    other = SimpleNamespace(id=1, name="時田", role="施術者", display_order=1)
+
+    # 上田は14:00〜15:00の1枠だけ空き。時田は終日空き。
+    day_infos = [
+        slot_scorer._DayInfo(other, True, [], [], 600, 1260),
+        slot_scorer._DayInfo(pref, True, [(600, 840), (900, 1260)], [], 600, 1260),
+    ]
+    db, fake_bh, fake_load = _make_candidate_db(day_infos)
+    monkeypatch.setattr(slot_scorer, "get_business_hours_for_date", fake_bh)
+    monkeypatch.setattr(slot_scorer, "_load_day_infos", fake_load)
+
+    results = await slot_scorer.build_same_day_candidates(
+        db, target_date, time(14, 0), 60, preferred_practitioner_id=2, max_results=3,
+    )
+
+    assert len(results) == 3
+    assert 2 in {r.practitioner_id for r in results}
+    assert 1 in {r.practitioner_id for r in results}
+
+
+@pytest.mark.asyncio
+async def test_build_same_day_candidates_without_preference_spreads_over_the_day(monkeypatch):
+    """担当未指定でも、各担当の最速枠ではなく その日の空きを時間帯で散らす。
+
+    2026-08-26 の実機不具合の再現ケース。以前は「各施術者の最速枠を1つずつ」しか
+    返さず、候補数が出勤人数ぶんに固定され、夕方の空きが一切見えなかった。
+    """
+    target_date = date(2026, 8, 13)
+    ueda = SimpleNamespace(id=1, name="上田", role="施術者", display_order=1)
+    tokita = SimpleNamespace(id=2, name="時田", role="施術者", display_order=2)
+
+    # 上田: 勤務10:00〜13:00 / 10:00〜11:00 だけ空き
+    # 時田: 勤務10:00〜21:00 / 13:30〜14:30 と 16:00以降が空き
+    day_infos = [
+        slot_scorer._DayInfo(ueda, True, [(660, 780)], [], 600, 780),
+        slot_scorer._DayInfo(tokita, True, [(600, 810), (870, 960)], [], 600, 1260),
+    ]
+    db, fake_bh, fake_load = _make_candidate_db(day_infos)
+    monkeypatch.setattr(slot_scorer, "get_business_hours_for_date", fake_bh)
+    monkeypatch.setattr(slot_scorer, "_load_day_infos", fake_load)
+
+    results = await slot_scorer.build_same_day_candidates(
+        db, target_date, time(9, 0), 60, preferred_practitioner_id=None, max_results=3,
+    )
+
+    starts = [r.start_time.hour * 60 + r.start_time.minute for r in results]
+    assert len(results) == 3, f"出勤2人でも3候補出ること: {starts}"
+    assert starts == [600, 810, 960]  # 10:00 / 13:30 / 16:00
+    # 夕方の空きが候補に出る（以前は各担当の最速枠しか見ずゼロだった）
+    assert max(starts) >= 960
+
+
+@pytest.mark.asyncio
+async def test_build_same_day_candidates_skips_short_gaps(monkeypatch):
+    """施術時間に満たない隙間は候補にしない（黙って短い施術を提案しない）。"""
     target_date = date(2026, 8, 13)
     pref = SimpleNamespace(id=2, name="上田", role="院長", display_order=2)
     other = SimpleNamespace(id=1, name="時田", role="施術者", display_order=1)
@@ -214,7 +272,10 @@ async def test_build_same_day_candidates_offers_short_gap_slot(monkeypatch):
         db, target_date, time(14, 0), 60, preferred_practitioner_id=2, max_results=3,
     )
 
-    # 1件目は上田の40分枠（フル未満なので「分」表記が入る）
-    assert results[0].practitioner_id == 2
-    assert "40分" in results[0].label
-    assert "14:00〜14:40" in results[0].label
+    # 40分の隙間は出さない。短縮の可否は患者に尋ねてから扱う。
+    assert all(r.practitioner_id != 2 for r in results)
+    assert all("40分" not in r.label for r in results)
+    for candidate in results:
+        start = candidate.start_time.hour * 60 + candidate.start_time.minute
+        end = candidate.end_time.hour * 60 + candidate.end_time.minute
+        assert end - start == 60
