@@ -100,6 +100,14 @@ FIRST_VISIT_DURATION_MINUTES = 60
 
 # 登録情報から補った条件(assumed_*)を事実として渡してよい場面。
 # 予約条件を組み立てている場面に限る（取消・質問の返信に混ぜると話が飛ぶ）。
+# 「いま話している予約はどれか」が問われる場面。直前に確定した予約を事実として渡す。
+_RECENT_BOOKING_SITUATIONS = {
+    "reservation_status",
+    "ask_datetime",
+    "answer_question",
+    "change_target_missing",
+}
+
 _ASSUMED_DEFAULT_SITUATIONS = {
     "ask_datetime",
     "ask_time_for_date",
@@ -782,6 +790,48 @@ async def _complete_autopilot_setup(
         )
 
 
+async def _find_upcoming_reservations(db: AsyncSession, patient_id: int) -> list[Reservation]:
+    return list(
+        (
+            await db.execute(
+                select(Reservation)
+                .where(
+                    Reservation.patient_id == patient_id,
+                    Reservation.status == "CONFIRMED",
+                    Reservation.start_time >= now_jst(),
+                )
+                .order_by(Reservation.start_time)
+                .limit(5)
+            )
+        ).scalars().all()
+    )
+
+
+async def _find_change_target_reservation(
+    db: AsyncSession,
+    patient_id: int,
+    recent_booking: dict | None,
+) -> Reservation | None:
+    """変更・取消の対象予約を決める。
+
+    予約が2件以上あると「どれのことか」が決まらないが、直前にこの会話で
+    確定した予約があるなら、患者が言っているのはまずそれ。
+    それを使わずに手動退避すると、取ったばかりの予約を直せない。
+    """
+    reservations = await _find_upcoming_reservations(db, patient_id)
+    if len(reservations) == 1:
+        return reservations[0]
+    if not reservations or not recent_booking:
+        return None
+    target_date = str(recent_booking.get("date") or "").replace("/", "-")
+    target_start = str(recent_booking.get("start") or "")
+    for reservation in reservations:
+        start = reservation.start_time.astimezone(JST)
+        if start.strftime("%Y-%m-%d") == target_date and start.strftime("%H:%M") == target_start:
+            return reservation
+    return None
+
+
 async def _find_single_upcoming_reservation(db: AsyncSession, patient_id: int) -> Reservation | None:
     reservations = (
         await db.execute(
@@ -972,6 +1022,12 @@ async def _compose_autopilot_reply(
         enriched_context["recent_history"] = history[-6:]
         # 登録情報から補った条件は患者が述べたことではない。
         # 予約条件を扱う場面にだけ事実として渡し、断言させず確認させる。
+        # 直前にこの会話で確定した予約は「いま話している予約」。これを渡さないと、
+        # 未来の予約が複数あるとき、関係のない別の予約を指して答えてしまう。
+        if situation in _RECENT_BOOKING_SITUATIONS:
+            recent = (state.get("context_data") or {}).get("recent_completed_booking")
+            if recent and not enriched_context.get("recent_completed_booking"):
+                enriched_context["recent_completed_booking"] = recent
         if situation in _ASSUMED_DEFAULT_SITUATIONS:
             draft = state.get("draft") or {}
             for key in ("assumed_menu", "assumed_practitioner", "assumed_duration", "first_visit"):
@@ -2592,7 +2648,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     },
                 )
             await set_user_mode(db, user_id, "idle")
-        elif text.strip() in {"いいえ", "変更", "ちがう", "違う"}:
+        # 「変更」は予約そのものの変更依頼と語がぶつかる。ここで拾うと
+        # 変更のつもりの患者が新規予約のメニュー選択へ落ちるため含めない。
+        elif text.strip() in {"いいえ", "ちがう", "違う", "別のメニュー"}:
             await set_user_mode(db, user_id, "waiting_menu")
             if reply_token:
                 quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
@@ -2712,7 +2770,11 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         return
 
     if is_autopilot_patient and ((parsed_intent or {}).get("intent") == "change" or _has_change_intent(text)):
-        reservation = await _find_single_upcoming_reservation(db, line_patient.id)
+        reservation = await _find_change_target_reservation(
+            db,
+            line_patient.id,
+            (user_state.get("context_data") or {}).get("recent_completed_booking"),
+        )
         if not reservation:
             await _handoff_autopilot_to_human(
                 db,

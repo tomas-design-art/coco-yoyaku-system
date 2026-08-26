@@ -916,7 +916,7 @@ async def test_autopilot_change_without_datetime_asks_and_keeps_conversation_act
         "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
     ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
         "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
-    ), patch("app.api.line._find_single_upcoming_reservation", new=AsyncMock(return_value=reservation)), patch(
+    ), patch("app.api.line._find_change_target_reservation", new=AsyncMock(return_value=reservation)), patch(
         "app.api.line.parse_line_message", new=AsyncMock(return_value={"date": None, "time": None})
     ), patch("app.api.line.create_notification", new=AsyncMock()), patch(
         "app.api.line.merge_user_draft", new=AsyncMock()
@@ -2913,3 +2913,57 @@ async def test_webhook_failure_notifies_admin_and_replies_to_patient():
     assert "ValueError: boom" in mock_push.await_args.args[1]
     assert mock_reply.await_args.args[0] == "reply-token"
     assert "担当者" in mock_reply.await_args.args[1]
+
+
+# ── 変更対象の特定と「変更」の語のぶつかり ──
+
+
+@pytest.mark.asyncio
+async def test_change_target_uses_the_booking_just_made():
+    """予約が複数あっても、直前にこの会話で取った予約を変更対象にする。"""
+    from app.api.line import _find_change_target_reservation
+    from app.utils.datetime_jst import JST
+
+    older = SimpleNamespace(id=1, start_time=datetime(2026, 8, 27, 10, 0, tzinfo=JST))
+    just_made = SimpleNamespace(id=2, start_time=datetime(2026, 8, 31, 14, 30, tzinfo=JST))
+    with patch("app.api.line._find_upcoming_reservations", new=AsyncMock(return_value=[older, just_made])):
+        target = await _find_change_target_reservation(
+            AsyncMock(), 7, {"date": "2026/08/31", "start": "14:30"}
+        )
+    assert target is just_made
+
+
+@pytest.mark.asyncio
+async def test_change_target_is_unresolved_without_a_recent_booking():
+    """手がかりが無いまま複数から勝手に選ばない（別の予約を触る事故を防ぐ）。"""
+    from app.api.line import _find_change_target_reservation
+    from app.utils.datetime_jst import JST
+
+    a = SimpleNamespace(id=1, start_time=datetime(2026, 8, 27, 10, 0, tzinfo=JST))
+    b = SimpleNamespace(id=2, start_time=datetime(2026, 8, 31, 14, 30, tzinfo=JST))
+    with patch("app.api.line._find_upcoming_reservations", new=AsyncMock(return_value=[a, b])):
+        assert await _find_change_target_reservation(AsyncMock(), 7, None) is None
+
+
+@pytest.mark.asyncio
+async def test_change_target_falls_back_to_the_only_reservation():
+    from app.api.line import _find_change_target_reservation
+    from app.utils.datetime_jst import JST
+
+    only = SimpleNamespace(id=3, start_time=datetime(2026, 8, 31, 14, 30, tzinfo=JST))
+    with patch("app.api.line._find_upcoming_reservations", new=AsyncMock(return_value=[only])):
+        assert await _find_change_target_reservation(AsyncMock(), 7, None) is only
+
+
+def test_usual_confirmation_does_not_treat_change_as_menu_rejection():
+    """「変更」を『いつものメニューを選び直す』と解釈しない。
+
+    予約の変更依頼と語がぶつかり、変更のつもりの患者が新規予約の
+    メニュー選択へ落ちていた（実機で発生）。
+    """
+    import inspect as _inspect
+    from app.api import line as line_module
+
+    source = _inspect.getsource(line_module._handle_text_message)
+    assert '"いいえ", "変更"' not in source
+    assert '"いいえ", "ちがう", "違う", "別のメニュー"' in source
