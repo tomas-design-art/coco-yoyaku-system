@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import re
+import traceback
 from typing import Optional
 from urllib.parse import parse_qs
 
@@ -1095,6 +1096,29 @@ async def _complete_autopilot_reschedule(
     return True
 
 
+_EXPLICIT_DATE_PATTERN = re.compile(
+    r"\d{4}-\d{1,2}-\d{1,2}"
+    r"|\d{1,2}\s*[月/]\s*\d{1,2}"
+    r"|\d{1,2}\s*日(?!間)"
+    r"|[月火水木金土日]\s*曜"
+    r"|今日|本日|明日|あした|あす|明後日|あさって|しあさって"
+    r"|今週|来週|再来週|週明け|週末"
+    r"|今月|来月|再来月|月末|月初"
+    r"|\d{1,2}\s*日後"
+)
+
+
+def _mentions_explicit_date(text: str) -> bool:
+    """本文に日付・曜日の表現があるか。
+
+    「14:00でお願いします」のような時刻だけの返事に対し、解析側が日付を
+    今日で補うことがある。それをそのまま採用すると、話していた日
+    （例: 8/31）から今日へ勝手に飛び、別の日の予約を確定してしまう。
+    患者が日付を口にしていないうちは、提示済みの日を動かさない。
+    """
+    return bool(_EXPLICIT_DATE_PATTERN.search(text or ""))
+
+
 async def _merge_autopilot_slots(
     db: AsyncSession,
     *,
@@ -1112,6 +1136,11 @@ async def _merge_autopilot_slots(
         "constraints": parsed.get("constraints"),
         "parse_confidence": parsed.get("confidence"),
     }
+    # 患者が日付を口にしていないなら、話していた日を動かさない。
+    # 解析側が時刻だけの返事に今日の日付を補うことがあり、そのまま採ると
+    # 8/31の話をしていたのに今日で確定してしまう（実機で発生）。
+    if update["date"] and previous.get("date") and not _mentions_explicit_date(text):
+        update["date"] = previous["date"]
     menu_hint = parsed.get("menu_name") or parsed.get("menu_hint")
     wants_usual = menu_hint == "usual" or bool(re.search(r"いつもの|前回と同じ|この前と同じ", text)) or text.startswith("⭐️いつもの")
     if wants_usual:
@@ -3846,6 +3875,34 @@ async def _handle_admin_text_command(db: AsyncSession, text: str, reply_token: s
     return True
 
 
+async def _notify_webhook_failure(event: dict, error: Exception) -> None:
+    """例外で返信できなかったことを管理者へ伝え、患者を無言にしない。
+
+    webhook が例外を上げると 500 になり、返信も db.commit() も実行されない。
+    患者から見ると「送ったのに何も返ってこない」状態になり、原因も残らない。
+    """
+    detail = f"{type(error).__name__}: {error}"
+    admin_user_id = settings.admin_line_developer_user_id or settings.line_admin_user_id
+    if admin_user_id:
+        try:
+            await push_message(
+                admin_user_id,
+                "[LINE処理エラー] 返信できませんでした。手動で対応をお願いします。\n"
+                f"{detail}\n{traceback.format_exc()[-800:]}",
+            )
+        except Exception:
+            logger.exception("failed to notify admin about webhook failure")
+    reply_token = event.get("replyToken")
+    if reply_token:
+        try:
+            await reply_to_line(
+                reply_token,
+                "申し訳ございません。確認のうえ担当者からあらためてご案内いたします。",
+            )
+        except Exception:
+            logger.exception("failed to reply after webhook failure")
+
+
 @router.post("/webhook")
 async def line_webhook(
     request: Request,
@@ -3865,10 +3922,17 @@ async def line_webhook(
 
     events = payload.get("events", [])
     for event in events:
-        if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
-            await _handle_text_message(event, db)
-        elif event.get("type") == "postback":
-            await _handle_postback(event, db)
+        try:
+            if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
+                await _handle_text_message(event, db)
+            elif event.get("type") == "postback":
+                await _handle_postback(event, db)
+        except Exception as error:
+            # ここで例外を通すと 500 になり、患者へは何も返らず db.commit() も走らない。
+            # 「送ったのに無反応」で原因も残らないため、必ず捕まえて通知する。
+            logger.exception("LINE webhook handler failed")
+            await db.rollback()
+            await _notify_webhook_failure(event, error)
 
     await db.commit()
     return {"status": "ok"}

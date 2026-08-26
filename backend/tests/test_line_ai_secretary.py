@@ -2828,3 +2828,88 @@ async def test_autopilot_returning_patient_is_never_treated_as_first_visit():
     assert merged.get("first_visit") is None
     assert merged.get("assumed_duration") is None
     assert merged.get("practitioner_id") is None
+
+
+# ── 時刻だけの返事で日付が飛ばないこと ──
+
+
+def test_mentions_explicit_date_distinguishes_time_only_replies():
+    from app.api.line import _mentions_explicit_date
+
+    for message in ["14:00でお願いします", "では16:30からお願いします", "もっと遅い時間", "はい", "2時間くらい"]:
+        assert _mentions_explicit_date(message) is False, message
+    for message in ["来週の月曜日予約したい", "8月31日で", "31日でお願いします", "明日の14時", "月曜日", "3日後"]:
+        assert _mentions_explicit_date(message) is True, message
+
+
+@pytest.mark.asyncio
+async def test_autopilot_time_only_reply_keeps_the_date_being_discussed():
+    """8/31の話をしているのに「14:00で」で今日へ飛ばない（実機で発生した事故）。"""
+    from app.api.line import _merge_autopilot_slots
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    previous = {
+        "date": "2026-08-31",
+        "menu_name": "マッスルセラピー",
+        "duration_minutes": 60,
+        "practitioner_id": 3,
+    }
+    with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: {**previous, **update})
+    ):
+        merged = await _merge_autopilot_slots(
+            AsyncMock(),
+            user_id="U-autopilot",
+            text="14:00でお願いします",
+            patient=patient,
+            previous=previous,
+            # 解析側が時刻だけの返事に今日(8/27)を補ってきた状況を再現
+            parsed={"intent": "new", "date": "2026-08-27", "time": "14:00", "confidence": "high", "constraints": []},
+        )
+
+    assert merged["date"] == "2026-08-31"
+    assert merged["time"] == "14:00"
+
+
+@pytest.mark.asyncio
+async def test_autopilot_explicit_new_date_still_moves_the_day():
+    """患者が別の日を口にしたときは、ちゃんとその日へ移る。"""
+    from app.api.line import _merge_autopilot_slots
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    previous = {
+        "date": "2026-08-31",
+        "menu_name": "マッスルセラピー",
+        "duration_minutes": 60,
+        "practitioner_id": 3,
+    }
+    with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: {**previous, **update})
+    ):
+        merged = await _merge_autopilot_slots(
+            AsyncMock(),
+            user_id="U-autopilot",
+            text="やっぱり9月2日の14時で",
+            patient=patient,
+            previous=previous,
+            parsed={"intent": "new", "date": "2026-09-02", "time": "14:00", "confidence": "high", "constraints": []},
+        )
+
+    assert merged["date"] == "2026-09-02"
+
+
+@pytest.mark.asyncio
+async def test_webhook_failure_notifies_admin_and_replies_to_patient():
+    """例外で無言にしない。管理者へ原因を流し、患者には引き継ぎを返す。"""
+    from app.api.line import _notify_webhook_failure
+
+    event = {"replyToken": "reply-token", "source": {"userId": "U-autopilot"}}
+    with patch("app.api.line.settings.admin_line_developer_user_id", "U-admin"), patch(
+        "app.api.line.push_message", new=AsyncMock()
+    ) as mock_push, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+        await _notify_webhook_failure(event, ValueError("boom"))
+
+    assert mock_push.await_args.args[0] == "U-admin"
+    assert "ValueError: boom" in mock_push.await_args.args[1]
+    assert mock_reply.await_args.args[0] == "reply-token"
+    assert "担当者" in mock_reply.await_args.args[1]
