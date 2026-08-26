@@ -2794,3 +2794,37 @@ def test_assumed_booking_defaults_detected():
     assert _has_assumed_booking_defaults({"assumed_duration": 60}) is True
     assert _has_assumed_booking_defaults({"menu_name": "マッスルセラピー", "assumed_practitioner": False}) is False
     assert _has_assumed_booking_defaults({}) is False
+
+
+@pytest.mark.asyncio
+async def test_autopilot_returning_patient_is_never_treated_as_first_visit():
+    """来院実績がある人は、いつもの設定が無くても初回扱い（60分・院長固定）にしない。
+
+    初回扱いは「LINE連携時に予約システムで照合できなかった新規の人」だけ。
+    メニューが決まらなかったことを初回の根拠にしてはいけない。
+    """
+    from app.api.line import _merge_autopilot_slots
+
+    patient = SimpleNamespace(id=11, name="常連 花子", line_autopilot_enabled=True)
+    latest = {"menu_id": 3, "menu_name": "骨盤矯正", "duration_minutes": 40}
+    with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
+        "app.api.line._get_patient_default_preset", new=AsyncMock(return_value=None)
+    ), patch("app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=latest)), patch(
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)
+    ):
+        merged = await _merge_autopilot_slots(
+            AsyncMock(),
+            user_id="U-returning",
+            text="来週の月曜日は空いてますか？",
+            patient=patient,
+            previous={},
+            parsed={"intent": "new", "date": "2026-08-31", "time": None, "confidence": "high", "constraints": []},
+        )
+
+    # 前回の内容は引き継ぐ
+    assert merged["menu_name"] == "骨盤矯正"
+    assert merged["duration_minutes"] == 40
+    # 初回ではないので60分固定も院長固定もしない
+    assert merged.get("first_visit") is None
+    assert merged.get("assumed_duration") is None
+    assert merged.get("practitioner_id") is None

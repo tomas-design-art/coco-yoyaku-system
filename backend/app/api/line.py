@@ -402,19 +402,20 @@ async def _resolve_booking_defaults(
     「いつもの」ボタンを押さない患者にも同じ前提で探せるようにする。
     ここで入る値は患者が今回述べたものではないため assumed_* を立て、
     返信では断言させず必ず確認させる（プロンプト側で扱う）。
-    """
-    defaults: dict = {}
 
+    優先順位は「スタッフ設定 → 前回の内容 → 初回扱い」。
+    初回扱い（60分・院長）は**来院実績がまったく無い人だけ**に適用する。
+    メニューが決まらなかったことを初回の根拠にしてはいけない。
+    """
+    # ① スタッフが個人管理に設定した「いつもの」が最優先。
     preset = await _get_patient_default_preset(db, patient)
     if preset:
-        defaults.update(
-            {
-                "menu_id": preset["menu_id"],
-                "menu_name": preset["menu_name"],
-                "duration_minutes": preset["duration_minutes"],
-                "assumed_menu": preset["menu_name"],
-            }
-        )
+        defaults = {
+            "menu_id": preset["menu_id"],
+            "menu_name": preset["menu_name"],
+            "duration_minutes": preset["duration_minutes"],
+            "assumed_menu": preset["menu_name"],
+        }
         if preset.get("practitioner_id"):
             defaults.update(
                 {
@@ -423,41 +424,40 @@ async def _resolve_booking_defaults(
                     "assumed_practitioner": preset["practitioner_name"],
                 }
             )
-    else:
-        latest = await _get_latest_reservation_for_line_user(db, user_id)
-        if latest:
-            defaults.update(
-                {
-                    "menu_id": latest.get("menu_id"),
-                    "menu_name": latest["menu_name"],
-                    "duration_minutes": latest["duration_minutes"],
-                    "assumed_menu": latest["menu_name"],
-                }
-            )
+        return defaults
 
-    if not defaults.get("duration_minutes"):
-        # 完全初回はHP経由の新規獲得と同じ扱い（院長優先＋60分）。
-        # 担当未設定のリピーターまで院長へ寄せると既存の割当が変わるため、
-        # 院長を既定にするのは初回のときだけに限る。
-        defaults["duration_minutes"] = FIRST_VISIT_DURATION_MINUTES
-        defaults["assumed_duration"] = FIRST_VISIT_DURATION_MINUTES
-        defaults["first_visit"] = True
-        director = (
-            await db.execute(
-                select(Practitioner)
-                .where(Practitioner.is_active == True, Practitioner.role == "院長")
-                .order_by(Practitioner.display_order)
-            )
-        ).scalars().first()
-        if director:
-            defaults.update(
-                {
-                    "practitioner_id": director.id,
-                    "practitioner_name": director.name,
-                    "assumed_practitioner": director.name,
-                }
-            )
+    # ② 来院実績があれば前回の内容を引き継ぐ。担当は勝手に決めない。
+    latest = await _get_latest_reservation_for_line_user(db, user_id)
+    if latest:
+        return {
+            "menu_id": latest.get("menu_id"),
+            "menu_name": latest["menu_name"],
+            "duration_minutes": latest["duration_minutes"],
+            "assumed_menu": latest["menu_name"],
+        }
 
+    # ③ 来院実績が無い＝LINE連携時に予約システムで照合できなかった新規の人。
+    #    HP経由の新規獲得と同じ扱い（60分・院長優先）はこの人だけに適用する。
+    defaults = {
+        "duration_minutes": FIRST_VISIT_DURATION_MINUTES,
+        "assumed_duration": FIRST_VISIT_DURATION_MINUTES,
+        "first_visit": True,
+    }
+    director = (
+        await db.execute(
+            select(Practitioner)
+            .where(Practitioner.is_active == True, Practitioner.role == "院長")
+            .order_by(Practitioner.display_order)
+        )
+    ).scalars().first()
+    if director:
+        defaults.update(
+            {
+                "practitioner_id": director.id,
+                "practitioner_name": director.name,
+                "assumed_practitioner": director.name,
+            }
+        )
     return defaults
 
 
