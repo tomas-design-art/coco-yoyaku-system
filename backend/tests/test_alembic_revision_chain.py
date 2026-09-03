@@ -40,3 +40,28 @@ def test_alembic_down_revision_references_existing_revision_ids():
         "Alembic chain has unknown down_revision reference(s): "
         + ", ".join([f"{f}:{r}->{d}" for (f, r, d) in invalid])
     )
+
+
+def test_alembic_revision_chain_has_expected_single_head():
+    versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+    revisions: set[str] = set()
+    down_revisions: set[str] = set()
+
+    for path in versions_dir.glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        revision = _extract("revision", text)
+        if revision:
+            revisions.add(revision)
+        down_revision = _extract("down_revision", text)
+        if down_revision:
+            down_revisions.add(down_revision)
+
+    assert revisions - down_revisions == {"027_patient_line_id_index"}
+
+
+def test_patient_line_id_has_non_unique_lookup_index():
+    from app.models.patient import Patient
+
+    indexes = {index.name: index for index in Patient.__table__.indexes}
+    assert "ix_patients_line_id" in indexes
+    assert indexes["ix_patients_line_id"].unique is not True

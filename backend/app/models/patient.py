@@ -21,7 +21,7 @@ class Patient(Base):
     patient_number = Column(String(50), unique=True, nullable=True)
     phone = Column(String(20), nullable=True)
     email = Column(String(200), nullable=True)
-    line_id = Column(String(100), nullable=True)
+    line_id = Column(String(100), nullable=True, index=True)
     line_autopilot_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
     notes = Column(Text, nullable=True)
     default_menu_id = Column(Integer, ForeignKey("menus.id", ondelete="SET NULL"), nullable=True)

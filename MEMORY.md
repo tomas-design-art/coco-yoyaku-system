@@ -1,5 +1,13 @@
 # 開発トラブルナレッジ
 
+- AI向けの実行エラーと既知テスト失敗は `ERRORS.md` を参照する。
+
+## LINE inbox 段階導入 (2026-09-04)
+
+- `LINE_INBOX_ROLLOUT=legacy|autopilot|all`。未設定は`legacy`、初回本番は`autopilot`で既存対象者だけ新経路へ通す。
+- 対象者名簿は`patients.line_autopilot_enabled`のみ。通常患者は従来の同期処理とスタッフ手動返信を維持する。
+- migration `027_patient_line_id_index`で入口照合用の非一意indexを追加。切戻しは`legacy`へ変更後、queueを排出してから行う。
+
 ## 実装済みフェーズ (2026-03-21)
 
 ### PATCH_001 完了

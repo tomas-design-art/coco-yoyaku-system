@@ -2967,3 +2967,561 @@ def test_usual_confirmation_does_not_treat_change_as_menu_rejection():
     source = _inspect.getsource(line_module._handle_text_message)
     assert '"いいえ", "変更"' not in source
     assert '"いいえ", "ちがう", "違う", "別のメニュー"' in source
+
+
+def test_line_inbox_rollout_defaults_to_legacy_and_rejects_unknown_values():
+    from app.config import Settings
+
+    with patch.dict("os.environ", {}, clear=True):
+        assert Settings(_env_file=None).line_inbox_rollout == "legacy"
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, line_inbox_rollout="unknown")
+
+
+@pytest.mark.asyncio
+async def test_webhook_stores_events_and_returns_before_running_handlers():
+    import json
+
+    from app.api import line as line_module
+
+    body = json.dumps(
+        {
+            "events": [
+                {
+                    "type": "message",
+                    "webhookEventId": "EV-1",
+                    "deliveryContext": {"isRedelivery": False},
+                    "source": {"userId": "U-patient"},
+                    "message": {"type": "text", "text": "予約したい"},
+                }
+            ]
+        }
+    ).encode()
+    request = SimpleNamespace(body=AsyncMock(return_value=body))
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_channel_access_token", "token"), patch(
+        "app.api.line.settings.line_inbox_rollout", "all", create=True
+    ), patch(
+        "app.api.line._verify_signature", new=Mock()
+    ), patch("app.api.line._forward_line_webhook_to_mirror", new=AsyncMock()) as mock_mirror, patch(
+        "app.api.line.enqueue_line_events", new=AsyncMock(return_value=1)
+    ) as mock_enqueue, patch(
+        "app.api.line._handle_text_message", new=AsyncMock()
+    ) as mock_handle:
+        result = await line_module.line_webhook(request, db, "signature")
+
+    assert result["status"] == "ok"
+    mock_enqueue.assert_awaited_once()
+    mock_handle.assert_not_awaited()
+    mock_mirror.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_webhook_autopilot_rollout_queues_flagged_and_dispatches_legacy():
+    import json
+
+    from app.api import line as line_module
+
+    queued_event = {
+        "type": "message",
+        "webhookEventId": "EV-autopilot",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "予約したい"},
+    }
+    legacy_event = {
+        "type": "message",
+        "webhookEventId": "EV-legacy",
+        "source": {"userId": "U-legacy"},
+        "message": {"type": "text", "text": "予約について相談です"},
+    }
+    events = [queued_event, legacy_event]
+    request = SimpleNamespace(body=AsyncMock(return_value=json.dumps({"events": events}).encode()))
+    db = AsyncMock()
+
+    async def assert_queue_committed(event, session):
+        assert event is legacy_event
+        assert session is db
+        assert db.commit.await_count == 1
+
+    with patch("app.api.line.settings.line_channel_access_token", "token"), patch(
+        "app.api.line._verify_signature", new=Mock()
+    ), patch(
+        "app.api.line._partition_line_events",
+        new=AsyncMock(return_value=([queued_event], [legacy_event])),
+        create=True,
+    ) as mock_partition, patch(
+        "app.api.line.enqueue_line_events", new=AsyncMock(return_value=1)
+    ) as mock_enqueue, patch(
+        "app.api.line._dispatch_line_event", new=AsyncMock(side_effect=assert_queue_committed)
+    ) as mock_dispatch:
+        result = await line_module.line_webhook(request, db, "signature")
+
+    assert result == {"status": "ok", "queued": 1}
+    mock_partition.assert_awaited_once_with(events, db)
+    mock_enqueue.assert_awaited_once_with(db, [queued_event])
+    mock_dispatch.assert_awaited_once_with(legacy_event, db)
+    assert db.commit.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rollout", "queued_count", "legacy_count"),
+    [("legacy", 0, 2), ("all", 2, 0)],
+)
+async def test_line_event_partition_modes_do_not_query_patients(
+    rollout,
+    queued_count,
+    legacy_count,
+):
+    from app.api import line as line_module
+
+    events = [
+        {"type": "message", "source": {"userId": "U-one"}},
+        {"type": "postback", "source": {"userId": "U-two"}},
+    ]
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_inbox_rollout", rollout, create=True):
+        queued, legacy = await line_module._partition_line_events(events, db)
+
+    assert len(queued) == queued_count
+    assert len(legacy) == legacy_count
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_autopilot_rollout_uses_existing_patient_flag_for_messages_and_postbacks():
+    from app.api import line as line_module
+
+    autopilot_message = {"type": "message", "source": {"userId": "U-autopilot"}}
+    autopilot_postback = {"type": "postback", "source": {"userId": "U-autopilot"}}
+    legacy_message = {"type": "message", "source": {"userId": "U-legacy"}}
+    admin_postback = {"type": "postback", "source": {"userId": "U-admin"}}
+    setup_message = {
+        "type": "message",
+        "source": {"userId": "U-unlinked"},
+        "message": {"type": "text", "text": "#autopilot-setup"},
+    }
+    no_user_event = {"type": "follow", "source": {"type": "group"}}
+    events = [
+        autopilot_message,
+        autopilot_postback,
+        legacy_message,
+        admin_postback,
+        setup_message,
+        no_user_event,
+    ]
+    query_result = Mock()
+    query_result.scalars.return_value.all.return_value = ["U-autopilot"]
+    db = AsyncMock()
+    db.execute.return_value = query_result
+
+    with patch("app.api.line.settings.line_inbox_rollout", "autopilot", create=True), patch(
+        "app.api.line.settings.line_autopilot_enabled", True
+    ):
+        queued, legacy = await line_module._partition_line_events(events, db)
+
+    assert queued == [autopilot_message, autopilot_postback]
+    assert legacy == [legacy_message, admin_postback, setup_message, no_user_event]
+    db.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_autopilot_rollout_global_off_keeps_everyone_on_legacy():
+    from app.api import line as line_module
+
+    events = [{"type": "message", "source": {"userId": "U-flagged"}}]
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_inbox_rollout", "autopilot", create=True), patch(
+        "app.api.line.settings.line_autopilot_enabled", False
+    ):
+        queued, legacy = await line_module._partition_line_events(events, db)
+
+    assert queued == []
+    assert legacy == events
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_webhook_routing_lookup_failure_rolls_back_and_uses_legacy():
+    import json
+
+    from app.api import line as line_module
+
+    events = [
+        {
+            "type": "message",
+            "webhookEventId": "EV-fallback",
+            "source": {"userId": "U-patient"},
+            "message": {"type": "text", "text": "予約について相談です"},
+        }
+    ]
+    request = SimpleNamespace(body=AsyncMock(return_value=json.dumps({"events": events}).encode()))
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_channel_access_token", "token"), patch(
+        "app.api.line._verify_signature", new=Mock()
+    ), patch(
+        "app.api.line._partition_line_events", new=AsyncMock(side_effect=RuntimeError("db unavailable"))
+    ), patch("app.api.line.enqueue_line_events", new=AsyncMock()) as mock_enqueue, patch(
+        "app.api.line._dispatch_line_event", new=AsyncMock()
+    ) as mock_dispatch:
+        result = await line_module.line_webhook(request, db, "signature")
+
+    assert result == {"status": "ok", "queued": 0}
+    db.rollback.assert_awaited_once()
+    mock_enqueue.assert_not_awaited()
+    mock_dispatch.assert_awaited_once_with(events[0], db)
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_legacy_handler_failure_is_not_allowed_to_abort_later_events():
+    import json
+
+    from app.api import line as line_module
+
+    events = [
+        {"type": "message", "webhookEventId": "EV-bad", "source": {"userId": "U-one"}},
+        {"type": "message", "webhookEventId": "EV-good", "source": {"userId": "U-two"}},
+    ]
+    request = SimpleNamespace(body=AsyncMock(return_value=json.dumps({"events": events}).encode()))
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_channel_access_token", "token"), patch(
+        "app.api.line._verify_signature", new=Mock()
+    ), patch(
+        "app.api.line._partition_line_events", new=AsyncMock(return_value=([], events))
+    ), patch(
+        "app.api.line._dispatch_line_event",
+        new=AsyncMock(side_effect=[ValueError("bad event"), None]),
+    ) as mock_dispatch, patch(
+        "app.api.line._notify_webhook_failure", new=AsyncMock()
+    ) as mock_notify:
+        result = await line_module.line_webhook(request, db, "signature")
+
+    assert result == {"status": "ok", "queued": 0}
+    assert mock_dispatch.await_count == 2
+    db.rollback.assert_awaited_once()
+    mock_notify.assert_awaited_once()
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_same_webhook_event_id_is_stored_only_once():
+    from app.services.line_inbox import enqueue_events
+
+    event = {
+        "type": "message",
+        "webhookEventId": "EV-dup",
+        "deliveryContext": {"isRedelivery": True},
+        "source": {"userId": "U-patient"},
+        "timestamp": 1756800000000,
+        "message": {"type": "text", "text": "予約したい"},
+    }
+    db = AsyncMock()
+    db.scalar = AsyncMock(side_effect=[None, 10])
+    db.add = Mock()
+    db.begin_nested = Mock(return_value=AsyncMock())
+
+    assert await enqueue_events(db, [event]) == 1
+    assert await enqueue_events(db, [event]) == 0
+    assert db.add.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_deferred_processing_uses_reply_before_push(caplog):
+    from app.api import line as line_module
+
+    caplog.set_level("INFO", logger="app.api.line")
+    user_context = line_module._DEFERRED_REPLY_USER.set("U-patient")
+    reply_context = line_module._DEFERRED_REPLY_TOKEN.set("reply-token")
+    received_at_context = line_module._DEFERRED_REPLY_RECEIVED_AT.set(line_module.now_jst())
+    used_context = line_module._DEFERRED_REPLY_TOKEN_USED.set(False)
+    try:
+        with patch("app.api.line.push_message", new=AsyncMock(return_value=True)) as mock_push, patch(
+            "app.api.line._reply_to_line_api", new=AsyncMock(return_value=True)
+        ) as mock_reply_api:
+            assert await line_module.reply_to_line("reply-token", "ご予約を承りました。") is True
+    finally:
+        line_module._DEFERRED_REPLY_TOKEN_USED.reset(used_context)
+        line_module._DEFERRED_REPLY_RECEIVED_AT.reset(received_at_context)
+        line_module._DEFERRED_REPLY_TOKEN.reset(reply_context)
+        line_module._DEFERRED_REPLY_USER.reset(user_context)
+
+    mock_reply_api.assert_awaited_once_with("reply-token", "ご予約を承りました。")
+    mock_push.assert_not_awaited()
+    assert "LINE deferred response sent via reply API" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_deferred_processing_falls_back_to_push_when_reply_fails(caplog):
+    from app.api import line as line_module
+
+    caplog.set_level("INFO", logger="app.api.line")
+    user_context = line_module._DEFERRED_REPLY_USER.set("U-patient")
+    reply_context = line_module._DEFERRED_REPLY_TOKEN.set("reply-token")
+    received_at_context = line_module._DEFERRED_REPLY_RECEIVED_AT.set(line_module.now_jst())
+    used_context = line_module._DEFERRED_REPLY_TOKEN_USED.set(False)
+    try:
+        with patch("app.api.line.push_message", new=AsyncMock(return_value=True)) as mock_push, patch(
+            "app.api.line._reply_to_line_api", new=AsyncMock(return_value=False)
+        ) as mock_reply_api:
+            assert await line_module.reply_to_line("reply-token", "ご予約を承りました。") is True
+    finally:
+        line_module._DEFERRED_REPLY_TOKEN_USED.reset(used_context)
+        line_module._DEFERRED_REPLY_RECEIVED_AT.reset(received_at_context)
+        line_module._DEFERRED_REPLY_TOKEN.reset(reply_context)
+        line_module._DEFERRED_REPLY_USER.reset(user_context)
+
+    mock_reply_api.assert_awaited_once_with("reply-token", "ご予約を承りました。")
+    mock_push.assert_awaited_once_with("U-patient", "ご予約を承りました。")
+    assert "LINE push fallback sent (reason=reply_api_failed)" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_deferred_processing_uses_push_for_second_message_in_same_event():
+    from app.api import line as line_module
+
+    user_context = line_module._DEFERRED_REPLY_USER.set("U-patient")
+    reply_context = line_module._DEFERRED_REPLY_TOKEN.set("reply-token")
+    received_at_context = line_module._DEFERRED_REPLY_RECEIVED_AT.set(line_module.now_jst())
+    used_context = line_module._DEFERRED_REPLY_TOKEN_USED.set(False)
+    try:
+        with patch("app.api.line.push_message", new=AsyncMock(return_value=True)) as mock_push, patch(
+            "app.api.line._reply_to_line_api", new=AsyncMock(return_value=True)
+        ) as mock_reply_api:
+            await line_module.reply_to_line("reply-token", "1通目")
+            await line_module.reply_to_line("reply-token", "2通目")
+    finally:
+        line_module._DEFERRED_REPLY_TOKEN_USED.reset(used_context)
+        line_module._DEFERRED_REPLY_RECEIVED_AT.reset(received_at_context)
+        line_module._DEFERRED_REPLY_TOKEN.reset(reply_context)
+        line_module._DEFERRED_REPLY_USER.reset(user_context)
+
+    mock_reply_api.assert_awaited_once_with("reply-token", "1通目")
+    mock_push.assert_awaited_once_with("U-patient", "2通目")
+
+
+@pytest.mark.asyncio
+async def test_deferred_processing_skips_reply_for_old_webhook():
+    from app.api import line as line_module
+
+    old_received_at = line_module.now_jst() - timedelta(seconds=61)
+    user_context = line_module._DEFERRED_REPLY_USER.set("U-patient")
+    reply_context = line_module._DEFERRED_REPLY_TOKEN.set("reply-token")
+    received_at_context = line_module._DEFERRED_REPLY_RECEIVED_AT.set(old_received_at)
+    used_context = line_module._DEFERRED_REPLY_TOKEN_USED.set(False)
+    try:
+        with patch("app.api.line.push_message", new=AsyncMock(return_value=True)) as mock_push, patch(
+            "app.api.line._reply_to_line_api", new=AsyncMock(return_value=True)
+        ) as mock_reply_api:
+            assert await line_module.reply_to_line("reply-token", "期限切れイベント") is True
+    finally:
+        line_module._DEFERRED_REPLY_TOKEN_USED.reset(used_context)
+        line_module._DEFERRED_REPLY_RECEIVED_AT.reset(received_at_context)
+        line_module._DEFERRED_REPLY_TOKEN.reset(reply_context)
+        line_module._DEFERRED_REPLY_USER.reset(user_context)
+
+    mock_reply_api.assert_not_awaited()
+    mock_push.assert_awaited_once_with("U-patient", "期限切れイベント")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_type", ["quick_reply", "flex"])
+async def test_deferred_processing_prefers_reply_for_structured_messages(message_type):
+    from app.api import line as line_module
+
+    user_context = line_module._DEFERRED_REPLY_USER.set("U-patient")
+    reply_context = line_module._DEFERRED_REPLY_TOKEN.set("reply-token")
+    received_at_context = line_module._DEFERRED_REPLY_RECEIVED_AT.set(line_module.now_jst())
+    used_context = line_module._DEFERRED_REPLY_TOKEN_USED.set(False)
+    try:
+        if message_type == "quick_reply":
+            reply_api = AsyncMock(return_value=True)
+            push_api = AsyncMock(return_value=True)
+            with patch.object(line_module, "_reply_text_with_quick_reply_api", reply_api), patch.object(
+                line_module, "push_text_with_quick_reply", push_api
+            ):
+                await line_module.reply_text_with_quick_reply("reply-token", "選んでください", [{"type": "action"}])
+        else:
+            reply_api = AsyncMock(return_value=True)
+            push_api = AsyncMock(return_value=True)
+            with patch.object(line_module, "_reply_flex_message_api", reply_api), patch.object(
+                line_module, "push_flex_message", push_api
+            ):
+                await line_module.reply_flex_message("reply-token", "予約内容", {"type": "bubble"})
+    finally:
+        line_module._DEFERRED_REPLY_TOKEN_USED.reset(used_context)
+        line_module._DEFERRED_REPLY_RECEIVED_AT.reset(received_at_context)
+        line_module._DEFERRED_REPLY_TOKEN.reset(reply_context)
+        line_module._DEFERRED_REPLY_USER.reset(user_context)
+
+    assert reply_api.await_count == 1
+    push_api.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pending_event_worker_sets_and_clears_reply_context():
+    from app.api import line as line_module
+
+    event_timestamp = int(datetime.now().timestamp() * 1000)
+    received_at = line_module.now_jst()
+    event = {
+        "type": "message",
+        "replyToken": "reply-token",
+        "timestamp": event_timestamp,
+        "source": {"userId": "U-patient"},
+        "message": {"type": "text", "text": "予約したい"},
+    }
+    db = AsyncMock()
+
+    class SessionContext:
+        async def __aenter__(self):
+            return db
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    async def assert_worker_context(payload, session):
+        assert payload is event
+        assert session is db
+        assert line_module._DEFERRED_REPLY_USER.get() == "U-patient"
+        assert line_module._DEFERRED_REPLY_TOKEN.get() == "reply-token"
+        assert line_module._DEFERRED_REPLY_RECEIVED_AT.get() == received_at
+        assert line_module._DEFERRED_REPLY_TOKEN_USED.get() is False
+
+    record = {"id": 1, "line_user_id": "U-patient", "payload": event, "received_at": received_at}
+    with patch("app.api.line.settings.line_inbox_rollout", "legacy"), patch(
+        "app.api.line.async_session", side_effect=SessionContext
+    ), patch(
+        "app.api.line.claim_pending_events", new=AsyncMock(return_value=[record])
+    ), patch("app.api.line._dispatch_line_event", new=AsyncMock(side_effect=assert_worker_context)), patch(
+        "app.api.line.mark_event_done", new=AsyncMock()
+    ):
+        assert await line_module.process_pending_line_events() == 1
+
+    assert line_module._DEFERRED_REPLY_USER.get() is None
+    assert line_module._DEFERRED_REPLY_TOKEN.get() is None
+    assert line_module._DEFERRED_REPLY_RECEIVED_AT.get() is None
+    assert line_module._DEFERRED_REPLY_TOKEN_USED.get() is False
+
+
+@pytest.mark.asyncio
+async def test_recently_received_old_event_still_uses_reply_token():
+    from app.api import line as line_module
+
+    old_event_timestamp = int((datetime.now() - timedelta(minutes=10)).timestamp() * 1000)
+    user_context = line_module._DEFERRED_REPLY_USER.set("U-patient")
+    reply_context = line_module._DEFERRED_REPLY_TOKEN.set("reply-token")
+    received_at_context = line_module._DEFERRED_REPLY_RECEIVED_AT.set(line_module.now_jst())
+    used_context = line_module._DEFERRED_REPLY_TOKEN_USED.set(False)
+    try:
+        with patch("app.api.line.push_message", new=AsyncMock(return_value=True)) as mock_push, patch(
+            "app.api.line._reply_to_line_api", new=AsyncMock(return_value=True)
+        ) as mock_reply_api:
+            event = {"timestamp": old_event_timestamp, "replyToken": "reply-token"}
+            assert await line_module.reply_to_line(event["replyToken"], "再送への返信") is True
+    finally:
+        line_module._DEFERRED_REPLY_TOKEN_USED.reset(used_context)
+        line_module._DEFERRED_REPLY_RECEIVED_AT.reset(received_at_context)
+        line_module._DEFERRED_REPLY_TOKEN.reset(reply_context)
+        line_module._DEFERRED_REPLY_USER.reset(user_context)
+
+    mock_reply_api.assert_awaited_once_with("reply-token", "再送への返信")
+    mock_push.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_with_multiple_reservations_offers_postback_choices():
+    from app.api.line import _handle_text_message
+    from app.utils.datetime_jst import JST
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    reservations = [
+        SimpleNamespace(id=91, start_time=datetime(2026, 9, 5, 14, 0, tzinfo=JST)),
+        SimpleNamespace(id=92, start_time=datetime(2026, 9, 12, 10, 30, tzinfo=JST)),
+    ]
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "予約をキャンセルしたいです"},
+    }
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state",
+        new=AsyncMock(return_value={"mode": "idle", "draft": {}, "request_id": None, "context_data": {}}),
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="idle")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch(
+        "app.api.line.parse_line_message",
+        new=AsyncMock(return_value={"intent": "cancel", "constraints": [], "has_reservation_intent": True}),
+    ), patch("app.api.line.build_clinic_context", new=AsyncMock(return_value={})), patch(
+        "app.api.line._get_patient_default_preset", new=AsyncMock(return_value=None)
+    ), patch(
+        "app.api.line._find_upcoming_reservations", new=AsyncMock(return_value=reservations)
+    ), patch("app.api.line._handoff_autopilot_to_human", new=AsyncMock()) as mock_handoff, patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ) as mock_set_mode, patch(
+        "app.api.line.reply_text_with_quick_reply", new=AsyncMock()
+    ) as mock_quick_reply:
+        await _handle_text_message(event, db)
+
+    mock_handoff.assert_not_awaited()
+    mock_set_mode.assert_not_awaited()
+    items = mock_quick_reply.await_args.args[2]
+    assert [item["action"]["data"] for item in items] == [
+        "action=cancel_select&reservation_id=91",
+        "action=cancel_select&reservation_id=92",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_select_rejects_reservation_owned_by_another_patient():
+    from app.api.line import _handle_postback
+    from app.utils.datetime_jst import JST
+
+    patient = SimpleNamespace(id=7, line_autopilot_enabled=True)
+    someone_elses = SimpleNamespace(
+        id=99,
+        patient_id=8,
+        status="CONFIRMED",
+        start_time=datetime(2099, 9, 5, 14, 0, tzinfo=JST),
+    )
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=someone_elses)
+
+    with patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line.merge_user_draft", new=AsyncMock()
+    ) as mock_merge, patch("app.api.line.set_user_mode", new=AsyncMock()) as mock_set_mode, patch(
+        "app.api.line.reply_to_line", new=AsyncMock()
+    ):
+        await _handle_postback(
+            {
+                "replyToken": "reply-token",
+                "source": {"userId": "U-autopilot"},
+                "postback": {"data": "action=cancel_select&reservation_id=99"},
+            },
+            db,
+        )
+
+    mock_merge.assert_not_awaited()
+    mock_set_mode.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shadow_admin_notification_is_sent_once_to_the_acting_admin():
+    from app.api.line import _notify_shadow_admin
+
+    with patch("app.api.line.push_message", new=AsyncMock()) as mock_push, patch(
+        "app.api.line.reply_to_line", new=AsyncMock()
+    ) as mock_reply, patch("app.api.line.settings.line_admin_user_id", "U-admin"):
+        await _notify_shadow_admin("予約システムに登録し予約完了しました。", "reply-token", "U-admin")
+
+    mock_push.assert_awaited_once_with("U-admin", "予約システムに登録し予約完了しました。")
+    mock_reply.assert_not_awaited()
