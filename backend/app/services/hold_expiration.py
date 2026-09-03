@@ -408,9 +408,42 @@ async def check_schedule_conflicts_morning():
         logger.info("morning schedule conflict scan: %d alerts pushed", len(alerts))
 
 
+async def process_line_webhook_events():
+    """DBに保存済みのLINE受信イベントを処理する。
+
+    別のRenderサービスを増やさずに済むよう、バックエンドと同じプロセスで回す。
+    """
+    from app.api.line import process_pending_line_events
+
+    try:
+        await process_pending_line_events()
+    except Exception:
+        logger.exception("LINE webhook event worker failed")
+
+
+async def cleanup_processed_line_events():
+    """処理済みイベントは患者の文面を含むため長く残さない。"""
+    from app.services.line_inbox import delete_processed_events_before
+
+    async with async_session() as db:
+        deleted = await delete_processed_events_before(db, now_jst() - timedelta(days=3))
+        await db.commit()
+    if deleted:
+        logger.info("deleted %d processed LINE webhook events", deleted)
+
+
 def start_hold_expiration_job():
     scheduler.add_job(expire_holds, "interval", minutes=1, id="hold_expiration")
     scheduler.add_job(expire_chat_sessions, "interval", minutes=10, id="chat_session_expiration")
+    scheduler.add_job(
+        process_line_webhook_events,
+        "interval",
+        seconds=2,
+        id="line_webhook_events",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(cleanup_processed_line_events, "cron", hour=4, minute=0, id="line_webhook_events_cleanup")
     # HP未転記リマインドは1日2回に抑制: 朝一(最優先・本日分のみ)と午後(1週間分・低優先度)
     scheduler.add_job(check_hotpepper_unsynced_urgent_morning, "cron", hour=8, minute=30, id="hotpepper_urgent_morning")
     scheduler.add_job(check_hotpepper_unsynced_weekly, "cron", hour=15, minute=0, id="hotpepper_weekly_reminder")

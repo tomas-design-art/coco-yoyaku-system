@@ -1,4 +1,5 @@
 """LINE Webhook & API（AI秘書: 第1段階）"""
+import asyncio
 import base64
 from contextvars import ContextVar
 from datetime import date, datetime, time, timedelta
@@ -20,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.line_parser import classify_conversation_control, extract_full_name, parse_line_message
 from app.config import settings
-from app.database import get_db
+from app.database import async_session, get_db
 from app.models.menu import Menu
 from app.models.patient import Patient
 from app.models.practitioner import Practitioner
@@ -33,6 +34,12 @@ from app.services.conflict_detector import check_conflict
 from app.services.line_alerts import build_reservation_review_flex, push_admin_reservation_review
 from app.services.line_composer import compose_reply
 from app.services.line_debounce import clear_debounce, is_duplicate_message, merge_debounced_message
+from app.services.line_inbox import (
+    claim_pending_events,
+    enqueue_events as enqueue_line_events,
+    mark_done as mark_event_done,
+    mark_failed as mark_event_failed,
+)
 from app.services.business_hours import get_business_hours_for_date
 from app.services.clinic_context import (
     build_clinic_context,
@@ -54,7 +61,13 @@ from app.services.slot_scorer import (
     find_best_practitioner,
     score_candidates,
 )
-from app.services.line_reply import push_message, reply_flex_message, reply_text_with_quick_reply, reply_to_line
+from app.services.line_reply import (
+    push_message,
+    push_text_with_quick_reply,
+    reply_flex_message,
+    reply_text_with_quick_reply as _reply_text_with_quick_reply_api,
+    reply_to_line as _reply_to_line_api,
+)
 from app.services.line_state import (
     append_conversation_history,
     clear_user_draft,
@@ -91,6 +104,32 @@ _AUTOPILOT_USER_CONTEXT: ContextVar[str | None] = ContextVar("autopilot_user", d
 # 院の確定情報（休診日・施術者の休み・メニューの施術時間）。
 # 解析と文面生成の両方が同じ事実を見るための共有点。
 _AUTOPILOT_CLINIC_CONTEXT: ContextVar[dict] = ContextVar("autopilot_clinic", default={})
+# Webhook を即 200 で返してから処理すると、応答トークンの1分の期限に間に合わない。
+# その間の返信先をここに入れ、全て push へ切り替える。
+_DEFERRED_REPLY_USER: ContextVar[str | None] = ContextVar("deferred_reply_user", default=None)
+_LINE_EVENT_WORKER_LOCK = asyncio.Lock()
+
+
+async def reply_to_line(reply_token: str | None, message: str) -> bool:
+    deferred_user = _DEFERRED_REPLY_USER.get()
+    if deferred_user:
+        return await push_message(deferred_user, message)
+    if not reply_token:
+        return False
+    return await _reply_to_line_api(reply_token, message)
+
+
+async def reply_text_with_quick_reply(
+    reply_token: str | None,
+    message: str,
+    items: list[dict],
+) -> bool:
+    deferred_user = _DEFERRED_REPLY_USER.get()
+    if deferred_user:
+        return await push_text_with_quick_reply(deferred_user, message, items)
+    if not reply_token:
+        return False
+    return await _reply_text_with_quick_reply_api(reply_token, message, items)
 
 router = APIRouter(prefix="/api/line", tags=["line"])
 
@@ -832,20 +871,49 @@ async def _find_change_target_reservation(
     return None
 
 
-async def _find_single_upcoming_reservation(db: AsyncSession, patient_id: int) -> Reservation | None:
-    reservations = (
-        await db.execute(
-            select(Reservation)
-            .where(
-                Reservation.patient_id == patient_id,
-                Reservation.status == "CONFIRMED",
-                Reservation.start_time >= now_jst(),
-            )
-            .order_by(Reservation.start_time)
-            .limit(2)
+def _build_cancel_selection_items(reservations: list[Reservation]) -> list[dict]:
+    items = []
+    for reservation in reservations:
+        start = reservation.start_time.astimezone(JST)
+        label = start.strftime("%m/%d %H:%M")
+        items.append(
+            {
+                "type": "action",
+                "action": {
+                    "type": "postback",
+                    "label": label[:20],
+                    "data": f"action=cancel_select&reservation_id={reservation.id}",
+                    "displayText": f"{label}のご予約をキャンセル",
+                },
+            }
         )
-    ).scalars().all()
-    return reservations[0] if len(reservations) == 1 else None
+    return items
+
+
+def _compose_cancel_selection_text(reservations: list[Reservation]) -> str:
+    lines = ["キャンセルするご予約を選んでください。"]
+    for reservation in reservations:
+        start = reservation.start_time.astimezone(JST)
+        lines.append(f"・{_format_date_with_weekday_jp(start.date())} {start.strftime('%H:%M')}")
+    return "\n".join(lines)
+
+
+async def _find_owned_cancellable_reservation(
+    db: AsyncSession,
+    patient_id: int,
+    reservation_id: int,
+) -> Reservation | None:
+    """postback の予約IDは他人のものを送られうるので、必ず持ち主を照合する。"""
+    reservation = await db.get(Reservation, reservation_id)
+    if not reservation:
+        return None
+    if reservation.patient_id != patient_id:
+        return None
+    if reservation.status != "CONFIRMED":
+        return None
+    if reservation.start_time.astimezone(JST) < now_jst():
+        return None
+    return reservation
 
 
 def _requires_manual_autopilot_handling(text: str) -> bool:
@@ -2740,8 +2808,8 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         return
 
     if is_autopilot_patient and ((parsed_intent or {}).get("intent") == "cancel" or _has_cancellation_intent(text)):
-        reservation = await _find_single_upcoming_reservation(db, line_patient.id)
-        if not reservation:
+        upcoming = await _find_upcoming_reservations(db, line_patient.id)
+        if not upcoming:
             await _handoff_autopilot_to_human(
                 db,
                 user_id=user_id,
@@ -2752,6 +2820,16 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 notification=f"LINEキャンセル要確認: {line_patient.id}",
             )
             return
+        if len(upcoming) > 1:
+            # どの予約かはLLMに推測させず、患者本人に選択で確定させる。
+            if reply_token or _DEFERRED_REPLY_USER.get():
+                await reply_text_with_quick_reply(
+                    reply_token,
+                    _compose_cancel_selection_text(upcoming),
+                    _build_cancel_selection_items(upcoming),
+                )
+            return
+        reservation = upcoming[0]
         await merge_user_draft(db, user_id, {"autopilot_cancel_reservation_id": reservation.id})
         await set_user_mode(db, user_id, "autopilot_cancel_confirm")
         if reply_token:
@@ -3628,8 +3706,60 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     await set_user_mode(db, user_id, "adjusting", request_id)
 
 
+async def _handle_cancel_selection(
+    db: AsyncSession,
+    query: dict,
+    reply_token: str | None,
+    actor_user_id: str | None,
+) -> None:
+    """\u9078\u629e\u3055\u308c\u305f\u4e88\u7d04\u3092\u30ad\u30e3\u30f3\u30bb\u30eb\u78ba\u8a8d\u3078\u9032\u3081\u308b\u3002
+
+    \u4fe1\u7528\u3059\u308b\u306e\u306f postback \u306e uid \u3067\u306f\u306a\u304f\u3001LINE \u304c\u4ed8\u4e0e\u3059\u308b\u9001\u4fe1\u8005\u306e userId\u3002
+    """
+    if not actor_user_id:
+        return
+
+    raw_id = (query.get("reservation_id") or [""])[0]
+    try:
+        reservation_id = int(raw_id)
+    except (TypeError, ValueError):
+        return
+
+    patient = await _find_line_patient(db, actor_user_id)
+    if not patient or not patient.line_autopilot_enabled:
+        return
+
+    reservation = await _find_owned_cancellable_reservation(db, patient.id, reservation_id)
+    if not reservation:
+        await reply_to_line(reply_token, "\u5bfe\u8c61\u306e\u3054\u4e88\u7d04\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093\u3067\u3057\u305f\u3002\u304a\u624b\u6570\u3067\u3059\u304c\u3082\u3046\u4e00\u5ea6\u304a\u77e5\u3089\u305b\u304f\u3060\u3055\u3044\u3002")
+        return
+
+    start = reservation.start_time.astimezone(JST)
+    await merge_user_draft(db, actor_user_id, {"autopilot_cancel_reservation_id": reservation.id})
+    await set_user_mode(db, actor_user_id, "autopilot_cancel_confirm")
+    await reply_to_line(
+        reply_token,
+        await _compose_autopilot_reply(
+            "cancel_confirm",
+            {
+                "date": start.strftime("%Y/%m/%d"),
+                "start": start.strftime("%H:%M"),
+                "patient_message": "\u30ad\u30e3\u30f3\u30bb\u30eb\u3059\u308b\u4e88\u7d04\u3092\u9078\u629e",
+            },
+        ),
+    )
+
+
+async def _notify_shadow_admin(text: str, reply_token: str | None, actor_user_id: str | None) -> None:
+    """同じ本文を push と reply の両方で送ると、操作した管理者に2通届く。"""
+    await push_message(settings.line_admin_user_id, text)
+    if reply_token and actor_user_id and actor_user_id != settings.line_admin_user_id:
+        await reply_to_line(reply_token, text)
+
+
 async def _handle_postback(event: dict, db: AsyncSession):
     reply_token = event.get("replyToken")
+    actor_user_id = event.get("source", {}).get("userId")
     data_str = event.get("postback", {}).get("data", "")
     if not data_str:
         return
@@ -3638,6 +3768,11 @@ async def _handle_postback(event: dict, db: AsyncSession):
     action = (q.get("action") or [""])[0]
     rid = (q.get("rid") or [""])[0]
     line_user_id = (q.get("uid") or [""])[0] or None
+
+    if action == "cancel_select":
+        await _handle_cancel_selection(db, q, reply_token, actor_user_id)
+        return
+
     req = await get_request(db, rid, line_user_id=line_user_id)
     if not req:
         if reply_token:
@@ -3737,9 +3872,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
                 f"{date_label} {time_label}〜{duration_minutes}分です。"
                 f" 理由: {detail}"
             )
-            await push_message(settings.line_admin_user_id, admin_fail_text)
-            if reply_token:
-                await reply_to_line(reply_token, admin_fail_text)
+            await _notify_shadow_admin(admin_fail_text, reply_token, actor_user_id)
             await update_request(db, rid, line_user_id=user_id, status="manual_reply")
             await set_user_mode(db, user_id, "manual", rid)
             return
@@ -3749,9 +3882,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
                 f"{date_label} {time_label}〜{duration_minutes}分です。"
                 f" 理由: {str(e)}"
             )
-            await push_message(settings.line_admin_user_id, admin_fail_text)
-            if reply_token:
-                await reply_to_line(reply_token, admin_fail_text)
+            await _notify_shadow_admin(admin_fail_text, reply_token, actor_user_id)
             await update_request(db, rid, line_user_id=user_id, status="manual_reply")
             await set_user_mode(db, user_id, "manual", rid)
             return
@@ -3785,9 +3916,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
                 f"\n[シャドー送信なし/患者返信想定]\n{simulated_reply}"
             )
 
-        await push_message(settings.line_admin_user_id, admin_ok_text)
-        if reply_token:
-            await reply_to_line(reply_token, admin_ok_text)
+        await _notify_shadow_admin(admin_ok_text, reply_token, actor_user_id)
 
     elif action == "shadow_alt":
         alt_raw = (q.get("alt") or ["0"])[0]
@@ -3839,9 +3968,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
                 f"{alt_date_label} {alt_time_label}〜{alt_duration_minutes}分です。"
                 f" 理由: {detail}"
             )
-            await push_message(settings.line_admin_user_id, admin_fail_text)
-            if reply_token:
-                await reply_to_line(reply_token, admin_fail_text)
+            await _notify_shadow_admin(admin_fail_text, reply_token, actor_user_id)
             await update_request(db, rid, line_user_id=user_id, status="manual_reply")
             await set_user_mode(db, user_id, "manual", rid)
             return
@@ -3851,9 +3978,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
                 f"{alt_date_label} {alt_time_label}〜{alt_duration_minutes}分です。"
                 f" 理由: {str(e)}"
             )
-            await push_message(settings.line_admin_user_id, admin_fail_text)
-            if reply_token:
-                await reply_to_line(reply_token, admin_fail_text)
+            await _notify_shadow_admin(admin_fail_text, reply_token, actor_user_id)
             await update_request(db, rid, line_user_id=user_id, status="manual_reply")
             await set_user_mode(db, user_id, "manual", rid)
             return
@@ -3888,9 +4013,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
                 f"\n[シャドー送信なし/患者返信想定]\n{simulated_reply}"
             )
 
-        await push_message(settings.line_admin_user_id, admin_ok_text)
-        if reply_token:
-            await reply_to_line(reply_token, admin_ok_text)
+        await _notify_shadow_admin(admin_ok_text, reply_token, actor_user_id)
 
     elif action == "shadow_manual":
         await update_request(db, rid, line_user_id=user_id, status="manual_reply")
@@ -3931,6 +4054,7 @@ async def _handle_admin_text_command(db: AsyncSession, text: str, reply_token: s
     # 承認: 仮想 postback イベントを作って既存処理を再利用
     fake_event = {
         "replyToken": reply_token,
+        "source": {"userId": settings.admin_line_developer_user_id},
         "postback": {"data": f"action=shadow_approve&rid={rid}&uid={patient_uid}"},
     }
     await _handle_postback(fake_event, db)
@@ -3965,13 +4089,58 @@ async def _notify_webhook_failure(event: dict, error: Exception) -> None:
             logger.exception("failed to reply after webhook failure")
 
 
+async def _dispatch_line_event(event: dict, db: AsyncSession) -> None:
+    if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
+        await _handle_text_message(event, db)
+    elif event.get("type") == "postback":
+        await _handle_postback(event, db)
+
+
+async def process_pending_line_events(limit: int = 20) -> int:
+    """DBに残った受信イベントを1件ずつ処理する。
+
+    同じ患者の2通目が1通目を追い越すと会話状態が壊れるため、直列に処理する。
+    Webhook のリクエストとは別のセッションを使う（Depends のセッションは
+    レスポンス返却時に閉じられている）。
+    """
+    if _LINE_EVENT_WORKER_LOCK.locked():
+        return 0
+
+    async with _LINE_EVENT_WORKER_LOCK:
+        async with async_session() as db:
+            claimed = await claim_pending_events(db, limit=limit)
+            await db.commit()
+
+        processed = 0
+        for record in claimed:
+            payload = record["payload"] or {}
+            token = _DEFERRED_REPLY_USER.set(record["line_user_id"])
+            try:
+                async with async_session() as db:
+                    try:
+                        await _dispatch_line_event(payload, db)
+                        await mark_event_done(db, record["id"])
+                        await db.commit()
+                        processed += 1
+                    except Exception as error:
+                        await db.rollback()
+                        logger.exception("LINE webhook event processing failed")
+                        await _notify_webhook_failure(payload, error)
+                        async with async_session() as fail_db:
+                            await mark_event_failed(fail_db, record["id"], f"{type(error).__name__}: {error}")
+                            await fail_db.commit()
+            finally:
+                _DEFERRED_REPLY_USER.reset(token)
+        return processed
+
+
 @router.post("/webhook")
 async def line_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db),
     x_line_signature: Optional[str] = Header(None),
 ):
-    """LINE Webhook受信（予約意図抽出 -> 空き照会 -> 管理者確認通知）"""
+    """LINE Webhook受信。署名検証後は保存だけして即 200 を返す。"""
     if not settings.line_channel_access_token or settings.line_channel_access_token == "xxx":
         logger.info("LINE_CHANNEL_ACCESS_TOKEN が未設定のため Webhook をスキップします")
         return {"status": "skipped"}
@@ -3982,22 +4151,9 @@ async def line_webhook(
     payload = json.loads(body)
     await _forward_line_webhook_to_mirror(payload)
 
-    events = payload.get("events", [])
-    for event in events:
-        try:
-            if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
-                await _handle_text_message(event, db)
-            elif event.get("type") == "postback":
-                await _handle_postback(event, db)
-        except Exception as error:
-            # ここで例外を通すと 500 になり、患者へは何も返らず db.commit() も走らない。
-            # 「送ったのに無反応」で原因も残らないため、必ず捕まえて通知する。
-            logger.exception("LINE webhook handler failed")
-            await db.rollback()
-            await _notify_webhook_failure(event, error)
-
+    queued = await enqueue_line_events(db, payload.get("events", []))
     await db.commit()
-    return {"status": "ok"}
+    return {"status": "ok", "queued": queued}
 
 
 @router.post("/mirror-webhook")

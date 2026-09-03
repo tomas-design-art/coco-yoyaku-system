@@ -59,6 +59,38 @@ async def push_message(user_id: str, message: str) -> bool:
     return await push_message_with_access_token(user_id, message, settings.line_channel_access_token)
 
 
+async def push_text_with_quick_reply(user_id: str, message: str, items: list[dict]) -> bool:
+    """LINE QuickReply付きプッシュメッセージ"""
+    if not settings.line_channel_access_token or settings.line_channel_access_token == "xxx":
+        logger.warning("LINE access token not configured, skipping push")
+        return False
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.line.me/v2/bot/message/push",
+                headers={
+                    "Authorization": f"Bearer {settings.line_channel_access_token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "to": user_id,
+                    "messages": [
+                        {
+                            "type": "text",
+                            "text": message,
+                            "quickReply": {"items": items},
+                        }
+                    ],
+                },
+                timeout=10,
+            )
+            return response.status_code == 200
+    except Exception as e:
+        logger.error(f"LINE push error: {e}")
+        return False
+
+
 async def push_message_with_access_token(user_id: str, message: str, access_token: str | None) -> bool:
     """任意トークンでLINEプッシュメッセージ"""
     if not access_token or access_token == "xxx":

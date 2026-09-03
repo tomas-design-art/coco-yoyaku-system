@@ -2967,3 +2967,171 @@ def test_usual_confirmation_does_not_treat_change_as_menu_rejection():
     source = _inspect.getsource(line_module._handle_text_message)
     assert '"いいえ", "変更"' not in source
     assert '"いいえ", "ちがう", "違う", "別のメニュー"' in source
+
+
+@pytest.mark.asyncio
+async def test_webhook_stores_events_and_returns_before_running_handlers():
+    import json
+
+    from app.api import line as line_module
+
+    body = json.dumps(
+        {
+            "events": [
+                {
+                    "type": "message",
+                    "webhookEventId": "EV-1",
+                    "deliveryContext": {"isRedelivery": False},
+                    "source": {"userId": "U-patient"},
+                    "message": {"type": "text", "text": "予約したい"},
+                }
+            ]
+        }
+    ).encode()
+    request = SimpleNamespace(body=AsyncMock(return_value=body))
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_channel_access_token", "token"), patch(
+        "app.api.line._verify_signature", new=Mock()
+    ), patch("app.api.line._forward_line_webhook_to_mirror", new=AsyncMock()), patch(
+        "app.api.line.enqueue_line_events", new=AsyncMock(return_value=1)
+    ) as mock_enqueue, patch(
+        "app.api.line._handle_text_message", new=AsyncMock()
+    ) as mock_handle:
+        result = await line_module.line_webhook(request, db, "signature")
+
+    assert result["status"] == "ok"
+    mock_enqueue.assert_awaited_once()
+    mock_handle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_same_webhook_event_id_is_stored_only_once():
+    from app.services.line_inbox import enqueue_events
+
+    event = {
+        "type": "message",
+        "webhookEventId": "EV-dup",
+        "deliveryContext": {"isRedelivery": True},
+        "source": {"userId": "U-patient"},
+        "timestamp": 1756800000000,
+        "message": {"type": "text", "text": "予約したい"},
+    }
+    db = AsyncMock()
+    db.scalar = AsyncMock(side_effect=[None, 10])
+    db.add = Mock()
+    db.begin_nested = Mock(return_value=AsyncMock())
+
+    assert await enqueue_events(db, [event]) == 1
+    assert await enqueue_events(db, [event]) == 0
+    assert db.add.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_deferred_processing_replies_with_push_not_reply_token():
+    from app.api import line as line_module
+
+    token = line_module._DEFERRED_REPLY_USER.set("U-patient")
+    try:
+        with patch("app.api.line.push_message", new=AsyncMock(return_value=True)) as mock_push, patch(
+            "app.api.line._reply_to_line_api", new=AsyncMock()
+        ) as mock_reply_api:
+            await line_module.reply_to_line("expired-reply-token", "ご予約を承りました。")
+    finally:
+        line_module._DEFERRED_REPLY_USER.reset(token)
+
+    mock_push.assert_awaited_once_with("U-patient", "ご予約を承りました。")
+    mock_reply_api.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_with_multiple_reservations_offers_postback_choices():
+    from app.api.line import _handle_text_message
+    from app.utils.datetime_jst import JST
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    reservations = [
+        SimpleNamespace(id=91, start_time=datetime(2026, 9, 5, 14, 0, tzinfo=JST)),
+        SimpleNamespace(id=92, start_time=datetime(2026, 9, 12, 10, 30, tzinfo=JST)),
+    ]
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "予約をキャンセルしたいです"},
+    }
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state",
+        new=AsyncMock(return_value={"mode": "idle", "draft": {}, "request_id": None, "context_data": {}}),
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="idle")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch(
+        "app.api.line.parse_line_message",
+        new=AsyncMock(return_value={"intent": "cancel", "constraints": [], "has_reservation_intent": True}),
+    ), patch("app.api.line.build_clinic_context", new=AsyncMock(return_value={})), patch(
+        "app.api.line._get_patient_default_preset", new=AsyncMock(return_value=None)
+    ), patch(
+        "app.api.line._find_upcoming_reservations", new=AsyncMock(return_value=reservations)
+    ), patch("app.api.line._handoff_autopilot_to_human", new=AsyncMock()) as mock_handoff, patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ) as mock_set_mode, patch(
+        "app.api.line.reply_text_with_quick_reply", new=AsyncMock()
+    ) as mock_quick_reply:
+        await _handle_text_message(event, db)
+
+    mock_handoff.assert_not_awaited()
+    mock_set_mode.assert_not_awaited()
+    items = mock_quick_reply.await_args.args[2]
+    assert [item["action"]["data"] for item in items] == [
+        "action=cancel_select&reservation_id=91",
+        "action=cancel_select&reservation_id=92",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_select_rejects_reservation_owned_by_another_patient():
+    from app.api.line import _handle_postback
+    from app.utils.datetime_jst import JST
+
+    patient = SimpleNamespace(id=7, line_autopilot_enabled=True)
+    someone_elses = SimpleNamespace(
+        id=99,
+        patient_id=8,
+        status="CONFIRMED",
+        start_time=datetime(2099, 9, 5, 14, 0, tzinfo=JST),
+    )
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=someone_elses)
+
+    with patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line.merge_user_draft", new=AsyncMock()
+    ) as mock_merge, patch("app.api.line.set_user_mode", new=AsyncMock()) as mock_set_mode, patch(
+        "app.api.line.reply_to_line", new=AsyncMock()
+    ):
+        await _handle_postback(
+            {
+                "replyToken": "reply-token",
+                "source": {"userId": "U-autopilot"},
+                "postback": {"data": "action=cancel_select&reservation_id=99"},
+            },
+            db,
+        )
+
+    mock_merge.assert_not_awaited()
+    mock_set_mode.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shadow_admin_notification_is_sent_once_to_the_acting_admin():
+    from app.api.line import _notify_shadow_admin
+
+    with patch("app.api.line.push_message", new=AsyncMock()) as mock_push, patch(
+        "app.api.line.reply_to_line", new=AsyncMock()
+    ) as mock_reply, patch("app.api.line.settings.line_admin_user_id", "U-admin"):
+        await _notify_shadow_admin("予約システムに登録し予約完了しました。", "reply-token", "U-admin")
+
+    mock_push.assert_awaited_once_with("U-admin", "予約システムに登録し予約完了しました。")
+    mock_reply.assert_not_awaited()
