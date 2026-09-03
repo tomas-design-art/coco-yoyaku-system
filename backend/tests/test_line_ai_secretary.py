@@ -2993,7 +2993,7 @@ async def test_webhook_stores_events_and_returns_before_running_handlers():
 
     with patch("app.api.line.settings.line_channel_access_token", "token"), patch(
         "app.api.line._verify_signature", new=Mock()
-    ), patch("app.api.line._forward_line_webhook_to_mirror", new=AsyncMock()), patch(
+    ), patch("app.api.line._forward_line_webhook_to_mirror", new=AsyncMock()) as mock_mirror, patch(
         "app.api.line.enqueue_line_events", new=AsyncMock(return_value=1)
     ) as mock_enqueue, patch(
         "app.api.line._handle_text_message", new=AsyncMock()
@@ -3003,6 +3003,7 @@ async def test_webhook_stores_events_and_returns_before_running_handlers():
     assert result["status"] == "ok"
     mock_enqueue.assert_awaited_once()
     mock_handle.assert_not_awaited()
+    mock_mirror.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3028,20 +3029,204 @@ async def test_same_webhook_event_id_is_stored_only_once():
 
 
 @pytest.mark.asyncio
-async def test_deferred_processing_replies_with_push_not_reply_token():
+async def test_deferred_processing_uses_reply_before_push(caplog):
     from app.api import line as line_module
 
-    token = line_module._DEFERRED_REPLY_USER.set("U-patient")
+    caplog.set_level("INFO", logger="app.api.line")
+    user_context = line_module._DEFERRED_REPLY_USER.set("U-patient")
+    reply_context = line_module._DEFERRED_REPLY_TOKEN.set("reply-token")
+    received_at_context = line_module._DEFERRED_REPLY_RECEIVED_AT.set(line_module.now_jst())
+    used_context = line_module._DEFERRED_REPLY_TOKEN_USED.set(False)
     try:
         with patch("app.api.line.push_message", new=AsyncMock(return_value=True)) as mock_push, patch(
-            "app.api.line._reply_to_line_api", new=AsyncMock()
+            "app.api.line._reply_to_line_api", new=AsyncMock(return_value=True)
         ) as mock_reply_api:
-            await line_module.reply_to_line("expired-reply-token", "ご予約を承りました。")
+            assert await line_module.reply_to_line("reply-token", "ご予約を承りました。") is True
     finally:
-        line_module._DEFERRED_REPLY_USER.reset(token)
+        line_module._DEFERRED_REPLY_TOKEN_USED.reset(used_context)
+        line_module._DEFERRED_REPLY_RECEIVED_AT.reset(received_at_context)
+        line_module._DEFERRED_REPLY_TOKEN.reset(reply_context)
+        line_module._DEFERRED_REPLY_USER.reset(user_context)
 
+    mock_reply_api.assert_awaited_once_with("reply-token", "ご予約を承りました。")
+    mock_push.assert_not_awaited()
+    assert "LINE deferred response sent via reply API" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_deferred_processing_falls_back_to_push_when_reply_fails(caplog):
+    from app.api import line as line_module
+
+    caplog.set_level("INFO", logger="app.api.line")
+    user_context = line_module._DEFERRED_REPLY_USER.set("U-patient")
+    reply_context = line_module._DEFERRED_REPLY_TOKEN.set("reply-token")
+    received_at_context = line_module._DEFERRED_REPLY_RECEIVED_AT.set(line_module.now_jst())
+    used_context = line_module._DEFERRED_REPLY_TOKEN_USED.set(False)
+    try:
+        with patch("app.api.line.push_message", new=AsyncMock(return_value=True)) as mock_push, patch(
+            "app.api.line._reply_to_line_api", new=AsyncMock(return_value=False)
+        ) as mock_reply_api:
+            assert await line_module.reply_to_line("reply-token", "ご予約を承りました。") is True
+    finally:
+        line_module._DEFERRED_REPLY_TOKEN_USED.reset(used_context)
+        line_module._DEFERRED_REPLY_RECEIVED_AT.reset(received_at_context)
+        line_module._DEFERRED_REPLY_TOKEN.reset(reply_context)
+        line_module._DEFERRED_REPLY_USER.reset(user_context)
+
+    mock_reply_api.assert_awaited_once_with("reply-token", "ご予約を承りました。")
     mock_push.assert_awaited_once_with("U-patient", "ご予約を承りました。")
+    assert "LINE push fallback sent (reason=reply_api_failed)" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_deferred_processing_uses_push_for_second_message_in_same_event():
+    from app.api import line as line_module
+
+    user_context = line_module._DEFERRED_REPLY_USER.set("U-patient")
+    reply_context = line_module._DEFERRED_REPLY_TOKEN.set("reply-token")
+    received_at_context = line_module._DEFERRED_REPLY_RECEIVED_AT.set(line_module.now_jst())
+    used_context = line_module._DEFERRED_REPLY_TOKEN_USED.set(False)
+    try:
+        with patch("app.api.line.push_message", new=AsyncMock(return_value=True)) as mock_push, patch(
+            "app.api.line._reply_to_line_api", new=AsyncMock(return_value=True)
+        ) as mock_reply_api:
+            await line_module.reply_to_line("reply-token", "1通目")
+            await line_module.reply_to_line("reply-token", "2通目")
+    finally:
+        line_module._DEFERRED_REPLY_TOKEN_USED.reset(used_context)
+        line_module._DEFERRED_REPLY_RECEIVED_AT.reset(received_at_context)
+        line_module._DEFERRED_REPLY_TOKEN.reset(reply_context)
+        line_module._DEFERRED_REPLY_USER.reset(user_context)
+
+    mock_reply_api.assert_awaited_once_with("reply-token", "1通目")
+    mock_push.assert_awaited_once_with("U-patient", "2通目")
+
+
+@pytest.mark.asyncio
+async def test_deferred_processing_skips_reply_for_old_webhook():
+    from app.api import line as line_module
+
+    old_received_at = line_module.now_jst() - timedelta(seconds=61)
+    user_context = line_module._DEFERRED_REPLY_USER.set("U-patient")
+    reply_context = line_module._DEFERRED_REPLY_TOKEN.set("reply-token")
+    received_at_context = line_module._DEFERRED_REPLY_RECEIVED_AT.set(old_received_at)
+    used_context = line_module._DEFERRED_REPLY_TOKEN_USED.set(False)
+    try:
+        with patch("app.api.line.push_message", new=AsyncMock(return_value=True)) as mock_push, patch(
+            "app.api.line._reply_to_line_api", new=AsyncMock(return_value=True)
+        ) as mock_reply_api:
+            assert await line_module.reply_to_line("reply-token", "期限切れイベント") is True
+    finally:
+        line_module._DEFERRED_REPLY_TOKEN_USED.reset(used_context)
+        line_module._DEFERRED_REPLY_RECEIVED_AT.reset(received_at_context)
+        line_module._DEFERRED_REPLY_TOKEN.reset(reply_context)
+        line_module._DEFERRED_REPLY_USER.reset(user_context)
+
     mock_reply_api.assert_not_awaited()
+    mock_push.assert_awaited_once_with("U-patient", "期限切れイベント")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_type", ["quick_reply", "flex"])
+async def test_deferred_processing_prefers_reply_for_structured_messages(message_type):
+    from app.api import line as line_module
+
+    user_context = line_module._DEFERRED_REPLY_USER.set("U-patient")
+    reply_context = line_module._DEFERRED_REPLY_TOKEN.set("reply-token")
+    received_at_context = line_module._DEFERRED_REPLY_RECEIVED_AT.set(line_module.now_jst())
+    used_context = line_module._DEFERRED_REPLY_TOKEN_USED.set(False)
+    try:
+        if message_type == "quick_reply":
+            reply_api = AsyncMock(return_value=True)
+            push_api = AsyncMock(return_value=True)
+            with patch.object(line_module, "_reply_text_with_quick_reply_api", reply_api), patch.object(
+                line_module, "push_text_with_quick_reply", push_api
+            ):
+                await line_module.reply_text_with_quick_reply("reply-token", "選んでください", [{"type": "action"}])
+        else:
+            reply_api = AsyncMock(return_value=True)
+            push_api = AsyncMock(return_value=True)
+            with patch.object(line_module, "_reply_flex_message_api", reply_api), patch.object(
+                line_module, "push_flex_message", push_api
+            ):
+                await line_module.reply_flex_message("reply-token", "予約内容", {"type": "bubble"})
+    finally:
+        line_module._DEFERRED_REPLY_TOKEN_USED.reset(used_context)
+        line_module._DEFERRED_REPLY_RECEIVED_AT.reset(received_at_context)
+        line_module._DEFERRED_REPLY_TOKEN.reset(reply_context)
+        line_module._DEFERRED_REPLY_USER.reset(user_context)
+
+    assert reply_api.await_count == 1
+    push_api.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pending_event_worker_sets_and_clears_reply_context():
+    from app.api import line as line_module
+
+    event_timestamp = int(datetime.now().timestamp() * 1000)
+    received_at = line_module.now_jst()
+    event = {
+        "type": "message",
+        "replyToken": "reply-token",
+        "timestamp": event_timestamp,
+        "source": {"userId": "U-patient"},
+        "message": {"type": "text", "text": "予約したい"},
+    }
+    db = AsyncMock()
+
+    class SessionContext:
+        async def __aenter__(self):
+            return db
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    async def assert_worker_context(payload, session):
+        assert payload is event
+        assert session is db
+        assert line_module._DEFERRED_REPLY_USER.get() == "U-patient"
+        assert line_module._DEFERRED_REPLY_TOKEN.get() == "reply-token"
+        assert line_module._DEFERRED_REPLY_RECEIVED_AT.get() == received_at
+        assert line_module._DEFERRED_REPLY_TOKEN_USED.get() is False
+
+    record = {"id": 1, "line_user_id": "U-patient", "payload": event, "received_at": received_at}
+    with patch("app.api.line.async_session", side_effect=SessionContext), patch(
+        "app.api.line.claim_pending_events", new=AsyncMock(return_value=[record])
+    ), patch("app.api.line._dispatch_line_event", new=AsyncMock(side_effect=assert_worker_context)), patch(
+        "app.api.line.mark_event_done", new=AsyncMock()
+    ):
+        assert await line_module.process_pending_line_events() == 1
+
+    assert line_module._DEFERRED_REPLY_USER.get() is None
+    assert line_module._DEFERRED_REPLY_TOKEN.get() is None
+    assert line_module._DEFERRED_REPLY_RECEIVED_AT.get() is None
+    assert line_module._DEFERRED_REPLY_TOKEN_USED.get() is False
+
+
+@pytest.mark.asyncio
+async def test_recently_received_old_event_still_uses_reply_token():
+    from app.api import line as line_module
+
+    old_event_timestamp = int((datetime.now() - timedelta(minutes=10)).timestamp() * 1000)
+    user_context = line_module._DEFERRED_REPLY_USER.set("U-patient")
+    reply_context = line_module._DEFERRED_REPLY_TOKEN.set("reply-token")
+    received_at_context = line_module._DEFERRED_REPLY_RECEIVED_AT.set(line_module.now_jst())
+    used_context = line_module._DEFERRED_REPLY_TOKEN_USED.set(False)
+    try:
+        with patch("app.api.line.push_message", new=AsyncMock(return_value=True)) as mock_push, patch(
+            "app.api.line._reply_to_line_api", new=AsyncMock(return_value=True)
+        ) as mock_reply_api:
+            event = {"timestamp": old_event_timestamp, "replyToken": "reply-token"}
+            assert await line_module.reply_to_line(event["replyToken"], "再送への返信") is True
+    finally:
+        line_module._DEFERRED_REPLY_TOKEN_USED.reset(used_context)
+        line_module._DEFERRED_REPLY_RECEIVED_AT.reset(received_at_context)
+        line_module._DEFERRED_REPLY_TOKEN.reset(reply_context)
+        line_module._DEFERRED_REPLY_USER.reset(user_context)
+
+    mock_reply_api.assert_awaited_once_with("reply-token", "再送への返信")
+    mock_push.assert_not_awaited()
 
 
 @pytest.mark.asyncio

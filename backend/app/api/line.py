@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import traceback
+from collections.abc import Awaitable, Callable
 from typing import Optional
 from urllib.parse import parse_qs
 
@@ -62,9 +63,10 @@ from app.services.slot_scorer import (
     score_candidates,
 )
 from app.services.line_reply import (
+    push_flex_message,
     push_message,
     push_text_with_quick_reply,
-    reply_flex_message,
+    reply_flex_message as _reply_flex_message_api,
     reply_text_with_quick_reply as _reply_text_with_quick_reply_api,
     reply_to_line as _reply_to_line_api,
 )
@@ -104,19 +106,63 @@ _AUTOPILOT_USER_CONTEXT: ContextVar[str | None] = ContextVar("autopilot_user", d
 # 院の確定情報（休診日・施術者の休み・メニューの施術時間）。
 # 解析と文面生成の両方が同じ事実を見るための共有点。
 _AUTOPILOT_CLINIC_CONTEXT: ContextVar[dict] = ContextVar("autopilot_clinic", default={})
-# Webhook を即 200 で返してから処理すると、応答トークンの1分の期限に間に合わない。
-# その間の返信先をここに入れ、全て push へ切り替える。
+# Webhook を即 200 で返した後も、1分以内なら無料の reply API を優先する。
 _DEFERRED_REPLY_USER: ContextVar[str | None] = ContextVar("deferred_reply_user", default=None)
+_DEFERRED_REPLY_TOKEN: ContextVar[str | None] = ContextVar("deferred_reply_token", default=None)
+_DEFERRED_REPLY_RECEIVED_AT: ContextVar[datetime | None] = ContextVar("deferred_reply_received_at", default=None)
+_DEFERRED_REPLY_TOKEN_USED: ContextVar[bool] = ContextVar("deferred_reply_token_used", default=False)
+_REPLY_TOKEN_MAX_AGE_SECONDS = 60
 _LINE_EVENT_WORKER_LOCK = asyncio.Lock()
 
 
-async def reply_to_line(reply_token: str | None, message: str) -> bool:
+def _deferred_reply_fallback_reason() -> str | None:
+    if _DEFERRED_REPLY_TOKEN_USED.get():
+        return "token_already_used"
+    if not _DEFERRED_REPLY_TOKEN.get():
+        return "missing_reply_token"
+
+    received_at = _DEFERRED_REPLY_RECEIVED_AT.get()
+    if received_at is None:
+        return "missing_received_at"
+    age_seconds = now_jst().timestamp() - received_at.timestamp()
+    if age_seconds >= _REPLY_TOKEN_MAX_AGE_SECONDS:
+        return "reply_token_expired"
+    return None
+
+
+async def _dispatch_line_response(
+    reply_token: str | None,
+    reply_sender: Callable[[str], Awaitable[bool]],
+    push_sender: Callable[[str], Awaitable[bool]],
+) -> bool:
     deferred_user = _DEFERRED_REPLY_USER.get()
-    if deferred_user:
-        return await push_message(deferred_user, message)
-    if not reply_token:
-        return False
-    return await _reply_to_line_api(reply_token, message)
+    if not deferred_user:
+        return await reply_sender(reply_token) if reply_token else False
+
+    fallback_reason = _deferred_reply_fallback_reason()
+    if fallback_reason is None:
+        deferred_reply_token = _DEFERRED_REPLY_TOKEN.get()
+        if deferred_reply_token:
+            _DEFERRED_REPLY_TOKEN_USED.set(True)
+            if await reply_sender(deferred_reply_token):
+                logger.info("LINE deferred response sent via reply API")
+                return True
+            fallback_reason = "reply_api_failed"
+
+    push_sent = await push_sender(deferred_user)
+    if push_sent:
+        logger.warning("LINE push fallback sent (reason=%s)", fallback_reason)
+    else:
+        logger.error("LINE push fallback failed (reason=%s)", fallback_reason)
+    return push_sent
+
+
+async def reply_to_line(reply_token: str | None, message: str) -> bool:
+    return await _dispatch_line_response(
+        reply_token,
+        lambda token: _reply_to_line_api(token, message),
+        lambda user_id: push_message(user_id, message),
+    )
 
 
 async def reply_text_with_quick_reply(
@@ -124,12 +170,19 @@ async def reply_text_with_quick_reply(
     message: str,
     items: list[dict],
 ) -> bool:
-    deferred_user = _DEFERRED_REPLY_USER.get()
-    if deferred_user:
-        return await push_text_with_quick_reply(deferred_user, message, items)
-    if not reply_token:
-        return False
-    return await _reply_text_with_quick_reply_api(reply_token, message, items)
+    return await _dispatch_line_response(
+        reply_token,
+        lambda token: _reply_text_with_quick_reply_api(token, message, items),
+        lambda user_id: push_text_with_quick_reply(user_id, message, items),
+    )
+
+
+async def reply_flex_message(reply_token: str | None, alt_text: str, contents: dict) -> bool:
+    return await _dispatch_line_response(
+        reply_token,
+        lambda token: _reply_flex_message_api(token, alt_text, contents),
+        lambda user_id: push_flex_message(user_id, alt_text, contents),
+    )
 
 router = APIRouter(prefix="/api/line", tags=["line"])
 
@@ -4114,7 +4167,10 @@ async def process_pending_line_events(limit: int = 20) -> int:
         processed = 0
         for record in claimed:
             payload = record["payload"] or {}
-            token = _DEFERRED_REPLY_USER.set(record["line_user_id"])
+            user_context = _DEFERRED_REPLY_USER.set(record["line_user_id"])
+            reply_context = _DEFERRED_REPLY_TOKEN.set(payload.get("replyToken"))
+            received_at_context = _DEFERRED_REPLY_RECEIVED_AT.set(record.get("received_at"))
+            used_context = _DEFERRED_REPLY_TOKEN_USED.set(False)
             try:
                 async with async_session() as db:
                     try:
@@ -4130,7 +4186,10 @@ async def process_pending_line_events(limit: int = 20) -> int:
                             await mark_event_failed(fail_db, record["id"], f"{type(error).__name__}: {error}")
                             await fail_db.commit()
             finally:
-                _DEFERRED_REPLY_USER.reset(token)
+                _DEFERRED_REPLY_TOKEN_USED.reset(used_context)
+                _DEFERRED_REPLY_RECEIVED_AT.reset(received_at_context)
+                _DEFERRED_REPLY_TOKEN.reset(reply_context)
+                _DEFERRED_REPLY_USER.reset(user_context)
         return processed
 
 
@@ -4149,7 +4208,7 @@ async def line_webhook(
     _verify_signature(body, x_line_signature)
 
     payload = json.loads(body)
-    await _forward_line_webhook_to_mirror(payload)
+    # mirror転送はWebhook応答を遅らせて再送を招くため、ここから呼ばない。
 
     queued = await enqueue_line_events(db, payload.get("events", []))
     await db.commit()

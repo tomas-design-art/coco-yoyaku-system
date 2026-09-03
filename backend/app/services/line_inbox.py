@@ -67,6 +67,7 @@ async def enqueue_events(db: AsyncSession, events: list[dict]) -> int:
 async def claim_pending_events(db: AsyncSession, limit: int = 20) -> list[dict]:
     """未処理イベントを取得し、処理中として記録する。
 
+    LINE Webhookイベント処理は --workers 1 前提。増やす場合は行ロックが必要。
     処理途中で落ちた行も一定時間後に拾い直す。timestamp 順に並べるのは、
     再送で受信順とイベント発生順がずれることがあるため。
     """
@@ -97,6 +98,7 @@ async def claim_pending_events(db: AsyncSession, limit: int = 20) -> list[dict]:
                 "event_id": record.event_id,
                 "line_user_id": record.line_user_id,
                 "payload": record.payload,
+                "received_at": record.received_at,
                 "attempts": record.attempts,
             }
         )
