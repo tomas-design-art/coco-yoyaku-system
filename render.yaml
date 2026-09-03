@@ -25,6 +25,7 @@ services:
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     # LINE Webhookイベント処理は --workers 1 前提。増やす場合はDBの行ロックが必要。
+    # LINE_INBOX_ROLLOUT は既存サービスのDashboardで管理。未設定時は legacy。
     startCommand: alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --access-log
     healthCheckPath: /health
     envVars:

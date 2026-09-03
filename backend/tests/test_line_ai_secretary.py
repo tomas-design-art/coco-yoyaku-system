@@ -2969,6 +2969,15 @@ def test_usual_confirmation_does_not_treat_change_as_menu_rejection():
     assert '"いいえ", "ちがう", "違う", "別のメニュー"' in source
 
 
+def test_line_inbox_rollout_defaults_to_legacy_and_rejects_unknown_values():
+    from app.config import Settings
+
+    with patch.dict("os.environ", {}, clear=True):
+        assert Settings(_env_file=None).line_inbox_rollout == "legacy"
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, line_inbox_rollout="unknown")
+
+
 @pytest.mark.asyncio
 async def test_webhook_stores_events_and_returns_before_running_handlers():
     import json
@@ -2992,6 +3001,8 @@ async def test_webhook_stores_events_and_returns_before_running_handlers():
     db = AsyncMock()
 
     with patch("app.api.line.settings.line_channel_access_token", "token"), patch(
+        "app.api.line.settings.line_inbox_rollout", "all", create=True
+    ), patch(
         "app.api.line._verify_signature", new=Mock()
     ), patch("app.api.line._forward_line_webhook_to_mirror", new=AsyncMock()) as mock_mirror, patch(
         "app.api.line.enqueue_line_events", new=AsyncMock(return_value=1)
@@ -3004,6 +3015,198 @@ async def test_webhook_stores_events_and_returns_before_running_handlers():
     mock_enqueue.assert_awaited_once()
     mock_handle.assert_not_awaited()
     mock_mirror.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_webhook_autopilot_rollout_queues_flagged_and_dispatches_legacy():
+    import json
+
+    from app.api import line as line_module
+
+    queued_event = {
+        "type": "message",
+        "webhookEventId": "EV-autopilot",
+        "source": {"userId": "U-autopilot"},
+        "message": {"type": "text", "text": "予約したい"},
+    }
+    legacy_event = {
+        "type": "message",
+        "webhookEventId": "EV-legacy",
+        "source": {"userId": "U-legacy"},
+        "message": {"type": "text", "text": "予約について相談です"},
+    }
+    events = [queued_event, legacy_event]
+    request = SimpleNamespace(body=AsyncMock(return_value=json.dumps({"events": events}).encode()))
+    db = AsyncMock()
+
+    async def assert_queue_committed(event, session):
+        assert event is legacy_event
+        assert session is db
+        assert db.commit.await_count == 1
+
+    with patch("app.api.line.settings.line_channel_access_token", "token"), patch(
+        "app.api.line._verify_signature", new=Mock()
+    ), patch(
+        "app.api.line._partition_line_events",
+        new=AsyncMock(return_value=([queued_event], [legacy_event])),
+        create=True,
+    ) as mock_partition, patch(
+        "app.api.line.enqueue_line_events", new=AsyncMock(return_value=1)
+    ) as mock_enqueue, patch(
+        "app.api.line._dispatch_line_event", new=AsyncMock(side_effect=assert_queue_committed)
+    ) as mock_dispatch:
+        result = await line_module.line_webhook(request, db, "signature")
+
+    assert result == {"status": "ok", "queued": 1}
+    mock_partition.assert_awaited_once_with(events, db)
+    mock_enqueue.assert_awaited_once_with(db, [queued_event])
+    mock_dispatch.assert_awaited_once_with(legacy_event, db)
+    assert db.commit.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rollout", "queued_count", "legacy_count"),
+    [("legacy", 0, 2), ("all", 2, 0)],
+)
+async def test_line_event_partition_modes_do_not_query_patients(
+    rollout,
+    queued_count,
+    legacy_count,
+):
+    from app.api import line as line_module
+
+    events = [
+        {"type": "message", "source": {"userId": "U-one"}},
+        {"type": "postback", "source": {"userId": "U-two"}},
+    ]
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_inbox_rollout", rollout, create=True):
+        queued, legacy = await line_module._partition_line_events(events, db)
+
+    assert len(queued) == queued_count
+    assert len(legacy) == legacy_count
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_autopilot_rollout_uses_existing_patient_flag_for_messages_and_postbacks():
+    from app.api import line as line_module
+
+    autopilot_message = {"type": "message", "source": {"userId": "U-autopilot"}}
+    autopilot_postback = {"type": "postback", "source": {"userId": "U-autopilot"}}
+    legacy_message = {"type": "message", "source": {"userId": "U-legacy"}}
+    admin_postback = {"type": "postback", "source": {"userId": "U-admin"}}
+    setup_message = {
+        "type": "message",
+        "source": {"userId": "U-unlinked"},
+        "message": {"type": "text", "text": "#autopilot-setup"},
+    }
+    no_user_event = {"type": "follow", "source": {"type": "group"}}
+    events = [
+        autopilot_message,
+        autopilot_postback,
+        legacy_message,
+        admin_postback,
+        setup_message,
+        no_user_event,
+    ]
+    query_result = Mock()
+    query_result.scalars.return_value.all.return_value = ["U-autopilot"]
+    db = AsyncMock()
+    db.execute.return_value = query_result
+
+    with patch("app.api.line.settings.line_inbox_rollout", "autopilot", create=True), patch(
+        "app.api.line.settings.line_autopilot_enabled", True
+    ):
+        queued, legacy = await line_module._partition_line_events(events, db)
+
+    assert queued == [autopilot_message, autopilot_postback]
+    assert legacy == [legacy_message, admin_postback, setup_message, no_user_event]
+    db.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_autopilot_rollout_global_off_keeps_everyone_on_legacy():
+    from app.api import line as line_module
+
+    events = [{"type": "message", "source": {"userId": "U-flagged"}}]
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_inbox_rollout", "autopilot", create=True), patch(
+        "app.api.line.settings.line_autopilot_enabled", False
+    ):
+        queued, legacy = await line_module._partition_line_events(events, db)
+
+    assert queued == []
+    assert legacy == events
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_webhook_routing_lookup_failure_rolls_back_and_uses_legacy():
+    import json
+
+    from app.api import line as line_module
+
+    events = [
+        {
+            "type": "message",
+            "webhookEventId": "EV-fallback",
+            "source": {"userId": "U-patient"},
+            "message": {"type": "text", "text": "予約について相談です"},
+        }
+    ]
+    request = SimpleNamespace(body=AsyncMock(return_value=json.dumps({"events": events}).encode()))
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_channel_access_token", "token"), patch(
+        "app.api.line._verify_signature", new=Mock()
+    ), patch(
+        "app.api.line._partition_line_events", new=AsyncMock(side_effect=RuntimeError("db unavailable"))
+    ), patch("app.api.line.enqueue_line_events", new=AsyncMock()) as mock_enqueue, patch(
+        "app.api.line._dispatch_line_event", new=AsyncMock()
+    ) as mock_dispatch:
+        result = await line_module.line_webhook(request, db, "signature")
+
+    assert result == {"status": "ok", "queued": 0}
+    db.rollback.assert_awaited_once()
+    mock_enqueue.assert_not_awaited()
+    mock_dispatch.assert_awaited_once_with(events[0], db)
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_legacy_handler_failure_is_not_allowed_to_abort_later_events():
+    import json
+
+    from app.api import line as line_module
+
+    events = [
+        {"type": "message", "webhookEventId": "EV-bad", "source": {"userId": "U-one"}},
+        {"type": "message", "webhookEventId": "EV-good", "source": {"userId": "U-two"}},
+    ]
+    request = SimpleNamespace(body=AsyncMock(return_value=json.dumps({"events": events}).encode()))
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_channel_access_token", "token"), patch(
+        "app.api.line._verify_signature", new=Mock()
+    ), patch(
+        "app.api.line._partition_line_events", new=AsyncMock(return_value=([], events))
+    ), patch(
+        "app.api.line._dispatch_line_event",
+        new=AsyncMock(side_effect=[ValueError("bad event"), None]),
+    ) as mock_dispatch, patch(
+        "app.api.line._notify_webhook_failure", new=AsyncMock()
+    ) as mock_notify:
+        result = await line_module.line_webhook(request, db, "signature")
+
+    assert result == {"status": "ok", "queued": 0}
+    assert mock_dispatch.await_count == 2
+    db.rollback.assert_awaited_once()
+    mock_notify.assert_awaited_once()
+    db.commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -3191,7 +3394,9 @@ async def test_pending_event_worker_sets_and_clears_reply_context():
         assert line_module._DEFERRED_REPLY_TOKEN_USED.get() is False
 
     record = {"id": 1, "line_user_id": "U-patient", "payload": event, "received_at": received_at}
-    with patch("app.api.line.async_session", side_effect=SessionContext), patch(
+    with patch("app.api.line.settings.line_inbox_rollout", "legacy"), patch(
+        "app.api.line.async_session", side_effect=SessionContext
+    ), patch(
         "app.api.line.claim_pending_events", new=AsyncMock(return_value=[record])
     ), patch("app.api.line._dispatch_line_event", new=AsyncMock(side_effect=assert_worker_context)), patch(
         "app.api.line.mark_event_done", new=AsyncMock()

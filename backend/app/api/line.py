@@ -4149,6 +4149,41 @@ async def _dispatch_line_event(event: dict, db: AsyncSession) -> None:
         await _handle_postback(event, db)
 
 
+async def _partition_line_events(
+    events: list[dict],
+    db: AsyncSession,
+) -> tuple[list[dict], list[dict]]:
+    """受信経路を切り替える。AI自動返信の対象者ゲート自体は変更しない。"""
+    rollout = getattr(settings, "line_inbox_rollout", "legacy")
+    if rollout == "all":
+        return events, []
+    if rollout == "legacy" or not _autopilot_is_globally_enabled():
+        return [], events
+
+    user_ids = {
+        user_id
+        for event in events
+        if (user_id := (event.get("source") or {}).get("userId"))
+    }
+    if not user_ids:
+        return [], events
+
+    result = await db.execute(
+        select(Patient.line_id).where(
+            Patient.line_id.in_(user_ids),
+            Patient.line_autopilot_enabled.is_(True),
+        )
+    )
+    autopilot_user_ids = set(result.scalars().all())
+    queued_events = [
+        event
+        for event in events
+        if (event.get("source") or {}).get("userId") in autopilot_user_ids
+    ]
+    legacy_events = [event for event in events if event not in queued_events]
+    return queued_events, legacy_events
+
+
 async def process_pending_line_events(limit: int = 20) -> int:
     """DBに残った受信イベントを1件ずつ処理する。
 
@@ -4210,8 +4245,36 @@ async def line_webhook(
     payload = json.loads(body)
     # mirror転送はWebhook応答を遅らせて再送を招くため、ここから呼ばない。
 
-    queued = await enqueue_line_events(db, payload.get("events", []))
-    await db.commit()
+    events = payload.get("events", [])
+    try:
+        queued_events, legacy_events = await _partition_line_events(events, db)
+    except Exception:
+        logger.exception("LINE inbox routing lookup failed; falling back to legacy")
+        await db.rollback()
+        queued_events, legacy_events = [], events
+
+    queued = 0
+    if queued_events:
+        queued = await enqueue_line_events(db, queued_events)
+        await db.commit()
+
+    for event in legacy_events:
+        try:
+            await _dispatch_line_event(event, db)
+        except Exception as error:
+            logger.exception("LINE webhook handler failed")
+            await db.rollback()
+            await _notify_webhook_failure(event, error)
+
+    if legacy_events:
+        await db.commit()
+
+    logger.info(
+        "LINE webhook routed (rollout=%s queued=%d legacy=%d)",
+        getattr(settings, "line_inbox_rollout", "legacy"),
+        len(queued_events),
+        len(legacy_events),
+    )
     return {"status": "ok", "queued": queued}
 
 

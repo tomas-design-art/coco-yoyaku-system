@@ -132,7 +132,7 @@ docker compose -f docker-compose.prod.yml logs --tail=100 nginx
 Internet
   │
   ▼
-nginx (443/HTTPS) ──┬─ /api/*  → backend:8000 (FastAPI, Gunicorn 2workers)
+nginx (443/HTTPS) ──┬─ /api/*  → backend:8000 (FastAPI, Uvicorn 1 worker)
                     └─ /*      → frontend:80  (nginx → 静的ファイル)
                     
 backend → db:5432 (PostgreSQL 15)
@@ -175,6 +175,47 @@ Render の Environment に以下を設定:
 - `ICLOUD_EMAIL` / `ICLOUD_APP_PASSWORD`（**サービス移設時に忘れやすい。未設定だとポーリングが黙ってスキップされ続ける**）
 - `IMAP_HOST` / `IMAP_PORT` / `IMAP_MAILBOX`（デフォルト値と異なる場合のみ）
 - `HOTPEPPER_SENDER_FILTERS`（利用時）
+
+### LINE inbox の段階導入
+
+`LINE_INBOX_ROLLOUT` は既存 Render サービスの Environment で管理する。
+既存 Blueprint に後から `sync: false` で追加しても値は作成されないため、`render.yaml` には値を置かない。
+未設定時は安全側の `legacy` になる。
+
+| 値 | Webhook の処理経路 | AI 自動返信の対象 |
+|---|---|---|
+| `legacy` | 全員を従来の同期経路で処理 | `line_autopilot_enabled=true` の患者だけ |
+| `autopilot` | 上記対象患者だけ PostgreSQL inbox、他は従来経路 | 上記対象患者だけ |
+| `all` | 全員を PostgreSQL inbox で処理 | 上記対象患者だけ |
+
+初回本番反映では `LINE_INBOX_ROLLOUT=autopilot` を設定し、既存の検証対象者だけを新経路へ通す。
+`LINE_AUTOPILOT_ENABLED=true` と `--workers 1` も維持する。`all` は全員をAI対応にする設定ではない。
+
+デプロイ後は次のログとDB状態を確認する。
+
+```text
+LINE inbox rollout initialized (mode=autopilot)
+LINE webhook routed (rollout=autopilot queued=... legacy=...)
+LINE deferred response sent via reply API
+LINE push fallback sent (reason=...)
+```
+
+`autopilot` から `all` へ進むには、連続7日かつreply可能な患者応答30件以上を観測し、
+次をすべて満たした上で院長と運用責任者の承認を得る。
+
+- reply API 成功率90%以上。push fallbackは理由を問わず全件調査済み
+- `missing_reply_token` / `missing_received_at` が0件
+- `failed=0`、5分以上の `processing=0`、30秒以上の `pending=0`
+- 検証対象者の双方で予約・変更・単一キャンセル・複数予約選択キャンセルが成功
+- 患者向け二重返信0件、通常患者のinbox混入0件、通常の手動返信運用の欠落0件
+
+条件達成後も即時恒久化はしない。診療時間外に短時間だけ `all` へ変更し、
+管理下の未フラグLINEアカウントで「inbox処理・AI自動返信なし・管理者通知・手動返信」を確認する。
+
+問題時は先に `LINE_INBOX_ROLLOUT=legacy` へ戻して再起動する。
+新規イベントが従来経路へ戻ったことを確認後、`line_webhook_events` の
+`pending` / `processing` を現行workerで排出し、`failed` の手動対応を確認してから Render rollback を実行する。
+200返却済みの未処理イベントが残る状態で旧デプロイへ戻してはならない。
 
 ### 2. Frontend (Static Site)
 

@@ -416,7 +416,13 @@ async def process_line_webhook_events():
     from app.api.line import process_pending_line_events
 
     try:
-        await process_pending_line_events()
+        processed = await process_pending_line_events()
+        if processed:
+            logger.info(
+                "LINE webhook events processed (rollout=%s count=%d)",
+                settings.line_inbox_rollout,
+                processed,
+            )
     except Exception:
         logger.exception("LINE webhook event worker failed")
 
@@ -458,6 +464,7 @@ def start_hold_expiration_job():
     scheduler.add_job(check_series_expiration, "cron", hour=10, minute=0, id="series_expiration_check")
     scheduler.add_job(check_schedule_conflicts_morning, "cron", hour=9, minute=0, id="schedule_conflict_morning")
     scheduler.start()
+    logger.info("LINE inbox rollout initialized (mode=%s)", settings.line_inbox_rollout)
     logger.info(
         "Background jobs started (HOLD expiration, chat session expiration, HP sync reminder, HotPepper mail poll, notification cleanup, series expiration check, schedule conflict morning check)"
     )
