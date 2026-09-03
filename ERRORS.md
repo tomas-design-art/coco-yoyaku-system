@@ -36,3 +36,17 @@
 - 原因: 前回コマンドのcwdが維持される共有ターミナルで、`..`をbackend基準だと仮定した。
 - 手順: Git操作前に`$repo = git rev-parse --show-toplevel`でルートを取得し、以後は`git -C $repo ...`を使う。
 - 状態: L2（相対cwd前提の再発。以後ルートをコマンドで確定する）
+
+## 2026-09-04: デプロイ前の`DATABASE_URL`がローカル接続だった
+
+- 症状: URLは設定済みだが`IsLocal=True`で、本番のautopilot対象者件数確認に使用できなかった。
+- 追加エラー: psqlは`ssl`クエリパラメータを受け付けず、`ssl=disable`が残ると`invalid URI query parameter`になる。
+- 手順: DB操作前に接続先を値非表示でlocal/Render判定する。psqlではasyncpgスキームを変換し、`ssl=require|disable`も`sslmode=require|disable`へ変換する。
+- 状態: push前で停止。本番影響なし。
+
+## 2026-09-04: PowerShellの`foreach`直後のpipeでParserError
+
+- 症状: 1行内の`foreach (...) { ... } | Format-Table`で`An empty pipe element is not allowed`になった。
+- 原因: 文としての`foreach`出力をそのまま同一構文のpipelineへ接続した。
+- 手順: 結果を`$rows = @(...foreach...)`へ格納してから`$rows | Format-Table`する。
+- 状態: L1（初回記録）
