@@ -49,12 +49,17 @@ LINE_PARSE_PROMPT = """あなたは接骨院の熟練予約秘書AIです。患�
 {menu_list}
 
 出力JSON（全キー必須）:
-{{"intent":"new | change | cancel | question | other","has_reservation_intent":true,"name":null,"menu_hint":null,"date":null,"time":null,"current_date":null,"current_time":null,"duration_minutes":null,"constraints":[],"polarity":"affirmative | negative | none","confidence":"high | medium | low","needs_human":false,"conversation_goal":null,"reply_action":"reply | no_reply"}}
+{{"intent":"new | change | cancel | question | other","has_reservation_intent":true,"name":null,"menu_hint":null,"practitioner":null,"date":null,"time":null,"current_date":null,"current_time":null,"duration_minutes":null,"constraints":[],"polarity":"affirmative | negative | none","confidence":"high | medium | low","needs_human":false,"conversation_goal":null,"reply_action":"reply | no_reply"}}
 
 intent: new=新規予約/空き確認、change=日時変更、cancel=取消/行けない、other=お礼・雑談・相槌。
 question=院の情報を尋ねている。営業時間・休診日・料金・領収書に加え、**施術者の出勤や休みを尋ねる質問も question**。
   例:「時田先生お休みの日ある？」「上田さんは何曜日にいますか」「今週◯◯先生いる？」→ question（担当者の指名ではない）
   「◯◯先生でお願いします」のように予約を頼んでいる場合だけ new。
+practitioner: この予約で担当してほしいと患者が示した施術者の名字。上の当院の確定情報にある施術者名だけを入れ、無ければ null。
+  助詞や言い回しに関係なく、その人を希望していると読めるなら必ず入れる。
+  例:「時田先生で」「時田先生がいつも担当なんですけど？」「だから時田先生だって！」「時田先生の空いてる時間は？」→ practitioner="時田"
+  例:「時田先生はお休みの日ある？」のように出勤予定だけを尋ねている場合は入れない（intent=question のまま practitioner=null）。
+  一度示された担当は、患者が別の人を言うか取り下げるまで有効。指名は intent が question や other でも入れてよい。
 polarity: 「大丈夫じゃない」「難しい」「無理」「やめておく」はnegative。「それで」「おけ」「はい」「お願いします」はaffirmative。
 相対日付は今日基準で未来へ解決。朝=09:00、午前=10:00、昼=12:00、午後イチ/午後=14:00、夕方=17:00、夜=19:00。具体時刻があれば優先する。
 週の定義（月曜始まり）: 「来週◯曜」＝今日を含む週の次の週の◯曜日。「今週◯曜」＝今日を含む週の◯曜日。「次の◯曜」「◯曜」＝直近の未来のその曜日（今日が同じ曜日なら7日後）。
@@ -386,6 +391,12 @@ def _normalize_result(parsed: dict, profile_name: str | None, previous: dict | N
     result = dict(parsed)
     result["customer_name"] = _normalize_name(result.get("customer_name") or result.get("name")) or previous.get("customer_name") or _normalize_name(profile_name)
     result["menu_name"] = result.get("menu_name") or result.get("menu_hint") or previous.get("menu_name")
+    # 担当者は「今回のメッセージで示されたか」だけを持つ。前回値の埋め戻しはしない
+    # （引き継ぎは draft 側のスロットが担当する）。
+    practitioner = result.get("practitioner")
+    result["practitioner"] = (
+        str(practitioner).strip()[:20] if isinstance(practitioner, str) and practitioner.strip() else None
+    )
     # 前の会話から引き継いだ日時は「患者が今回述べた事実」ではない。
     # これを断言すると「月曜日のご予約ですね」と勝手に決めつける事故になるため、
     # 引き継いだことを明示して後段で確認扱いにできるようにする。

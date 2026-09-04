@@ -3861,3 +3861,95 @@ def test_halfwidth_kana_and_fullwidth_digits_are_normalized():
     reading, birth_date = _extract_reading_and_birth_date("ﾔﾏﾀﾞ ﾀﾛｳ １９９０／４／１")
     assert birth_date == date(1990, 4, 1)
     assert reading == "ヤマダ タロウ"
+
+
+# ─────────────────────────────────────────────────────────────
+# P1: 担当者を「箱」にする
+# 実機で「時田先生」を3回言われて3回とも取りこぼした（2026-09-04）
+# ─────────────────────────────────────────────────────────────
+
+
+def _practitioner_db():
+    ueda = SimpleNamespace(id=3, name="上田 花子", is_active=True)
+    tokita = SimpleNamespace(id=1, name="時田 太郎", is_active=True)
+
+    class _Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [ueda, tokita]
+
+    class _DB:
+        async def execute(self, _q):
+            return _Result()
+
+    return _DB()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "時田先生がいつも担当なんですけど？",
+        "だから時田先生の空いてる時間は？",
+        "だから時田先生だって！",
+    ],
+)
+async def test_practitioner_designation_survives_natural_phrasing(message):
+    """助詞や語尾に関係なく担当指名を受け取る。
+
+    正規表現だけの頃は、名字の後ろに「で」「にして」等が続く形しか通らず、
+    実機の3回とも取りこぼして別の施術者を出し続けた。判断はLLMに任せる。
+    """
+    from app.api.line import _extract_requested_practitioner
+
+    # 正規表現だけでは拾えない言い方
+    assert await _extract_requested_practitioner(_practitioner_db(), message) is None
+    # 解析結果に指名があれば拾う
+    found = await _extract_requested_practitioner(
+        _practitioner_db(), message, {"practitioner": "時田"}
+    )
+    assert found is not None and found.id == 1
+
+
+@pytest.mark.asyncio
+async def test_practitioner_designation_accepts_honorifics_and_full_name():
+    from app.api.line import _extract_requested_practitioner
+
+    for named in ("時田", "時田先生", "時田さん", "時田 太郎"):
+        found = await _extract_requested_practitioner(
+            _practitioner_db(), "", {"practitioner": named}
+        )
+        assert found is not None and found.id == 1, named
+
+
+@pytest.mark.asyncio
+async def test_unknown_practitioner_name_is_not_guessed_into_someone_else():
+    """在籍しない名前は推測で他の施術者に結び付けない。"""
+    from app.api.line import _extract_requested_practitioner
+
+    assert (
+        await _extract_requested_practitioner(
+            _practitioner_db(), "山本先生でお願いします", {"practitioner": "山本"}
+        )
+        is None
+    )
+
+
+def test_parser_normalizes_the_practitioner_slot():
+    from app.agents.line_parser import _normalize_result
+
+    assert _normalize_result({"practitioner": " 時田 "}, None, {})["practitioner"] == "時田"
+    assert _normalize_result({"practitioner": ""}, None, {})["practitioner"] is None
+    assert _normalize_result({"practitioner": 3}, None, {})["practitioner"] is None
+    # 前回の指名を勝手に埋め戻さない（引き継ぎは draft 側の役目）
+    assert _normalize_result({}, None, {"practitioner": "上田"})["practitioner"] is None
+
+
+def test_parser_prompt_declares_the_practitioner_slot():
+    """出力JSONに箱が無ければ、LLMが理解しても渡す先が無い。"""
+    from app.agents.line_parser import LINE_PARSE_PROMPT
+
+    assert '"practitioner":null' in LINE_PARSE_PROMPT
+    assert "practitioner: この予約で担当してほしい" in LINE_PARSE_PROMPT

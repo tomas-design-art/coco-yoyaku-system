@@ -1434,7 +1434,7 @@ async def _merge_autopilot_slots(
             )
 
     # 本人が担当を明言していれば、登録上の既定より本人の希望を優先する。
-    requested_practitioner = await _extract_requested_practitioner(db, text)
+    requested_practitioner = await _extract_requested_practitioner(db, text, parsed)
     if requested_practitioner:
         update.update(
             {
@@ -1678,18 +1678,40 @@ def _vague_time_window(text: str) -> tuple[int, int] | None:
     return None
 
 
-async def _extract_requested_practitioner(db: AsyncSession, text: str) -> Practitioner | None:
-    """本文から明示的な担当指名（例: 上田さんで / 担当は時田）を抽出する。"""
+async def _extract_requested_practitioner(
+    db: AsyncSession,
+    text: str,
+    parsed: dict | None = None,
+) -> Practitioner | None:
+    """患者が示した担当者を返す。解析結果を先に見て、無ければ本文から拾う。
+
+    以前は本文の正規表現だけで判定していたため、名字の後ろに「で」「にして」等の
+    指名語が続く形しか通らなかった。実機で「時田先生がいつも担当なんですけど？」
+    「だから時田先生の空いてる時間は？」「だから時田先生だって！」の3回とも
+    取りこぼし、指名が一度も届かないまま別の施術者を出し続けた（2026-09-04）。
+    人の言い方は網羅できないので、判断はLLMに任せ、正規表現は保険として残す。
+    """
+    practitioners = [
+        p
+        for p in (
+            await db.execute(select(Practitioner).where(Practitioner.is_active == True))
+        ).scalars().all()
+        if p.name
+    ]
+
+    # ① 解析結果の指名。名字の完全一致だけを採る（推測で別人に紐づけない）。
+    named = (parsed or {}).get("practitioner")
+    if isinstance(named, str) and named.strip():
+        wanted = re.sub(r"(?:先生|さん|様)$", "", named.strip())
+        for p in practitioners:
+            if wanted and wanted in {p.name, p.name.split()[0]}:
+                return p
+
+    # ② 取りこぼし用。名字の直後に指名の合図が続く形だけを拾う。
     if not text:
         return None
-    practitioners = (
-        await db.execute(select(Practitioner).where(Practitioner.is_active == True))
-    ).scalars().all()
     for p in practitioners:
-        if not p.name:
-            continue
         surname = p.name.split()[0]
-        # 指名の合図（さん/先生/で/希望/指名/がいい/にして/でお願い、または「担当」前置）を伴う場合のみ採用
         pattern = rf"(?:担当[はを:：]?\s*)?{re.escape(surname)}\s*(?:さん|先生)?\s*(?:で|に|希望|指名|がいい|がいいです|にして|でお願い|でお願いします|でお願いしたい)"
         if re.search(pattern, text):
             return p
@@ -2384,9 +2406,31 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 parsed=parsed_intent,
             )
 
+        # 候補提示中に担当を名指しされたら、それも条件変更として扱って探し直す。
+        # 黙って同じ候補を出し直すと指名が無視されたまま同じ人が並び続ける
+        # （2026-09-04 実機: 「時田先生だって」を3回言われても別の施術者を出し続けた）。
+        practitioner_changed = False
+        # 施術者名が出ていないメッセージで施術者一覧を引かない。
+        # 解析側が指名を拾えていれば必ずここを通る。
+        mentions_practitioner = bool(
+            (parsed_intent or {}).get("practitioner") or re.search(r"先生|担当", text or "")
+        )
+        if mentions_practitioner and (
+            prev_draft.get("autopilot_offered_slots")
+            or current_mode in {"adjusting", "autopilot_booking_confirm"}
+        ):
+            requested = await _extract_requested_practitioner(db, text, parsed_intent)
+            if requested and requested.id != (merged or prev_draft).get("practitioner_id"):
+                merged = await merge_user_draft(
+                    db,
+                    user_id,
+                    {"practitioner_id": requested.id, "practitioner_name": requested.name},
+                )
+                practitioner_changed = True
+
         # 提示済み候補への条件変更（もっと早く/短くてもいい/別の日 等）は手動退避せず再検索する。
         negotiation_filters = build_slot_filters(parsed_intent.get("constraints"))
-        if negotiation_filters.has_condition:
+        if negotiation_filters.has_condition or practitioner_changed:
             negotiation_state = {
                 "draft": merged or prev_draft,
                 "request_id": user_state.get("request_id"),
@@ -3607,7 +3651,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     prefer_director = False
     first_visit_note: str | None = None
     if is_autopilot_patient:
-        requested_prac = await _extract_requested_practitioner(db, text)
+        requested_prac = await _extract_requested_practitioner(db, text, parsed_intent)
         # 既定値で院長が入ると preferred_practitioner_id が埋まるため、
         # 初回かどうかは _resolve_booking_defaults が立てたフラグを優先して見る。
         is_new_patient = bool(merged.get("first_visit")) or (
