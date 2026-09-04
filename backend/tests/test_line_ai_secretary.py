@@ -3738,3 +3738,126 @@ async def test_shadow_admin_notification_is_sent_once_to_the_acting_admin():
 
     mock_push.assert_awaited_once_with("U-admin", "予約システムに登録し予約完了しました。")
     mock_reply.assert_not_awaited()
+
+
+# ─────────────────────────────────────────────────────────────
+# P0: 「はい/いいえ」の意味をコードが握る／本人確認スロットを捨てない
+# 2026-09-04 本番実機で踏んだ事故の再現テスト
+# ─────────────────────────────────────────────────────────────
+
+
+def test_cancel_confirmation_must_not_bolt_on_a_rebooking_question():
+    """キャンセル確認に別の質問を足させない。
+
+    実機: 「キャンセルのお手続きをさせていただきます。もしよろしければ、
+    改めて別の日程でご予約をお取りしましょうか？」と聞かれ、
+    「いいえ。改めて連絡します」が『キャンセルしない』として処理された。
+    """
+    from app.services.line_composer import _asks_more_than_one_question
+
+    drifted = (
+        "9月6日11:30のご予約ですね。承知いたしました、キャンセルのお手続きをさせていただきます。"
+        "もしよろしければ、改めて別の日程でご予約をお取りしましょうか？"
+    )
+    assert _asks_more_than_one_question("cancel_confirm", drifted) is True
+
+    two_questions = "9月6日11:30でよろしいですか？ 他にご要望はありますか？"
+    assert _asks_more_than_one_question("cancel_confirm", two_questions) is True
+
+    correct = "2026/09/06 11:30のご予約をキャンセルしてよろしいですか？\nはい / いいえ"
+    assert _asks_more_than_one_question("cancel_confirm", correct) is False
+
+    # 確認待ち以外は自由に書いてよい（候補提示で質問が2つあっても止めない）
+    assert _asks_more_than_one_question("offer_alternatives", two_questions) is False
+
+
+@pytest.mark.asyncio
+async def test_confirmation_situations_do_not_receive_llm_conversation_goal():
+    """確認待ちでは、LLMが決めた「次に聞くこと」を返信生成へ渡さない。"""
+    from app.api.line import _compose_autopilot_reply
+
+    parsed = {
+        "intent": "cancel",
+        "conversation_goal": "キャンセルを承り、別日程での再予約を提案する",
+    }
+    context = {"date": "2026/09/06", "start": "11:30", "patient_message": "キャンセルしたい"}
+
+    with patch(
+        "app.api.line.compose_reply", new=AsyncMock(return_value="確認文")
+    ) as mock_compose:
+        await _compose_autopilot_reply("cancel_confirm", dict(context), parsed)
+    assert "conversation_goal" not in mock_compose.await_args.args[1]
+
+    # 収集中の場面ではこれまで通りLLMの判断を活かす
+    with patch(
+        "app.api.line.compose_reply", new=AsyncMock(return_value="案内文")
+    ) as mock_compose:
+        await _compose_autopilot_reply("offer_alternatives", dict(context), parsed)
+    assert mock_compose.await_args.args[1]["conversation_goal"] == parsed["conversation_goal"]
+
+
+@pytest.mark.asyncio
+async def test_identity_setup_keeps_the_name_and_asks_only_for_the_phone():
+    """本人確認も予約と同じスロット。埋まった箱は残し、足りない箱だけ聞く。"""
+    from app.api.line import _handle_autopilot_setup_message
+
+    db = AsyncMock()
+    with patch(
+        "app.api.line.classify_conversation_control", new=AsyncMock(return_value={})
+    ), patch("app.api.line.merge_user_draft", new=AsyncMock()) as mock_merge, patch(
+        "app.api.line.reply_text_with_quick_reply", new=AsyncMock()
+    ) as mock_reply:
+        handled = await _handle_autopilot_setup_message(
+            db,
+            user_id="U-setup",
+            text="山田 太郎",
+            reply_token="reply-token",
+            display_name="山田",
+            state={"mode": "autopilot_setup_name_phone", "draft": {}},
+        )
+
+    assert handled is True
+    # 名前は捨てずに保存されている（氏名は正規化で空白が落ちる）
+    assert mock_merge.await_args.args[2]["setup_name"] == "山田太郎"
+    # 聞くのは足りない電話番号だけ
+    message = mock_reply.await_args.args[1]
+    assert "電話番号" in message
+    assert "フルネーム" not in message
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("やまだ たろう 1990-04-01", date(1990, 4, 1)),
+        ("やまだ たろう 1990年4月1日", date(1990, 4, 1)),
+        ("やまだ たろう 昭和60年3月15日", date(1985, 3, 15)),
+        ("ヤマダ タロウ S60.3.15", date(1985, 3, 15)),
+        ("やまだ たろう H2.4.1", date(1990, 4, 1)),
+        ("やまだ たろう 令和元年5月1日", date(2019, 5, 1)),
+    ],
+)
+def test_birth_date_accepts_wareki_and_kanji_notation(text, expected):
+    """受付台帳と同じ書き方を受ける。和暦・年月日・英字元号・全角。"""
+    from app.api.line import _extract_reading_and_birth_date
+
+    reading, birth_date = _extract_reading_and_birth_date(text)
+    assert birth_date == expected
+    assert reading
+
+
+def test_birth_date_rejects_impossible_values_instead_of_guessing():
+    """読めない・ありえない値は推測せず聞き直す（他人を照合しないため）。"""
+    from app.api.line import _extract_reading_and_birth_date
+
+    assert _extract_reading_and_birth_date("やまだ たろう") == (None, None)
+    assert _extract_reading_and_birth_date("やまだ たろう 2099-01-01") == (None, None)
+    assert _extract_reading_and_birth_date("やまだ たろう 1990-13-01") == (None, None)
+
+
+def test_halfwidth_kana_and_fullwidth_digits_are_normalized():
+    """半角カナ・全角数字でもそのまま照合できる形にそろえる。"""
+    from app.api.line import _extract_reading_and_birth_date
+
+    reading, birth_date = _extract_reading_and_birth_date("ﾔﾏﾀﾞ ﾀﾛｳ １９９０／４／１")
+    assert birth_date == date(1990, 4, 1)
+    assert reading == "ヤマダ タロウ"

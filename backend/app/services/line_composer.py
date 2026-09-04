@@ -27,7 +27,11 @@ SITUATION_GUIDES = {
     "ask_menu": "予約に必要なメニュー選択を簡潔に促す。",
     "confirmed": "予約が確定したことと、確定した日時・担当・メニューを伝えて来院を歓迎する。",
     "cancel_done": "指定された予約のキャンセル完了を事実だけで伝える。",
-    "cancel_confirm": "対象予約の日時を示し、本当にキャンセルしてよいか、はい/いいえで確認する。",
+    "cancel_confirm": (
+        "対象予約の日時を示し、本当にキャンセルしてよいか、はい/いいえで確認する。"
+        "質問はこの1つだけにする。再予約・別の日程・変更の話は絶対に持ち出さない"
+        "（患者の はい/いいえ がどちらの質問への答えか分からなくなり、取消が実行されない）。"
+    ),
     "change_done": "予約変更の完了と、変更後の日時・担当を伝える。",
     "slot_taken": "候補が直前に埋まったことを詫び、別候補または別日時の選択を促す。",
     "handoff_to_human": "担当者からご連絡することだけを簡潔に伝える。引き継ぐ理由や原因は推測しないし説明もしない。",
@@ -361,6 +365,7 @@ _RETRY_NOTES = {
     "spec_claim": "\n前回の返信は院の枠の組み方や施術時間のルールを勝手に説明していました。院の仕組みには触れず、確定情報にある施術時間だけを使って書き直してください。",
     "alternative_context": "\n前回の返信は候補の日付や患者が指定した条件と矛盾していました。同日の候補を別日と呼ばず、時刻未指定なら希望時間帯が満席とは書かず、料金にも触れずに書き直してください。",
     "repeated_reply": "\n前回の返信は直近のあなた自身の返答と同じ定型的な冒頭を繰り返していました。患者の最新発言と確定事実にだけ応じ、同じ挨拶や体調への問いかけを繰り返さずに書き直してください。",
+    "extra_question": "\n前回の返信は、いま確認すべきこと以外の質問を足していました。いま確認すべき1点だけを尋ね、再予約や別日程など他の話題は一切持ち出さずに書き直してください。",
 }
 
 
@@ -463,6 +468,27 @@ def _has_unsupported_claim(context: dict, reply: str) -> bool:
         if not any(word in context_text for word in _SYMPTOM_CONTEXT_WORDS):
             return True
     return False
+
+
+_CONFIRMATION_SITUATIONS = {"confirm_slot", "usual_confirm", "cancel_confirm", "reconfirm_yes_no"}
+_OFFTOPIC_IN_CANCEL_CONFIRM = re.compile(
+    r"改めて.{0,6}(?:別|ご予約|予約)|別の?日程|別日|取り直|再度.{0,4}予約|変更.{0,6}(?:しますか|されますか|なさいますか)"
+)
+
+
+def _asks_more_than_one_question(situation: str, reply: str) -> bool:
+    """はい/いいえを待つ場面で、質問を2つ以上ぶら下げていないか。
+
+    コードは「いま自分が聞いた質問」への答えとして はい/いいえ を読む。
+    返信に質問が2つあると、患者はもう一方に答え、意味が反転して伝わる。
+    2026-09-04 本番: キャンセル確認に「別の日程でご予約をお取りしましょうか？」が
+    足され、「いいえ」が取消の中止として処理された。
+    """
+    if situation not in _CONFIRMATION_SITUATIONS:
+        return False
+    if len(re.findall(r"[?？]", reply)) > 1:
+        return True
+    return situation == "cancel_confirm" and bool(_OFFTOPIC_IN_CANCEL_CONFIRM.search(reply))
 
 
 def _has_premature_confirmation(situation: str, reply: str) -> bool:
@@ -670,6 +696,9 @@ async def compose_reply(situation: str, context: dict) -> str:
                     continue
                 if _has_wrong_booking_outcome(situation, text):
                     reason = "unsupported_claim"
+                    continue
+                if _asks_more_than_one_question(situation, text):
+                    reason = "extra_question"
                     continue
                 if _has_misleading_alternative_context(situation, context, text):
                     reason = "alternative_context"

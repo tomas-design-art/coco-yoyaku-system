@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import traceback
+import unicodedata
 from collections.abc import Awaitable, Callable
 from typing import Optional
 from urllib.parse import parse_qs
@@ -234,6 +235,13 @@ _AUTOPILOT_BOOKING_MODES = {
     "autopilot_change_confirm",
 }
 _CONVERSATION_TIMEOUT = timedelta(hours=1)
+# 「はい/いいえ」の意味をコードが解釈する場面。ここでは質問文をLLMに決めさせない。
+_CODE_OWNED_QUESTION_SITUATIONS = {
+    "confirm_slot",
+    "usual_confirm",
+    "cancel_confirm",
+    "reconfirm_yes_no",
+}
 
 
 class LineMessageRequest(BaseModel):
@@ -834,15 +842,60 @@ def _extract_setup_name_and_phone(text: str, profile_name: str | None) -> tuple[
     return name, phone
 
 
-def _extract_reading_and_birth_date(text: str) -> tuple[str | None, date | None]:
-    match = re.search(r"\b(19\d{2}|20\d{2})[/-](\d{1,2})[/-](\d{1,2})\b", text or "")
-    if not match:
-        return None, None
+# 元号の基準年。R7 → 2018+7 = 2025。単独英字（R/H/S/T/M）表記も受ける。
+_ERA_BASE_YEARS = {
+    "令和": 2018, "R": 2018,
+    "平成": 1988, "H": 1988,
+    "昭和": 1925, "S": 1925,
+    "大正": 1911, "T": 1911,
+    "明治": 1867, "M": 1867,
+}
+_SEP = r"[-/.年]"
+_WESTERN_BIRTH_DATE = re.compile(
+    r"(?<!\d)(19\d{2}|20\d{2})\s*" + _SEP + r"\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*日?"
+)
+_ERA_BIRTH_DATE = re.compile(
+    r"(令和|平成|昭和|大正|明治|[RHSTMrhstm])\s*(\d{1,2}|元)\s*" + _SEP
+    + r"\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*日?"
+)
+
+
+def _find_birth_date(normalized: str) -> tuple[date | None, int, int]:
+    """西暦・和暦のどちらでも生年月日を1つ読む。読めた位置も返す。
+
+    受付が台帳に書く形をそのまま受ける（1990-04-01 / 1990年4月1日 / S60.3.15 / 昭和60年3月15日）。
+    表記を推測で補わず、読めた形だけ採用する。読めなければ聞き直す。
+    """
+    match = _WESTERN_BIRTH_DATE.search(normalized)
+    if match:
+        parts = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    else:
+        match = _ERA_BIRTH_DATE.search(normalized)
+        if not match:
+            return None, 0, 0
+        base = _ERA_BASE_YEARS.get(match.group(1)) or _ERA_BASE_YEARS.get(match.group(1).upper())
+        if base is None:
+            return None, 0, 0
+        era_year = 1 if match.group(2) == "元" else int(match.group(2))
+        parts = (base + era_year, int(match.group(3)), int(match.group(4)))
     try:
-        birth_date = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        parsed = date(*parts)
     except ValueError:
+        return None, 0, 0
+    # 生年月日としてありえない値は採らずに聞き直す（誤った値で他人を照合しないため）。
+    if not (date(1900, 1, 1) <= parsed <= now_jst().date()):
+        return None, 0, 0
+    return parsed, match.start(), match.end()
+
+
+def _extract_reading_and_birth_date(text: str) -> tuple[str | None, date | None]:
+    # NFKC で全角数字・半角カナを揃えてから読む（受付台帳と同じ正規化）。
+    normalized = unicodedata.normalize("NFKC", text or "")
+    birth_date, start, end = _find_birth_date(normalized)
+    if not birth_date:
         return None, None
-    reading = (text[:match.start()] + text[match.end():]).strip(" \u3000、,，")
+    reading = (normalized[:start] + normalized[end:]).strip(" \u3000、,，")
+    reading = re.sub(r"(?:生まれ|生年月日|うまれ)", "", reading).strip(" \u3000、,，")
     return reading or None, birth_date
 
 
@@ -1129,7 +1182,18 @@ async def _compose_autopilot_reply(
     enriched_context = dict(context)
     # 次に何を患者へ確認・案内するかは、履歴を読んだGeminiの会話判断を優先する。
     # コードはDB事実の取得と予約確定だけを担う。
-    if parsed and parsed.get("conversation_goal"):
+    #
+    # ただし「はい/いいえ」を待つ場面は例外で、何を聞くかはコードが決める。
+    # ここで conversation_goal を渡すと、Geminiが別の質問（例:「改めて別の日程で
+    # ご予約をお取りしましょうか？」）に差し替えてしまい、返ってきた はい/いいえ を
+    # コードは自分が聞いたつもりの質問への答えとして読む＝意味が反転する。
+    # 2026-09-04 本番: キャンセル確認で「いいえ。改めて連絡します」が
+    # 「キャンセルしない」と解釈され、取消が無効になった。
+    if (
+        parsed
+        and parsed.get("conversation_goal")
+        and situation not in _CODE_OWNED_QUESTION_SITUATIONS
+    ):
         enriched_context["conversation_goal"] = parsed["conversation_goal"]
     # 休診日を「満席」と言い換えたり施術時間を作り話しないよう、院の事実を毎回同梱する
     enriched_context["clinic"] = _AUTOPILOT_CLINIC_CONTEXT.get()
@@ -1440,6 +1504,12 @@ async def _handle_autopilot_setup_message(
 
     if mode == "autopilot_setup_name_phone":
         name, phone = _extract_setup_name_and_phone(text, display_name)
+        # 片方だけ入力されたとき取れた分を捨てると、患者は毎回ゼロからやり直しになる。
+        # 予約のスロットと同じで、埋まった箱は残し、足りない箱だけを聞く。
+        if name or phone:
+            await merge_user_draft(db, user_id, {"setup_name": name, "setup_phone": phone})
+        name = name or draft.get("setup_name")
+        phone = phone or draft.get("setup_phone")
         if _has_explicit_new_registration_intent(text) and name:
             await merge_user_draft(db, user_id, {"setup_name": name, "setup_phone": phone})
             await set_user_mode(db, user_id, "autopilot_setup_confirm_new")
@@ -1452,9 +1522,24 @@ async def _handle_autopilot_setup_message(
             return True
         if not name or not phone:
             if reply_token:
+                if name and not phone:
+                    message = (
+                        f"{name}さんですね。\n"
+                        "続けて、登録済みのお電話番号を入力してください。\n例: 090-1234-5678"
+                    )
+                elif phone and not name:
+                    message = (
+                        "お電話番号を受け取りました。\n"
+                        "お名前をフルネームで入力してください。\n例: 山田 太郎"
+                    )
+                else:
+                    message = (
+                        "お名前をフルネームで入力し、登録済みの電話番号を続けて入力してください。\n"
+                        "例: 山田 太郎 090-1234-5678"
+                    )
                 await reply_text_with_quick_reply(
                     reply_token,
-                    "お名前をフルネームで入力し、登録済みの電話番号を続けて入力してください。\n例: 山田 太郎 090-1234-5678",
+                    message,
                     _build_setup_retry_quick_reply_items(),
                 )
             return True
