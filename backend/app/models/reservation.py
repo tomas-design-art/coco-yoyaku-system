@@ -14,6 +14,12 @@ class Reservation(Base):
             unique=True,
             postgresql_where=text("channel = 'HOTPEPPER' AND source_ref IS NOT NULL"),
         ),
+        Index(
+            "uq_reservations_line_source_ref",
+            "source_ref",
+            unique=True,
+            postgresql_where=text("channel = 'LINE' AND source_ref IS NOT NULL"),
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)

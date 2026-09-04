@@ -56,7 +56,7 @@ def test_alembic_revision_chain_has_expected_single_head():
         if down_revision:
             down_revisions.add(down_revision)
 
-    assert revisions - down_revisions == {"027_patient_line_id_index"}
+    assert revisions - down_revisions == {"028_line_reservation_source_ref"}
 
 
 def test_patient_line_id_has_non_unique_lookup_index():
@@ -65,3 +65,13 @@ def test_patient_line_id_has_non_unique_lookup_index():
     indexes = {index.name: index for index in Patient.__table__.indexes}
     assert "ix_patients_line_id" in indexes
     assert indexes["ix_patients_line_id"].unique is not True
+
+
+def test_line_source_ref_has_partial_unique_index():
+    from app.models.reservation import Reservation
+
+    indexes = {index.name: index for index in Reservation.__table__.indexes}
+    index = indexes["uq_reservations_line_source_ref"]
+
+    assert index.unique is True
+    assert "channel = 'LINE'" in str(index.dialect_options["postgresql"]["where"])

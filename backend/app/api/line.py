@@ -111,8 +111,14 @@ _DEFERRED_REPLY_USER: ContextVar[str | None] = ContextVar("deferred_reply_user",
 _DEFERRED_REPLY_TOKEN: ContextVar[str | None] = ContextVar("deferred_reply_token", default=None)
 _DEFERRED_REPLY_RECEIVED_AT: ContextVar[datetime | None] = ContextVar("deferred_reply_received_at", default=None)
 _DEFERRED_REPLY_TOKEN_USED: ContextVar[bool] = ContextVar("deferred_reply_token_used", default=False)
+_LINE_WEBHOOK_EVENT_ID: ContextVar[str | None] = ContextVar("line_webhook_event_id", default=None)
 _REPLY_TOKEN_MAX_AGE_SECONDS = 60
 _LINE_EVENT_WORKER_LOCK = asyncio.Lock()
+
+
+def _line_reservation_source_ref() -> str | None:
+    event_id = _LINE_WEBHOOK_EVENT_ID.get()
+    return f"line:{str(event_id)[:64]}" if event_id else None
 
 
 def _deferred_reply_fallback_reason() -> str | None:
@@ -2130,7 +2136,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             return
 
     # LINE の再送 webhook は予約会話を二重に進めてしまうため、対象患者だけで捨てる。
-    if is_autopilot_patient and is_duplicate_message(user_id, text):
+    if is_autopilot_patient and not _DEFERRED_REPLY_USER.get() and is_duplicate_message(user_id, text):
         logger.info("Autopilot: duplicate message skipped (user=%s)", user_id[:12])
         return
     if is_autopilot_patient and not _is_booking_or_change_menu_trigger(text):
@@ -2229,8 +2235,12 @@ async def _handle_text_message(event: dict, db: AsyncSession):
 
         # 予約確定直後の感謝・締めの挨拶は、Geminiが返信不要と判断できる。
         # 新しい予約操作を含まない場合だけ受け入れ、次の会話へ確定文脈を持ち越さない。
+        # ただし確認待ちの最中は絶対に適用しない。確定直後にキャンセル確認へ入ると、
+        # 患者の「はい」が「相槌」に見えてしまい、無言でreturnして取消が実行されなかった
+        # （2026-09-04 本番: 予約選択→キャンセル選択→「はい」が黙殺され状態も残った）。
         if (
             (user_state.get("context_data") or {}).get("recent_completed_booking")
+            and current_mode not in _AUTOPILOT_BOOKING_MODES
             and parsed_intent.get("reply_action") == "no_reply"
             and parsed_intent.get("intent") == "other"
             and not parsed_intent.get("has_reservation_intent")
@@ -2374,6 +2384,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     end_time=end_dt,
                     channel="LINE",
                     notes="LINE AI秘書 確認後確定",
+                    source_ref=_line_reservation_source_ref(),
                 ),
                 reject_conflicts=True,
             )
@@ -2449,6 +2460,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         end_time=end_dt,
                         channel="LINE",
                         notes="LINE AI秘書 候補選択確定",
+                        source_ref=_line_reservation_source_ref(),
                     ),
                     reject_conflicts=True,
                 )
@@ -2512,7 +2524,8 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         reservation_id = prev_draft.get("autopilot_cancel_reservation_id")
         if _is_affirmative(text) and reservation_id:
             try:
-                await transition_status(db, int(reservation_id), "CANCELLED")
+                cancelled_reservation = await transition_status(db, int(reservation_id), "CANCELLED")
+                cancelled_start = cancelled_reservation.start_time.astimezone(JST)
                 await db.commit()
             except HTTPException as error:
                 await db.rollback()
@@ -2541,7 +2554,11 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     reply_token,
                     await _compose_autopilot_reply(
                         "cancel_done",
-                        {"patient_message": text},
+                        {
+                            "date": cancelled_start.strftime("%Y/%m/%d"),
+                            "start": cancelled_start.strftime("%H:%M"),
+                            "patient_message": text,
+                        },
                         parsed_intent,
                     ),
                 )
@@ -3638,6 +3655,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                             end_time=end_dt,
                             channel="LINE",
                             notes="LINE AI秘書 高確信即時確定",
+                            source_ref=_line_reservation_source_ref(),
                         ),
                         reject_conflicts=True,
                     )
@@ -3858,6 +3876,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
                 end_time=end_dt,
                 channel="LINE",
                 notes=f"LINE AI秘書 確定 (RID:{rid})",
+                source_ref=_line_reservation_source_ref(),
             ),
         )
         await update_request(db, rid, line_user_id=user_id, status="confirmed", reservation_id=reservation.get("id"))
@@ -3916,6 +3935,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
                     end_time=end_dt,
                     channel="LINE",
                     notes=f"LINE シャドーモード確定 (RID:{rid}) / dummy_patient={patient.name}",
+                    source_ref=_line_reservation_source_ref(),
                 ),
             )
         except HTTPException as e:
@@ -4012,6 +4032,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
                     end_time=alt_end_dt,
                     channel="LINE",
                     notes=f"LINE シャドーモード代案{alt_index + 1} (RID:{rid}) / dummy_patient={patient.name}",
+                    source_ref=_line_reservation_source_ref(),
                 ),
             )
         except HTTPException as e:
@@ -4143,10 +4164,14 @@ async def _notify_webhook_failure(event: dict, error: Exception) -> None:
 
 
 async def _dispatch_line_event(event: dict, db: AsyncSession) -> None:
-    if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
-        await _handle_text_message(event, db)
-    elif event.get("type") == "postback":
-        await _handle_postback(event, db)
+    event_context = _LINE_WEBHOOK_EVENT_ID.set(event.get("webhookEventId"))
+    try:
+        if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
+            await _handle_text_message(event, db)
+        elif event.get("type") == "postback":
+            await _handle_postback(event, db)
+    finally:
+        _LINE_WEBHOOK_EVENT_ID.reset(event_context)
 
 
 async def _partition_line_events(

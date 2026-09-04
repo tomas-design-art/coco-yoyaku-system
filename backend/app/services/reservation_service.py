@@ -154,6 +154,26 @@ def build_reservation_response(reservation: Reservation) -> dict:
     return resp
 
 
+async def _find_line_reservation_by_source_ref(
+    db: AsyncSession,
+    source_ref: str,
+) -> Reservation | None:
+    result = await db.execute(
+        select(Reservation)
+        .where(
+            Reservation.channel == "LINE",
+            Reservation.source_ref == source_ref,
+        )
+        .options(
+            selectinload(Reservation.patient),
+            selectinload(Reservation.practitioner),
+            selectinload(Reservation.menu),
+            selectinload(Reservation.color),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
 async def create_reservation(
     db: AsyncSession,
     data: ReservationCreate,
@@ -164,6 +184,15 @@ async def create_reservation(
     # patient_id=0 は無効 → Noneに正規化
     if data.patient_id is not None and data.patient_id <= 0:
         data.patient_id = None
+
+    if data.channel == "LINE" and data.source_ref:
+        existing = await _find_line_reservation_by_source_ref(db, data.source_ref)
+        if existing:
+            logger.info(
+                "LINE reservation idempotent replay reused reservation_id=%s",
+                existing.id,
+            )
+            return build_reservation_response(existing)
 
     # color_id が未指定ならメニューの色を引き継ぐ（LINE/Web等の自動登録向け）
     resolved_color_id = data.color_id
@@ -338,6 +367,14 @@ async def create_reservation(
         await db.flush()
     except IntegrityError as e:
         await db.rollback()
+        if data.channel == "LINE" and data.source_ref:
+            existing = await _find_line_reservation_by_source_ref(db, data.source_ref)
+            if existing:
+                logger.info(
+                    "LINE reservation concurrent replay reused reservation_id=%s",
+                    existing.id,
+                )
+                return build_reservation_response(existing)
         if "no_overlap" in str(e.orig):
             conflicts = await check_conflict(
                 db, data.practitioner_id, data.start_time, data.end_time

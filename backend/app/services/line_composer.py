@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import date
 
 
 logger = logging.getLogger(__name__)
@@ -198,6 +199,15 @@ _STRICT_TEMPORAL_SITUATIONS = {
     "reservation_status",
 }
 _STRICT_TEMPORAL_KEYS = {"date", "start", "end", "time", "assumed_date", "assumed_time"}
+_YEAR_DATE_PATTERN = re.compile(
+    r"(?<!\d)(\d{4})(?:年|[-/])\s*(\d{1,2})(?:月|[-/])\s*(\d{1,2})日?(?!\d)"
+)
+_DATE_WITH_WEEKDAY_PATTERN = re.compile(
+    r"(?:(\d{4})(?:年|[-/])\s*)?"
+    r"(\d{1,2})(?:月|[-/])\s*(\d{1,2})日?\s*"
+    r"[（(]?\s*([月火水木金土日])(?:曜(?:日)?)?\s*[）)]?"
+)
+_WEEKDAY_NAMES = "月火水木金土日"
 
 
 def _temporal_facts(value: object, strict: bool = True) -> tuple[set[tuple[int, int]], set[tuple[int, int]]]:
@@ -245,7 +255,73 @@ def _has_temporal_contradiction(context: dict, reply: str, situation: str = "") 
         (int(match.group(1)), int(match.group(2)))
         for match in _DATE_PATTERN.finditer(reply)
     }
-    return bool((reply_times and not reply_times.issubset(allowed_times)) or (reply_dates and not reply_dates.issubset(allowed_dates)))
+    if (reply_times and not reply_times.issubset(allowed_times)) or (
+        reply_dates and not reply_dates.issubset(allowed_dates)
+    ):
+        return True
+    return _has_weekday_contradiction(context, reply, situation)
+
+
+def _has_weekday_contradiction(context: dict, reply: str, situation: str) -> bool:
+    """返信の日付に付いた曜日が、確定事実の日付と一致するか検算する。"""
+    expected: dict[tuple[int, int], set[str]] = {}
+    strict = situation in _STRICT_TEMPORAL_SITUATIONS
+
+    def remember(month: int, day: int, weekday: str) -> None:
+        expected.setdefault((month, day), set()).add(weekday)
+
+    def collect(value: object, key: str | None = None) -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                if child_key == "recent_history":
+                    continue
+                collect(child, child_key)
+            return
+        if isinstance(value, list):
+            for child in value:
+                collect(child, key)
+            return
+        if value in (None, "") or (strict and key not in _STRICT_TEMPORAL_KEYS):
+            return
+
+        text = str(value)
+        for match in _YEAR_DATE_PATTERN.finditer(text):
+            try:
+                actual = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            except ValueError:
+                continue
+            remember(actual.month, actual.day, _WEEKDAY_NAMES[actual.weekday()])
+
+        for match in _DATE_WITH_WEEKDAY_PATTERN.finditer(text):
+            year, month_text, day_text, stated_weekday = match.groups()
+            month, day = int(month_text), int(day_text)
+            if year:
+                try:
+                    actual = date(int(year), month, day)
+                except ValueError:
+                    continue
+                remember(month, day, _WEEKDAY_NAMES[actual.weekday()])
+            else:
+                remember(month, day, stated_weekday)
+
+    collect(context)
+    for match in _DATE_WITH_WEEKDAY_PATTERN.finditer(reply):
+        year, month_text, day_text, stated_weekday = match.groups()
+        month, day = int(month_text), int(day_text)
+        if year:
+            try:
+                actual = date(int(year), month, day)
+            except ValueError:
+                return True
+            if stated_weekday != _WEEKDAY_NAMES[actual.weekday()]:
+                return True
+        elif expected.get((month, day)) and stated_weekday not in expected[(month, day)]:
+            return True
+    expected_weekdays = {weekday for weekdays in expected.values() for weekday in weekdays}
+    mentioned_weekdays = set(re.findall(r"([月火水木金土日])曜", reply))
+    if expected_weekdays and not mentioned_weekdays.issubset(expected_weekdays):
+        return True
+    return False
 
 
 _SYSTEM_STATE_WORDS = (
@@ -398,8 +474,24 @@ def _has_wrong_booking_outcome(situation: str, reply: str) -> bool:
     """DB処理結果と逆の予約完了・取消完了を患者へ伝えていないか。"""
     booking_claims = ("ご予約ありがとうございます", "ご予約を確定", "ご予約を承りました", "予約をお取り", "お待ちしております")
     cancellation_claims = ("キャンセルしました", "キャンセルを承りました", "取消しました")
+    change_claims = ("予約を変更しました", "予約変更を承りました", "変更が完了しました")
+    failure_claim = bool(
+        re.search(
+            r"あいにく|満席|埋まって|空きが(?:ございません|ありません)|"
+            r"(?:予約|変更|キャンセル|取消|取り消し|処理|確定).{0,12}"
+            r"(?:できません|できない|できませんでした|失敗|未完了|見つかりません)",
+            reply,
+        )
+    )
+    # 成功状況は現在固定返信へ短絡する。将来その短絡が変更されても逆結果を通さない保険。
+    if situation == "confirmed":
+        return failure_claim or not any(claim in reply for claim in booking_claims)
+    if situation == "change_done":
+        return failure_claim or not any(claim in reply for claim in change_claims)
+    if situation == "cancel_done":
+        return failure_claim or not any(claim in reply for claim in cancellation_claims)
     if situation in {"cancel_failed", "slot_taken", "no_candidates"}:
-        return any(claim in reply for claim in booking_claims)
+        return any(claim in reply for claim in (*booking_claims, *cancellation_claims))
     if situation == "cancel_aborted":
         return any(claim in reply for claim in cancellation_claims)
     return False
@@ -461,6 +553,8 @@ async def _notify_fallback(situation: str, reason: str) -> None:
 async def compose_reply(situation: str, context: dict) -> str:
     """LLMの自然文を返し、通信不能または日時矛盾の再生成失敗時だけ定型文へ戻す。"""
     fallback = _fallback(situation, context)
+    if situation in {"confirmed", "change_done", "cancel_done"}:
+        return fallback
     try:
         from app.config import settings
         if not settings.gemini_api_key:

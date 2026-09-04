@@ -595,7 +595,7 @@ async def test_extract_requested_practitioner_detects_named_designation():
 
 @pytest.mark.asyncio
 async def test_autopilot_candidate_selection_books_directly_without_extra_confirmation():
-    from app.api.line import _handle_text_message
+    from app.api import line as line_module
 
     patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
     request_data = {
@@ -612,6 +612,8 @@ async def test_autopilot_candidate_selection_books_directly_without_extra_confir
         ],
     }
     event = {
+        "type": "message",
+        "webhookEventId": "evt-candidate-choice-1",
         "replyToken": "reply-token",
         "source": {"userId": "U-autopilot"},
         "message": {"type": "text", "text": "1でお願い"},
@@ -635,13 +637,59 @@ async def test_autopilot_candidate_selection_books_directly_without_extra_confir
         "app.api.line.set_user_mode", new=AsyncMock()
     ) as mock_set_mode, patch(
         "app.api.line.reply_to_line", new=AsyncMock()
-    ) as mock_reply:
-        await _handle_text_message(event, db)
+    ) as mock_reply, patch("app.api.line.is_duplicate_message", return_value=True) as mock_text_dedup:
+        deferred_user = line_module._DEFERRED_REPLY_USER.set("U-autopilot")
+        try:
+            await line_module._dispatch_line_event(event, db)
+        finally:
+            line_module._DEFERRED_REPLY_USER.reset(deferred_user)
 
     mock_create.assert_awaited_once()
+    reservation_data = mock_create.await_args.args[1]
+    assert reservation_data.source_ref == "line:evt-candidate-choice-1"
+    mock_text_dedup.assert_not_called()
+    assert line_module._LINE_WEBHOOK_EVENT_ID.get() is None
     mock_remember_completed.assert_awaited_once()
     assert mock_set_mode.await_args.args[2] == "idle"
-    assert mock_reply.await_args.args[1]
+    reply_text = mock_reply.await_args.args[1]
+    assert "ご予約を確定しました" in reply_text
+    assert "満席" not in reply_text
+
+
+@pytest.mark.asyncio
+async def test_create_reservation_reuses_existing_line_event_before_side_effects():
+    from app.models import patient, practitioner, reservation_color, reservation_series  # noqa: F401
+
+    from app.schemas.reservation import ReservationCreate
+    from app.services.reservation_service import create_reservation
+    from app.utils.datetime_jst import JST
+
+    db = AsyncMock()
+    existing = SimpleNamespace(id=555)
+    query_result = Mock()
+    query_result.scalar_one_or_none.return_value = existing
+    db.execute.return_value = query_result
+    data = ReservationCreate(
+        patient_id=7,
+        practitioner_id=3,
+        menu_id=5,
+        start_time=datetime(2026, 9, 4, 17, 0, tzinfo=JST),
+        end_time=datetime(2026, 9, 4, 18, 0, tzinfo=JST),
+        channel="LINE",
+        source_ref="line:evt-candidate-choice-1",
+    )
+
+    with patch(
+        "app.services.reservation_service.build_reservation_response",
+        return_value={"id": 555, "status": "CONFIRMED"},
+    ), patch(
+        "app.services.reservation_service.validate_business_hours", new=AsyncMock()
+    ) as mock_validate:
+        result = await create_reservation(db, data, reject_conflicts=True)
+
+    assert result == {"id": 555, "status": "CONFIRMED"}
+    mock_validate.assert_not_awaited()
+    db.add.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -756,8 +804,13 @@ async def test_autopilot_candidate_time_selection_books_directly_without_extra_c
 @pytest.mark.asyncio
 async def test_autopilot_cancel_confirmation_accepts_casual_affirmative():
     from app.api.line import _handle_text_message
+    from app.utils.datetime_jst import JST
 
     patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    cancelled_reservation = SimpleNamespace(
+        id=91,
+        start_time=datetime(2026, 9, 4, 17, 0, tzinfo=JST),
+    )
     event = {
         "replyToken": "reply-token",
         "source": {"userId": "U-autopilot"},
@@ -773,16 +826,99 @@ async def test_autopilot_cancel_confirmation_accepts_casual_affirmative():
     ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
         "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
     ), patch("app.api.line.create_notification", new=AsyncMock()) as mock_notification, patch(
-        "app.api.line.transition_status", new=AsyncMock()
+        "app.api.line.transition_status", new=AsyncMock(return_value=cancelled_reservation)
     ) as mock_transition, patch("app.api.line.clear_user_draft", new=AsyncMock()), patch(
         "app.api.line.set_user_mode", new=AsyncMock()
-    ) as mock_set_mode, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+    ) as mock_set_mode, patch(
+        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="9/4 17時のご予約をキャンセルしました。")
+    ) as mock_compose, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
         await _handle_text_message(event, db)
 
     mock_transition.assert_awaited_once_with(db, 91, "CANCELLED")
     assert mock_set_mode.await_args.args[2] == "idle"
     assert mock_notification.await_args.args[1] == "reservation_cancelled"
     assert mock_notification.await_args.args[3] == 91
+    cancel_context = mock_compose.await_args.args[1]
+    assert cancel_context["date"] == "2026/09/04"
+    assert cancel_context["start"] == "17:00"
+    assert mock_reply.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_cancel_confirmation_survives_recent_booking_no_reply_shortcut():
+    """確定直後にキャンセル確認へ入った「はい」を、相槌として黙殺しないこと。
+
+    2026-09-04 本番実機: 候補選択で予約確定 → キャンセル対象をpostbackで選択 →
+    「はい」。Geminiが reply_action=no_reply / intent=other と判定したため、
+    確認待ちなのに無言returnし、取消が実行されず状態も autopilot_cancel_confirm
+    のまま残った。確認待ちモードではこの近道へ入ってはいけない。
+    """
+    from app.api.line import _handle_text_message
+    from app.utils.datetime_jst import JST
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    cancelled_reservation = SimpleNamespace(
+        id=2518,
+        start_time=datetime(2026, 9, 4, 16, 0, tzinfo=JST),
+    )
+    event = {
+        # is_duplicate_message は (user_id, 本文) をプロセス内dictへ8秒残すため、
+        # 同じ "U-autopilot" + "はい" を使う他テストを巻き添えで黙殺してしまう。
+        # 共有stateを汚さないよう、このテストだけ別IDを使う。
+        "replyToken": "reply-token",
+        "source": {"userId": "U-autopilot-ack"},
+        "message": {"type": "text", "text": "はい"},
+    }
+    # 直前に「3で」で予約が確定しており、確定文脈が状態に残っている
+    state = {
+        "mode": "autopilot_cancel_confirm",
+        "draft": {"autopilot_cancel_reservation_id": 2518},
+        "request_id": None,
+        "context_data": {
+            "recent_completed_booking": {
+                "date": "2026/09/04",
+                "start": "16:00",
+                "end": "17:00",
+                "practitioner": "時田",
+            }
+        },
+    }
+    # 実機で返ってきた解析結果（相槌と判定された）
+    parsed = {
+        "intent": "other",
+        "reply_action": "no_reply",
+        "has_reservation_intent": False,
+        "confidence": "high",
+        "constraints": [],
+    }
+    db = AsyncMock()
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state", new=AsyncMock(return_value=state)
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="autopilot_cancel_confirm")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.build_clinic_context", new=AsyncMock(return_value={})), patch(
+        "app.api.line.parse_line_message", new=AsyncMock(return_value=parsed)
+    ), patch(
+        "app.api.line.clear_recent_completed_booking", new=AsyncMock()
+    ) as mock_clear_recent, patch(
+        "app.api.line.create_notification", new=AsyncMock()
+    ), patch(
+        "app.api.line.transition_status", new=AsyncMock(return_value=cancelled_reservation)
+    ) as mock_transition, patch("app.api.line.clear_user_draft", new=AsyncMock()), patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ) as mock_set_mode, patch(
+        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="ご予約をキャンセルしました。")
+    ), patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+        await _handle_text_message(event, db)
+
+    # 相槌の近道へ入らず、取消が実行されていること
+    mock_clear_recent.assert_not_awaited()
+    mock_transition.assert_awaited_once_with(db, 2518, "CANCELLED")
+    assert mock_set_mode.await_args.args[2] == "idle"
+    # 無言で終わらないこと（実機はここが無反応だった）
     assert mock_reply.await_args.args[1]
 
 
@@ -1014,6 +1150,15 @@ def test_composer_rejects_booking_confirmation_when_cancellation_failed():
     assert _has_wrong_booking_outcome("cancel_failed", "ご予約ありがとうございます。19:30にお待ちしております。") is True
     assert _has_wrong_booking_outcome("cancel_failed", "19:30のご予約を承りました。当日はお気をつけてお越しください。") is True
     assert _has_wrong_booking_outcome("cancel_failed", "キャンセル処理を完了できませんでした。") is False
+
+
+def test_composer_rejects_failure_reply_after_successful_booking_mutation():
+    from app.services.line_composer import _has_wrong_booking_outcome
+
+    assert _has_wrong_booking_outcome("confirmed", "あいにく17時の予約は埋まっております。") is True
+    assert _has_wrong_booking_outcome("confirmed", "17時でご予約を確定しました。") is False
+    assert _has_wrong_booking_outcome("change_done", "予約変更を完了できませんでした。") is True
+    assert _has_wrong_booking_outcome("cancel_done", "キャンセル処理を完了できませんでした。") is True
 
 
 def test_composer_prompt_does_not_require_a_greeting_before_every_reply():
@@ -1568,6 +1713,26 @@ async def test_composer_returns_successful_llm_text_without_template_replacement
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("situation", ["confirmed", "change_done", "cancel_done"])
+async def test_successful_mutation_reply_is_deterministic(situation):
+    from app.services.line_composer import _fallback, compose_reply
+
+    context = {
+        "date": "2026/09/04",
+        "start": "17:00",
+        "end": "18:00",
+        "practitioner": "時田",
+        "menu": "マッスルセラピー",
+    }
+    with patch("httpx.AsyncClient") as mock_client:
+        actual = await compose_reply(situation, context)
+
+    assert actual == _fallback(situation, context)
+    assert "17:00〜18:00" in actual
+    mock_client.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_composer_retries_once_only_for_temporal_contradiction():
     from app.services.line_composer import compose_reply
 
@@ -1590,6 +1755,46 @@ async def test_composer_retries_once_only_for_temporal_contradiction():
     assert actual == "8/16の14:00はいかがですか？"
     assert client.post.await_count == 2
     assert "書き直してください" in client.post.await_args_list[1].kwargs["json"]["contents"][0]["parts"][0]["text"]
+    mock_notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_offer_alternatives_retries_when_llm_invents_wrong_weekday():
+    from app.services.line_composer import compose_reply
+
+    wrong = Mock()
+    wrong.raise_for_status.return_value = None
+    wrong.json.return_value = {
+        "candidates": [{"content": {"parts": [{"text": "本日木曜日の17:00が空いております。"}]}}]
+    }
+    corrected = Mock()
+    corrected.raise_for_status.return_value = None
+    corrected.json.return_value = {
+        "candidates": [{"content": {"parts": [{"text": "本日金曜日の17:00が空いております。"}]}}]
+    }
+    client = AsyncMock()
+    client.post.side_effect = [wrong, corrected]
+    client_context = AsyncMock()
+    client_context.__aenter__.return_value = client
+    context = {
+        "alternatives": [
+            {
+                "date": "2026-09-04",
+                "start": "17:00",
+                "end": "18:00",
+                "label": "2026/09/04 17:00〜18:00（時田）",
+            }
+        ],
+        "vague": True,
+    }
+
+    with patch("app.config.settings.gemini_api_key", "test-key"), patch(
+        "httpx.AsyncClient", return_value=client_context
+    ), patch("app.services.line_composer._notify_fallback", new=AsyncMock()) as mock_notify:
+        actual = await compose_reply("offer_alternatives", context)
+
+    assert actual == "本日金曜日の17:00が空いております。"
+    assert client.post.await_count == 2
     mock_notify.assert_not_awaited()
 
 
@@ -2615,6 +2820,14 @@ def test_confirmation_still_rejects_fabricated_datetime():
     context = {"date": "8/19(水)", "start": "10:45", "end": "11:45", "practitioner": "時田"}
     assert _has_temporal_contradiction(context, "8/19(水) 10:45〜11:45で承りました。", "confirmed") is False
     assert _has_temporal_contradiction(context, "8/24(月) 19:30で承りました。", "confirmed") is True
+
+
+def test_confirmation_rejects_weekday_that_disagrees_with_confirmed_date():
+    from app.services.line_composer import _has_temporal_contradiction
+
+    context = {"date": "2026/09/04", "start": "17:00", "end": "18:00", "practitioner": "時田"}
+    assert _has_temporal_contradiction(context, "9/4(木) 17:00〜18:00で承りました。", "confirmed") is True
+    assert _has_temporal_contradiction(context, "9/4(金) 17:00〜18:00で承りました。", "confirmed") is False
 
 
 def test_offer_alternatives_cannot_claim_the_reservation_is_already_confirmed():
