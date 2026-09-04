@@ -1805,6 +1805,34 @@ async def _search_negotiated_candidates(
     return []
 
 
+def _preferred_practitioner_context(draft: dict | None, candidates: list[dict] | None) -> dict:
+    """希望担当の枠を出せなかった事実を、返信の材料として必ず渡す。
+
+    候補生成は希望担当で埋まらなければ他の担当で補う（slot_scorer の仕様）。
+    黙って別の人を並べると「指名を無視された」と受け取られる。
+    2026-09-04 実機: 時田を3回指名されたのに、理由を言わないまま
+    別の施術者の枠だけを出し続けてループになった。
+    """
+    draft = draft or {}
+    name = draft.get("practitioner_name")
+    practitioner_id = draft.get("practitioner_id")
+    if not name or not practitioner_id:
+        return {}
+    matched = [
+        candidate
+        for candidate in (candidates or [])
+        if candidate.get("practitioner_id") == practitioner_id
+    ]
+    return {
+        "preferred_practitioner": {
+            "name": name,
+            "has_candidate": bool(matched),
+            "candidate_count": len(matched),
+            "total_candidates": len(candidates or []),
+        }
+    }
+
+
 def _date_shift_context(requested_date: date, candidates: list[dict]) -> dict:
     """提示する候補が希望日と違う日になっていれば、その事実を返信の材料に含める。
 
@@ -2040,6 +2068,8 @@ async def _reoffer_autopilot_candidates(
                     # 同日で見つからず別日へ広げた場合は、それを必ず伝えさせる。
                     # 黙って別日の候補を出すと「勝手に日付が変わった」と受け取られる。
                     **_date_shift_context(target_date, candidates),
+                    # 希望担当の枠を出せていないなら、その事実も同じ重みで伝えさせる。
+                    **_preferred_practitioner_context(draft, candidates),
                 },
                 parsed_intent,
             ),
@@ -3870,6 +3900,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         "duration_minutes": duration,
                         "first_visit_note": first_visit_note,
                         "patient_message": text,
+                        **_preferred_practitioner_context(merged or prev_draft, alternatives),
                     },
                     parsed_intent,
                 ),

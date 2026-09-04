@@ -3953,3 +3953,57 @@ def test_parser_prompt_declares_the_practitioner_slot():
 
     assert '"practitioner":null' in LINE_PARSE_PROMPT
     assert "practitioner: この予約で担当してほしい" in LINE_PARSE_PROMPT
+
+
+def test_preferred_practitioner_context_flags_when_the_request_could_not_be_met():
+    """希望担当の枠を出せていない事実を、返信の材料として渡す。"""
+    from app.api.line import _preferred_practitioner_context
+
+    draft = {"practitioner_id": 1, "practitioner_name": "時田"}
+    others = [
+        {"practitioner_id": 3, "start": "17:00"},
+        {"practitioner_id": 3, "start": "18:00"},
+    ]
+    note = _preferred_practitioner_context(draft, others)["preferred_practitioner"]
+    assert note["name"] == "時田"
+    assert note["has_candidate"] is False
+    assert note["total_candidates"] == 2
+
+    with_preferred = others + [{"practitioner_id": 1, "start": "12:30"}]
+    assert (
+        _preferred_practitioner_context(draft, with_preferred)["preferred_practitioner"][
+            "has_candidate"
+        ]
+        is True
+    )
+
+    # 担当の指名が無ければ何も足さない
+    assert _preferred_practitioner_context({}, others) == {}
+    assert _preferred_practitioner_context(None, others) == {}
+
+
+def test_reply_must_mention_the_practitioner_it_could_not_offer():
+    """指名された担当に触れずに別の担当の枠だけを並べる返信を止める。
+
+    2026-09-04 実機: 時田を3回指名されたのに理由を言わず、
+    別の施術者の枠だけを出し続けてループになった。
+    """
+    from app.services.line_composer import _ignores_unavailable_preferred_practitioner
+
+    context = {"preferred_practitioner": {"name": "時田", "has_candidate": False}}
+
+    silent = "9/6(日)は 17:00〜18:00、18:00〜19:00 が空いております。ご希望の番号を教えてください。"
+    assert _ignores_unavailable_preferred_practitioner(context, silent) is True
+
+    honest = (
+        "9/6(日)の夕方以降、時田は空きがございません。"
+        "同じ日でしたら 12:30〜13:30 で時田がご案内できます。"
+        "夕方をご希望でしたら 17:00〜18:00 で別の担当となります。"
+    )
+    assert _ignores_unavailable_preferred_practitioner(context, honest) is False
+
+    # 希望担当の枠を出せているときは黙っていてよい
+    met = {"preferred_practitioner": {"name": "時田", "has_candidate": True}}
+    assert _ignores_unavailable_preferred_practitioner(met, silent) is False
+    # 指名そのものが無いときも対象外
+    assert _ignores_unavailable_preferred_practitioner({}, silent) is False

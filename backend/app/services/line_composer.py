@@ -18,6 +18,10 @@ SITUATION_GUIDES = {
         "date_only が真なら患者は時刻を指定していない。その日の空き候補として案内し、希望時間帯が満席とは書かない。"
         "candidates_on_other_dates が真の場合は、requested_date に空きが無かったことを先に伝えてから"
         "別日の候補であると明示する。日付が変わったことを黙って提示しない。"
+        "preferred_practitioner があり has_candidate が false のときは、"
+        "その担当者の名前を出して『ご希望の条件では枠が空いていない』ことを先に伝える。"
+        "指名された担当者に触れないまま別の担当者の枠だけを並べない。"
+        "空きが無いことを『不在』『お休み』と言い換えない。"
     ),
     "usual_confirm": "いつものメニュー・所要時間・担当を提示し、この内容で良いか確認する。",
     "ask_datetime": "直近の会話を踏まえ、予約に必要な情報だけを自然に尋ねる。",
@@ -365,6 +369,7 @@ _RETRY_NOTES = {
     "spec_claim": "\n前回の返信は院の枠の組み方や施術時間のルールを勝手に説明していました。院の仕組みには触れず、確定情報にある施術時間だけを使って書き直してください。",
     "alternative_context": "\n前回の返信は候補の日付や患者が指定した条件と矛盾していました。同日の候補を別日と呼ばず、時刻未指定なら希望時間帯が満席とは書かず、料金にも触れずに書き直してください。",
     "repeated_reply": "\n前回の返信は直近のあなた自身の返答と同じ定型的な冒頭を繰り返していました。患者の最新発言と確定事実にだけ応じ、同じ挨拶や体調への問いかけを繰り返さずに書き直してください。",
+    "ignored_preferred_practitioner": "\n前回の返信は、患者が指名した担当者を出せない事実に触れずに別の担当者の枠だけを並べていました。指名された担当者の名前を出し、その条件では空きが無いことを先に伝えてから候補を案内してください。",
     "extra_question": "\n前回の返信は、いま確認すべきこと以外の質問を足していました。いま確認すべき1点だけを尋ね、再予約や別日程など他の話題は一切持ち出さずに書き直してください。",
 }
 
@@ -538,6 +543,21 @@ def _has_misleading_alternative_context(situation: str, context: dict, reply: st
     return bool(context.get("date_only") and re.search(r"(?:希望|ご希望).{0,8}(?:時間帯|時間).{0,12}(?:満席|埋ま)", reply))
 
 
+def _ignores_unavailable_preferred_practitioner(context: dict, reply: str) -> bool:
+    """指名された担当者を出せないのに、その人に一言も触れていないか。
+
+    黙って別の担当者の枠を並べると、患者には指名が無視されたように見える。
+    """
+    preferred = context.get("preferred_practitioner")
+    if not isinstance(preferred, dict) or preferred.get("has_candidate"):
+        return False
+    name = str(preferred.get("name") or "")
+    if not name:
+        return False
+    surname = name.split()[0]
+    return surname not in reply
+
+
 def _has_unprompted_price_reference(context: dict, reply: str) -> bool:
     """料金を尋ねられていない候補案内で、料金の話題を勝手に持ち出さない。"""
     if not any(word in reply for word in _PRICE_REFERENCE_WORDS):
@@ -702,6 +722,9 @@ async def compose_reply(situation: str, context: dict) -> str:
                     continue
                 if _has_misleading_alternative_context(situation, context, text):
                     reason = "alternative_context"
+                    continue
+                if _ignores_unavailable_preferred_practitioner(context, text):
+                    reason = "ignored_preferred_practitioner"
                     continue
                 if _has_unprompted_price_reference(context, text):
                     reason = "alternative_context"
