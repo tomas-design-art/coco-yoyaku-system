@@ -3007,6 +3007,9 @@ def test_assumed_booking_defaults_detected():
     assert _has_assumed_booking_defaults({"assumed_duration": 60}) is True
     assert _has_assumed_booking_defaults({"menu_name": "マッスルセラピー", "assumed_practitioner": False}) is False
     assert _has_assumed_booking_defaults({}) is False
+    # 日付・時刻も同じ扱いになった（フォーム側の出どころ判定）
+    assert _has_assumed_booking_defaults({"date": "2026-09-06", "assumed_date": True}) is True
+    assert _has_assumed_booking_defaults({"date": "2026-09-06"}) is False
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ from app.models.setting import Setting
 from app.schemas.reservation import ReservationCreate
 from app.services.conflict_detector import check_conflict
 from app.services.line_alerts import build_reservation_review_flex, push_admin_reservation_review
+from app.services.booking_form import Form as BookingForm
 from app.services.line_composer import compose_reply
 from app.services.line_debounce import clear_debounce, is_duplicate_message, merge_debounced_message
 from app.services.line_inbox import (
@@ -581,7 +582,14 @@ def _has_assumed_booking_defaults(draft: dict) -> bool:
     """患者が述べていない条件（登録情報からの推定）が混ざっているか。
 
     混ざっているうちは確認なしで予約を確定させない。
+
+    判定の本体は予約フォーム（services/booking_form.py）が持つ「箱の出どころ」。
+    以前はキー名を3つ直接見ていたため、日付・時刻には同じ扱いが無く、
+    どのスロットが患者の言葉でどれが補われた値かが経路ごとにばらついていた。
+    フォーム側の判定に加えて従来の印も見る（判定を緩めないため）。
     """
+    if BookingForm.booking(draft).needs_confirmation():
+        return True
     return any(draft.get(key) for key in ("assumed_menu", "assumed_practitioner", "assumed_duration"))
 
 
