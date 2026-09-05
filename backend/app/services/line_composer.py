@@ -506,8 +506,22 @@ def _has_premature_confirmation(situation: str, reply: str) -> bool:
     return situation == "offer_alternatives" and any(word in reply for word in _PREMATURE_CONFIRMATION_WORDS)
 
 
+# 予約の「完了」を名乗る言い方。確認（お取りしてよろしいでしょうか／お取りしましょうか）は含めない。
+_COMPLETED_BOOKING_CLAIM = re.compile(
+    r"(?:予約|お席)(?:を|が|も)?\s*(?:承り|確定し|お取りし|お取りいたし|完了し|承っ)"
+    r"(?:ました|ます(?!か)|ております)"
+)
+
+
 def _has_wrong_booking_outcome(situation: str, reply: str) -> bool:
-    """DB処理結果と逆の予約完了・取消完了を患者へ伝えていないか。"""
+    """DB処理結果と逆の予約完了・取消完了を患者へ伝えていないか。
+
+    完了を名乗ってよいのは、実際にDBへ書いた場面だけ。以前はここを
+    「言ってはいけない場面」の列挙で管理していたため、列挙に無い場面
+    （解析に失敗した返信など）ではLLMが自由に完了を名乗れてしまった。
+    2026-09-06 実機: 予約が1件も作られていないのに
+    「9月7日15:00から、上田の…でご予約を承りました」と患者へ伝えた。
+    """
     booking_claims = ("ご予約ありがとうございます", "ご予約を確定", "ご予約を承りました", "予約をお取り", "お待ちしております")
     cancellation_claims = ("キャンセルしました", "キャンセルを承りました", "取消しました")
     change_claims = ("予約を変更しました", "予約変更を承りました", "変更が完了しました")
@@ -519,6 +533,13 @@ def _has_wrong_booking_outcome(situation: str, reply: str) -> bool:
             reply,
         )
     )
+    # ★完了を名乗れるのはここに挙げた場面だけ（許可リスト）。
+    #   これ以外の場面で完了を名乗ったら、その予約は存在しない。
+    if situation not in {"confirmed", "change_done"} and _COMPLETED_BOOKING_CLAIM.search(reply):
+        return True
+    if situation != "cancel_done" and any(claim in reply for claim in cancellation_claims):
+        return True
+
     # 成功状況は現在固定返信へ短絡する。将来その短絡が変更されても逆結果を通さない保険。
     if situation == "confirmed":
         return failure_claim or not any(claim in reply for claim in booking_claims)

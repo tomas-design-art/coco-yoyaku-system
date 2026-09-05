@@ -4413,3 +4413,64 @@ def test_no_confirmation_is_sent_without_buttons():
 
     assert checked, "確認の送出が1つも見つからない（検査が空振りしている）"
     assert not offenders, f"ボタン無しで送っている確認: {offenders}"
+
+
+# ─────────────────────────────────────────────────────────────
+# 存在しない予約を「承りました」と言わせない
+# 2026-09-06 実機: 予約が1件も作られていないのに完了を伝えた
+# ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "situation",
+    ["parse_failed", "answer_question", "small_talk", "ask_datetime", "offer_alternatives"],
+)
+def test_only_the_situations_that_wrote_to_the_database_may_claim_a_booking(situation):
+    """実際にDBへ書いた場面以外で、予約の完了を名乗らせない。
+
+    実機で送られた文面をそのまま使う。この予約は作られていなかった。
+    """
+    from app.services.line_composer import _has_wrong_booking_outcome
+
+    phantom = (
+        "9月7日（月）15:00から、上田のマッスルセラピー60分でご予約を承りました。"
+        "当日お待ちしております。"
+    )
+    assert _has_wrong_booking_outcome(situation, phantom) is True
+    assert _has_wrong_booking_outcome(situation, "ご予約を確定しました。9/7 15:00です。") is True
+    assert _has_wrong_booking_outcome(situation, "9/6 15:00のご予約をキャンセルしました。") is True
+
+
+def test_asking_permission_to_book_is_not_a_completion_claim():
+    """「お取りしてよろしいでしょうか」は完了ではない。止めてはいけない。"""
+    from app.services.line_composer import _has_wrong_booking_outcome
+
+    asking = (
+        "9月7日（月）の午前中でしたら、10時から時田の枠でご案内可能ですが、"
+        "こちらでご予約をお取りしてよろしいでしょうか？"
+    )
+    assert _has_wrong_booking_outcome("confirm_slot", asking) is False
+    assert (
+        _has_wrong_booking_outcome("offer_alternatives", "改めて別の日程でご予約をお取りしましょうか？")
+        is False
+    )
+    assert (
+        _has_wrong_booking_outcome("cancel_confirm", "9月6日15:00のご予約をキャンセルしてよろしいですか？")
+        is False
+    )
+    assert _has_wrong_booking_outcome("cancel_aborted", "承知しました。キャンセルは取りやめました。") is False
+
+
+def test_the_situations_that_did_write_may_report_completion():
+    from app.services.line_composer import _has_wrong_booking_outcome
+
+    assert (
+        _has_wrong_booking_outcome(
+            "confirmed", "ご予約を確定しました。\n2026/09/06 15:00〜16:00\nご来院をお待ちしております。"
+        )
+        is False
+    )
+    assert (
+        _has_wrong_booking_outcome("cancel_done", "2026/09/06 15:00のご予約をキャンセルしました。")
+        is False
+    )
