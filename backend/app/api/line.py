@@ -3860,10 +3860,13 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     if duration <= 0:
         duration = 60
 
+    # 日付と時刻をまとめて判定していたため、時刻だけ取れないときにも
+    # 「メッセージがうまく読み取れませんでした」と全否定していた。
+    # 2026-09-06 実機:「明日予約したい」で日付を受け取った直後の
+    # 「午前中空いてますか？」に、日付ごと読み取れなかったかのように返した。
+    # 埋まっている箱は受け取ったと示し、空いている箱だけを尋ねる。
     try:
         target_date = date.fromisoformat(desired_date)
-        hh, mm = map(int, str(desired_time).split(":"))
-        target_time = time(hh, mm)
     except Exception:
         if reply_token:
             await reply_to_line(
@@ -3871,6 +3874,29 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 await _compose_autopilot_reply(
                     "parse_failed",
                     {"patient_message": text},
+                    parsed_intent,
+                ),
+            )
+        return
+
+    try:
+        hh, mm = map(int, str(desired_time).split(":"))
+        target_time = time(hh, mm)
+    except Exception:
+        await set_user_mode(db, user_id, "waiting_datetime", user_state.get("request_id"))
+        if reply_token:
+            await reply_to_line(
+                reply_token,
+                await _compose_autopilot_reply(
+                    "ask_time_for_date",
+                    {
+                        "date": _format_date_with_weekday_jp(target_date),
+                        "duration_minutes": duration,
+                        "day_availability": await build_day_availability_summary(
+                            db, target_date, duration
+                        ),
+                        "patient_message": text,
+                    },
                     parsed_intent,
                 ),
             )

@@ -4474,3 +4474,105 @@ def test_the_situations_that_did_write_may_report_completion():
         _has_wrong_booking_outcome("cancel_done", "2026/09/06 15:00のご予約をキャンセルしました。")
         is False
     )
+
+
+class _EmptyDB:
+    """何を聞かれても「該当なし」と答えるDB。
+
+    AsyncMock を DB として渡すと、scalars() 等が待ち受け可能なものを返してしまい、
+    テストが判定にたどり着く前に例外で止まる。止まった理由を「仕様が変わった」と
+    読み違えないよう、答えられるDBを用意する。
+    """
+
+    class _Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+        def first(self):
+            return None
+
+        def scalar_one_or_none(self):
+            return None
+
+        def scalar(self):
+            return None
+
+    async def execute(self, *_args, **_kwargs):
+        return self._Result()
+
+    async def get(self, *_args, **_kwargs):
+        return None
+
+    async def commit(self):
+        return None
+
+    async def flush(self):
+        return None
+
+    async def rollback(self):
+        return None
+
+    def add(self, *_args, **_kwargs):
+        return None
+
+@pytest.mark.asyncio
+async def test_a_known_date_is_not_thrown_away_when_only_the_time_is_missing():
+    """日付を受け取っているなら、時刻だけを尋ねる。
+
+    2026-09-06 実機:「明日予約したい」で 9/7 を受け取った直後の
+    「午前中空いてますか？」に、「メッセージがうまく読み取れませんでした」と
+    日付ごと読み取れなかったかのように返した。
+    """
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-time-missing"},
+        "message": {"type": "text", "text": "午前中空いてますか？"},
+    }
+    # 日付は受け取っているが、時刻が HH:MM として読めない値で返ってきた
+    parsed = {
+        "intent": "new",
+        "confidence": "medium",
+        "constraints": [],
+        "date": "2026-09-07",
+        "time": "午前中",
+        "has_reservation_intent": True,
+    }
+    state = {
+        "mode": "waiting_datetime",
+        "draft": {"date": "2026-09-07", "menu_name": "マッスルセラピー", "duration_minutes": 60},
+        "request_id": None,
+        "context_data": {},
+    }
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state", new=AsyncMock(return_value=state)
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="waiting_datetime")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.build_clinic_context", new=AsyncMock(return_value={})), patch(
+        "app.api.line.parse_line_message", new=AsyncMock(return_value=parsed)
+    ), patch(
+        "app.api.line._merge_autopilot_slots",
+        new=AsyncMock(return_value={**state["draft"], "time": "午前中", "customer_name": "時田信"}),
+    ), patch("app.api.line._resolve_menu", new=AsyncMock(return_value=None)), patch(
+        "app.api.line.merge_user_draft", new=AsyncMock()
+    ), patch("app.api.line.set_user_mode", new=AsyncMock()), patch(
+        "app.api.line.build_day_availability_summary", new=AsyncMock(return_value={})
+    ), patch(
+        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="9/7(月)ですね。")
+    ) as mock_compose, patch("app.api.line.reply_to_line", new=AsyncMock()):
+        await _handle_text_message(event, _EmptyDB())
+
+    situations = [call.args[0] for call in mock_compose.await_args_list]
+    assert "parse_failed" not in situations, situations
+    assert "ask_time_for_date" in situations, situations
+    # 受け取った日付を返信の材料として渡していること
+    context = [c.args[1] for c in mock_compose.await_args_list if c.args[0] == "ask_time_for_date"][0]
+    assert "9/7" in str(context.get("date"))
