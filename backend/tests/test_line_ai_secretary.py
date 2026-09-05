@@ -3679,6 +3679,8 @@ async def test_cancel_with_multiple_reservations_offers_postback_choices():
     ), patch(
         "app.api.line._find_upcoming_reservations", new=AsyncMock(return_value=reservations)
     ), patch("app.api.line._handoff_autopilot_to_human", new=AsyncMock()) as mock_handoff, patch(
+        "app.api.line.merge_user_draft", new=AsyncMock()
+    ) as mock_merge, patch(
         "app.api.line.set_user_mode", new=AsyncMock()
     ) as mock_set_mode, patch(
         "app.api.line.reply_text_with_quick_reply", new=AsyncMock()
@@ -3686,12 +3688,18 @@ async def test_cancel_with_multiple_reservations_offers_postback_choices():
         await _handle_text_message(event, db)
 
     mock_handoff.assert_not_awaited()
-    mock_set_mode.assert_not_awaited()
     items = mock_quick_reply.await_args.args[2]
     assert [item["action"]["data"] for item in items] == [
         "action=cancel_select&reservation_id=91",
         "action=cancel_select&reservation_id=92",
     ]
+    # 一覧を出したら「選択待ち」を状態として持つ。持たないと、ボタンではなく
+    # 文字で答えられたときに新規メッセージとして処理され、予約の候補提示に化ける。
+    assert mock_set_mode.await_args.args[2] == "autopilot_cancel_select"
+    assert mock_merge.await_args.args[2]["autopilot_cancel_candidate_ids"] == [91, 92]
+    # 番号でも答えられるよう、一覧には番号を振る
+    listing = mock_quick_reply.await_args.args[1]
+    assert "1. " in listing and "2. " in listing
 
 
 @pytest.mark.asyncio
@@ -4007,3 +4015,133 @@ def test_reply_must_mention_the_practitioner_it_could_not_offer():
     assert _ignores_unavailable_preferred_practitioner(met, silent) is False
     # 指名そのものが無いときも対象外
     assert _ignores_unavailable_preferred_practitioner({}, silent) is False
+
+
+# ─────────────────────────────────────────────────────────────
+# キャンセル対象の選択待ちを状態として持つ
+# 2026-09-04 実機: 一覧に「両方」と文字で答えたら新規予約の候補提示に化けた
+# ─────────────────────────────────────────────────────────────
+
+
+def _cancel_candidates():
+    from app.utils.datetime_jst import JST
+
+    return [
+        SimpleNamespace(id=2535, start_time=datetime(2026, 9, 5, 15, 0, tzinfo=JST)),
+        SimpleNamespace(id=2536, start_time=datetime(2026, 9, 6, 11, 30, tzinfo=JST)),
+    ]
+
+
+def test_cancel_target_selection_understands_both_number_and_datetime():
+    from app.api.line import _select_cancel_targets
+
+    candidates = _cancel_candidates()
+
+    # 「両方」は2件とも対象
+    assert [r.id for r in _select_cancel_targets("両方", candidates)] == [2535, 2536]
+    assert [r.id for r in _select_cancel_targets("全部お願いします", candidates)] == [2535, 2536]
+
+    # 番号
+    assert [r.id for r in _select_cancel_targets("2", candidates)] == [2536]
+    assert [r.id for r in _select_cancel_targets("1で", candidates)] == [2535]
+
+    # 日時（番号と読み違えない）
+    assert [r.id for r in _select_cancel_targets("9/5の15時", candidates)] == [2535]
+    assert [r.id for r in _select_cancel_targets("09/06 11:30", candidates)] == [2536]
+
+    # 決まらないものは推測しない（取り違えたキャンセルは戻せない）
+    assert _select_cancel_targets("うーん", candidates) == []
+    assert _select_cancel_targets("どうしよう", candidates) == []
+
+
+@pytest.mark.asyncio
+async def test_both_on_the_cancel_list_confirms_one_at_a_time():
+    """一覧への「両方」を新規予約に化けさせず、1件ずつ確認へ進める。"""
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    candidates = _cancel_candidates()
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-cancel-both"},
+        "message": {"type": "text", "text": "両方"},
+    }
+    state = {
+        "mode": "autopilot_cancel_select",
+        "draft": {"autopilot_cancel_candidate_ids": [2535, 2536]},
+        "request_id": None,
+        "context_data": {},
+    }
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state", new=AsyncMock(return_value=state)
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="autopilot_cancel_select")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.build_clinic_context", new=AsyncMock(return_value={})), patch(
+        "app.api.line.parse_line_message",
+        new=AsyncMock(return_value={"intent": "cancel", "constraints": [], "has_reservation_intent": True}),
+    ), patch(
+        "app.api.line._find_owned_cancellable_reservation",
+        new=AsyncMock(side_effect=lambda _db, _pid, rid: next((c for c in candidates if c.id == rid), None)),
+    ), patch("app.api.line.merge_user_draft", new=AsyncMock()) as mock_merge, patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ) as mock_set_mode, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+        await _handle_text_message(event, AsyncMock())
+
+    # 1件目の確認へ進み、残りは待たせる
+    assert mock_set_mode.await_args.args[2] == "autopilot_cancel_confirm"
+    draft = mock_merge.await_args.args[2]
+    assert draft["autopilot_cancel_reservation_id"] == 2535
+    assert draft["autopilot_cancel_queue"] == [2536]
+    # 確認文は固定。取り違えると戻せないのでLLMに書かせない
+    message = mock_reply.await_args.args[1]
+    assert "2026/09/05 15:00" in message
+    assert "はい / いいえ" in message
+    assert "残り1件" in message
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_answer_on_the_cancel_list_reasks_instead_of_guessing():
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    candidates = _cancel_candidates()
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-cancel-vague"},
+        "message": {"type": "text", "text": "うーん"},
+    }
+    state = {
+        "mode": "autopilot_cancel_select",
+        "draft": {"autopilot_cancel_candidate_ids": [2535, 2536]},
+        "request_id": None,
+        "context_data": {},
+    }
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state", new=AsyncMock(return_value=state)
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="autopilot_cancel_select")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.build_clinic_context", new=AsyncMock(return_value={})), patch(
+        "app.api.line.parse_line_message",
+        new=AsyncMock(return_value={"intent": "other", "constraints": [], "has_reservation_intent": False}),
+    ), patch(
+        "app.api.line._find_owned_cancellable_reservation",
+        new=AsyncMock(side_effect=lambda _db, _pid, rid: next((c for c in candidates if c.id == rid), None)),
+    ), patch("app.api.line.merge_user_draft", new=AsyncMock()), patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ) as mock_set_mode, patch(
+        "app.api.line.transition_status", new=AsyncMock()
+    ) as mock_transition, patch(
+        "app.api.line.reply_text_with_quick_reply", new=AsyncMock()
+    ) as mock_quick_reply:
+        await _handle_text_message(event, AsyncMock())
+
+    # 推測でキャンセルしない。状態も進めず、同じ一覧をもう一度出す
+    mock_transition.assert_not_awaited()
+    mock_set_mode.assert_not_awaited()
+    assert "どちらのご予約か" in mock_quick_reply.await_args.args[1]

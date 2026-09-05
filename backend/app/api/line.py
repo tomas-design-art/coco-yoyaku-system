@@ -230,6 +230,7 @@ _AUTOPILOT_BOOKING_MODES = {
     "autopilot_confirm_usual",
     "autopilot_booking_confirm",
     "adjusting",
+    "autopilot_cancel_select",
     "autopilot_cancel_confirm",
     "autopilot_change_datetime",
     "autopilot_change_confirm",
@@ -1004,10 +1005,50 @@ def _build_cancel_selection_items(reservations: list[Reservation]) -> list[dict]
 
 def _compose_cancel_selection_text(reservations: list[Reservation]) -> str:
     lines = ["キャンセルするご予約を選んでください。"]
-    for reservation in reservations:
+    for index, reservation in enumerate(reservations, 1):
         start = reservation.start_time.astimezone(JST)
-        lines.append(f"・{_format_date_with_weekday_jp(start.date())} {start.strftime('%H:%M')}")
+        lines.append(
+            f"{index}. {_format_date_with_weekday_jp(start.date())} {start.strftime('%H:%M')}"
+        )
+    lines.append("番号・日時のご返信でも、下のボタンでもお選びいただけます。")
     return "\n".join(lines)
+
+
+_ALL_CANCEL_WORDS = re.compile(r"両方|双方|どちらも|全部|ぜんぶ|全て|すべて|まとめて")
+
+
+def _matches_reservation_datetime(text: str, reservation: Reservation) -> bool:
+    """本文がその予約の日付か時刻を指しているか。"""
+    start = reservation.start_time.astimezone(JST)
+    normalized = unicodedata.normalize("NFKC", text or "").replace("：", ":")
+    has_date = bool(
+        re.search(rf"(?<!\d)0?{start.month}\s*[/月]\s*0?{start.day}(?!\d)", normalized)
+    )
+    has_time = bool(
+        re.search(rf"(?<!\d)0?{start.hour}\s*(?::\s*0?{start.minute}(?!\d)|時)", normalized)
+    )
+    return has_date or has_time
+
+
+def _select_cancel_targets(text: str, reservations: list[Reservation]) -> list[Reservation]:
+    """提示した一覧から、患者が指したキャンセル対象を返す。決まらなければ空。
+
+    決まらないものを推測で1件に決めない。取り違えたキャンセルは元に戻せない。
+    """
+    if not reservations:
+        return []
+    if _ALL_CANCEL_WORDS.search(_normalize_confirmation_text(text)):
+        return list(reservations)
+    # 日時の指定を先に見る。「9/5の15時」の数字を番号と読み違えないため。
+    matched = [
+        reservation for reservation in reservations if _matches_reservation_datetime(text, reservation)
+    ]
+    if len(matched) == 1:
+        return matched
+    choice = _extract_alternative_choice(text, len(reservations))
+    if choice is not None:
+        return [reservations[choice - 1]]
+    return []
 
 
 async def _find_owned_cancellable_reservation(
@@ -2679,6 +2720,70 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             )
             return
 
+    if is_autopilot_patient and current_mode == "autopilot_cancel_select":
+        candidates: list[Reservation] = []
+        for raw_id in prev_draft.get("autopilot_cancel_candidate_ids") or []:
+            found = await _find_owned_cancellable_reservation(db, line_patient.id, int(raw_id))
+            if found:
+                candidates.append(found)
+        if not candidates:
+            await clear_user_draft(db, user_id)
+            await set_user_mode(db, user_id, "idle")
+            if reply_token:
+                await reply_to_line(
+                    reply_token,
+                    await _compose_autopilot_reply(
+                        "cancel_target_missing", {"patient_message": text}, parsed_intent
+                    ),
+                )
+            return
+
+        selected = _select_cancel_targets(text, candidates)
+        if selected:
+            first, rest = selected[0], selected[1:]
+            start = first.start_time.astimezone(JST)
+            await merge_user_draft(
+                db,
+                user_id,
+                {
+                    "autopilot_cancel_reservation_id": first.id,
+                    "autopilot_cancel_queue": [reservation.id for reservation in rest],
+                },
+            )
+            await set_user_mode(db, user_id, "autopilot_cancel_confirm")
+            if reply_token:
+                # 確認は取り違えると戻せないので、文面をLLMに任せず固定で出す。
+                note = f"\n（残り{len(rest)}件は、この後で1件ずつ確認します）" if rest else ""
+                await reply_to_line(
+                    reply_token,
+                    f"{start.strftime('%Y/%m/%d %H:%M')}のご予約をキャンセルしてよろしいですか？"
+                    f"{note}\nはい / いいえ",
+                )
+            return
+
+        # 選べなかった。推測せず、同じ一覧をもう一度出す。繰り返すなら人へ渡す。
+        failures = int(prev_draft.get("autopilot_cancel_select_failures") or 0) + 1
+        await merge_user_draft(db, user_id, {"autopilot_cancel_select_failures": failures})
+        if failures >= 3:
+            await _handoff_autopilot_to_human(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                patient=line_patient,
+                text=text,
+                parsed_intent=parsed_intent,
+                notification=f"LINEキャンセル対象を選べず: {line_patient.id}",
+            )
+            return
+        if reply_token or _DEFERRED_REPLY_USER.get():
+            await reply_text_with_quick_reply(
+                reply_token,
+                "恐れ入ります、どちらのご予約かを教えてください。\n"
+                + _compose_cancel_selection_text(candidates),
+                _build_cancel_selection_items(candidates),
+            )
+        return
+
     if is_autopilot_patient and current_mode == "autopilot_cancel_confirm":
         reservation_id = prev_draft.get("autopilot_cancel_reservation_id")
         if _is_affirmative(text) and reservation_id:
@@ -2700,14 +2805,40 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         ),
                     )
                 return
+            # 「両方」で選ばれた残りは、消す前に読み出しておく（draftを空にするため）。
+            queue = [int(raw) for raw in (prev_draft.get("autopilot_cancel_queue") or [])]
             await clear_user_draft(db, user_id)
-            await set_user_mode(db, user_id, "idle")
             await create_notification(
                 db,
                 "reservation_cancelled",
                 f"LINE予約キャンセル: {line_patient.name}様",
                 int(reservation_id),
             )
+            next_reservation = None
+            while queue and next_reservation is None:
+                next_reservation = await _find_owned_cancellable_reservation(
+                    db, line_patient.id, queue.pop(0)
+                )
+            if next_reservation:
+                next_start = next_reservation.start_time.astimezone(JST)
+                await merge_user_draft(
+                    db,
+                    user_id,
+                    {
+                        "autopilot_cancel_reservation_id": next_reservation.id,
+                        "autopilot_cancel_queue": queue,
+                    },
+                )
+                await set_user_mode(db, user_id, "autopilot_cancel_confirm")
+                if reply_token:
+                    await reply_to_line(
+                        reply_token,
+                        f"{cancelled_start.strftime('%Y/%m/%d %H:%M')}のご予約をキャンセルしました。\n"
+                        f"続けて {next_start.strftime('%Y/%m/%d %H:%M')} のご予約も"
+                        "キャンセルしてよろしいですか？\nはい / いいえ",
+                    )
+                return
+            await set_user_mode(db, user_id, "idle")
             if reply_token:
                 await reply_to_line(
                     reply_token,
@@ -3051,6 +3182,15 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             return
         if len(upcoming) > 1:
             # どの予約かはLLMに推測させず、患者本人に選択で確定させる。
+            # 選択待ちであることを状態として持つ。持たないと、ボタンではなく文字で
+            # 答えられたとき（実機では「両方」）新規メッセージとして処理され、
+            # 予約の候補提示に化ける（2026-09-04）。
+            await merge_user_draft(
+                db,
+                user_id,
+                {"autopilot_cancel_candidate_ids": [reservation.id for reservation in upcoming]},
+            )
+            await set_user_mode(db, user_id, "autopilot_cancel_select")
             if reply_token or _DEFERRED_REPLY_USER.get():
                 await reply_text_with_quick_reply(
                     reply_token,
