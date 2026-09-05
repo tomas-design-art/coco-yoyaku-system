@@ -24,7 +24,11 @@ SITUATION_GUIDES = {
         "空きが無いことを『不在』『お休み』と言い換えない。"
     ),
     "usual_confirm": "いつものメニュー・所要時間・担当を提示し、この内容で良いか確認する。",
-    "ask_datetime": "直近の会話を踏まえ、予約に必要な情報だけを自然に尋ねる。",
+    "ask_datetime": (
+        "直近の会話を踏まえ、予約に必要な情報だけを自然に尋ねる。"
+        "booking_form.filled にある項目は受け取り済みなので聞き直さない。"
+        "尋ねてよいのは booking_form.missing にある項目だけ。"
+    ),
     "ask_time_for_date": "受け取った希望日を認識したと示し、その日の空き候補があれば提示して希望時刻を尋ねる。",
     "ask_date_for_time": "受け取った希望時刻を認識したと示し、希望日だけを尋ねる。",
     "ask_missing": "不足項目だけを責めずに尋ねる。複数ある場合も確定事実の項目名を使う。",
@@ -369,6 +373,7 @@ _RETRY_NOTES = {
     "spec_claim": "\n前回の返信は院の枠の組み方や施術時間のルールを勝手に説明していました。院の仕組みには触れず、確定情報にある施術時間だけを使って書き直してください。",
     "alternative_context": "\n前回の返信は候補の日付や患者が指定した条件と矛盾していました。同日の候補を別日と呼ばず、時刻未指定なら希望時間帯が満席とは書かず、料金にも触れずに書き直してください。",
     "repeated_reply": "\n前回の返信は直近のあなた自身の返答と同じ定型的な冒頭を繰り返していました。患者の最新発言と確定事実にだけ応じ、同じ挨拶や体調への問いかけを繰り返さずに書き直してください。",
+    "reasked_known_slot": "\n前回の返信は、すでに患者から受け取っている項目をもう一度尋ねていました。booking_form.filled にある項目は確定済みとして扱い、booking_form.missing にある項目だけを尋ねて書き直してください。",
     "ignored_preferred_practitioner": "\n前回の返信は、患者が指名した担当者を出せない事実に触れずに別の担当者の枠だけを並べていました。指名された担当者の名前を出し、その条件では空きが無いことを先に伝えてから候補を案内してください。",
     "extra_question": "\n前回の返信は、いま確認すべきこと以外の質問を足していました。いま確認すべき1点だけを尋ね、再予約や別日程など他の話題は一切持ち出さずに書き直してください。",
 }
@@ -541,6 +546,36 @@ def _has_misleading_alternative_context(situation: str, context: dict, reply: st
     if len(candidate_dates) == 1 and says_other_day:
         return True
     return bool(context.get("date_only") and re.search(r"(?:希望|ご希望).{0,8}(?:時間帯|時間).{0,12}(?:満席|埋ま)", reply))
+
+
+# すでに受け取った項目を聞き直していないかを見る。
+# 「担当は承知しました。ご希望の日時を教えてください」と、直前に聞いた日時を
+# もう一度尋ねるループが実機で起きた（2026-09-04）。
+_SLOT_ASK_PATTERNS = {
+    "date": re.compile(r"(?:日にち|日程|日付|日時|何日|いつ頃|いつが)[^。]{0,16}(?:教え|お知らせ|お聞かせ|でしょうか|ますか)"),
+    "time": re.compile(r"(?:お時間|時間帯|時刻|何時)[^。]{0,16}(?:教え|お知らせ|お聞かせ|でしょうか|ますか)"),
+    "practitioner_id": re.compile(r"(?:担当|施術者)[^。]{0,16}(?:どなた|誰|ご希望|教え|お知らせ)"),
+    "menu_id": re.compile(r"(?:メニュー|施術内容)[^。]{0,16}(?:どれ|どちら|ご希望|教え|お知らせ)"),
+}
+# 「他にご希望があれば」のような言い添えは聞き直しではない。
+_NOT_A_REASK = re.compile(r"他に|ほかに|別の|変更|ご不明")
+
+
+def _asks_for_a_slot_already_received(context: dict, reply: str) -> bool:
+    """すでに埋まっている箱を、もう一度尋ねていないか。"""
+    form = context.get("booking_form")
+    if not isinstance(form, dict):
+        return False
+    filled = set((form.get("filled") or {}).keys())
+    if not filled:
+        return False
+    for sentence in re.split(r"[。\n]", reply):
+        if not sentence.strip() or _NOT_A_REASK.search(sentence):
+            continue
+        for key, pattern in _SLOT_ASK_PATTERNS.items():
+            if key in filled and pattern.search(sentence):
+                return True
+    return False
 
 
 def _ignores_unavailable_preferred_practitioner(context: dict, reply: str) -> bool:
@@ -725,6 +760,9 @@ async def compose_reply(situation: str, context: dict) -> str:
                     continue
                 if _ignores_unavailable_preferred_practitioner(context, text):
                     reason = "ignored_preferred_practitioner"
+                    continue
+                if _asks_for_a_slot_already_received(context, text):
+                    reason = "reasked_known_slot"
                     continue
                 if _has_unprompted_price_reference(context, text):
                     reason = "alternative_context"

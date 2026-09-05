@@ -4090,7 +4090,9 @@ async def test_both_on_the_cancel_list_confirms_one_at_a_time():
         new=AsyncMock(side_effect=lambda _db, _pid, rid: next((c for c in candidates if c.id == rid), None)),
     ), patch("app.api.line.merge_user_draft", new=AsyncMock()) as mock_merge, patch(
         "app.api.line.set_user_mode", new=AsyncMock()
-    ) as mock_set_mode, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+    ) as mock_set_mode, patch(
+        "app.api.line.reply_text_with_quick_reply", new=AsyncMock()
+    ) as mock_reply:
         await _handle_text_message(event, AsyncMock())
 
     # 1件目の確認へ進み、残りは待たせる
@@ -4103,6 +4105,11 @@ async def test_both_on_the_cancel_list_confirms_one_at_a_time():
     assert "2026/09/05 15:00" in message
     assert "はい / いいえ" in message
     assert "残り1件" in message
+    # 答えはボタンで受ける（文面が変わっても意味が反転しない）
+    assert [item["action"]["data"] for item in mock_reply.await_args.args[2]] == [
+        "action=confirm&form=cancel&answer=yes",
+        "action=confirm&form=cancel&answer=no",
+    ]
 
 
 @pytest.mark.asyncio
@@ -4148,3 +4155,94 @@ async def test_ambiguous_answer_on_the_cancel_list_reasks_instead_of_guessing():
     mock_transition.assert_not_awaited()
     mock_set_mode.assert_not_awaited()
     assert "どちらのご予約か" in mock_quick_reply.await_args.args[1]
+
+
+# ─────────────────────────────────────────────────────────────
+# 埋まっている箱を聞き直さない ／ 確認はボタンで受ける
+# ─────────────────────────────────────────────────────────────
+
+
+def test_reply_must_not_ask_again_for_a_slot_already_received():
+    """すでに受け取った項目を聞き直す返信を止める。
+
+    2026-09-04 実機:「時田先生指名で承知しました。ご希望の日時を教えてください」と、
+    直前に伝えた日時をもう一度尋ねてループになった。
+    """
+    from app.services.line_composer import _asks_for_a_slot_already_received
+
+    context = {
+        "booking_form": {
+            "filled": {"date": "2026-09-06", "time": "17:00", "practitioner_id": 1},
+            "missing": ["menu_id", "duration_minutes"],
+        }
+    }
+
+    looping = (
+        "時田先生指名でのマッスルセラピー60分ですね、承知いたしました。"
+        "ご希望の日時を教えていただけますでしょうか。"
+    )
+    assert _asks_for_a_slot_already_received(context, looping) is True
+
+    # 空いている箱を尋ねるのは正しい
+    asks_missing = "承知いたしました。ご希望のメニューを教えていただけますか。"
+    assert _asks_for_a_slot_already_received(context, asks_missing) is False
+
+    # 受け取った内容を確認するのは聞き直しではない
+    confirming = "明後日9/6(日)の17:00〜18:00でご予約をお取りしてよろしいでしょうか。"
+    assert _asks_for_a_slot_already_received(context, confirming) is False
+
+    # 「他にご希望があれば」の言い添えも聞き直しではない
+    adding = "9/6(日)の17:00で承りました。他にご希望の日時があれば教えてください。"
+    assert _asks_for_a_slot_already_received(context, adding) is False
+
+    # フォームの情報が無ければ何も止めない
+    assert _asks_for_a_slot_already_received({}, looping) is False
+
+
+def test_confirmation_buttons_carry_which_question_they_answer():
+    from app.api.line import _build_confirmation_quick_reply_items
+
+    items = _build_confirmation_quick_reply_items("cancel")
+    assert [item["action"]["data"] for item in items] == [
+        "action=confirm&form=cancel&answer=yes",
+        "action=confirm&form=cancel&answer=no",
+    ]
+    assert [item["action"]["label"] for item in items] == ["はい", "いいえ"]
+
+
+@pytest.mark.asyncio
+async def test_confirmation_button_is_applied_without_reading_the_wording():
+    """ボタンの答えは文面の解釈を挟まずに適用する。"""
+    from app.api.line import _handle_confirmation_postback
+
+    event = {"source": {"userId": "U-confirm"}, "replyToken": "reply-token"}
+    query = {"form": ["cancel"], "answer": ["yes"]}
+
+    with patch(
+        "app.api.line.get_user_mode", new=AsyncMock(return_value="autopilot_cancel_confirm")
+    ), patch("app.api.line._handle_text_message", new=AsyncMock()) as mock_handle:
+        await _handle_confirmation_postback(AsyncMock(), event, query, "reply-token", "U-confirm")
+
+    forwarded = mock_handle.await_args.args[0]
+    assert forwarded["message"]["text"] == "はい"
+    assert forwarded["type"] == "message"
+
+
+@pytest.mark.asyncio
+async def test_a_stale_confirmation_button_does_not_act_on_the_new_conversation():
+    """押した時点で会話が進んでいたら、その答えは適用しない。
+
+    古いボタンで、いま話している別の予約を消してしまわないため。
+    """
+    from app.api.line import _handle_confirmation_postback
+
+    event = {"source": {"userId": "U-confirm"}, "replyToken": "reply-token"}
+    query = {"form": ["cancel"], "answer": ["yes"]}
+
+    with patch("app.api.line.get_user_mode", new=AsyncMock(return_value="idle")), patch(
+        "app.api.line._handle_text_message", new=AsyncMock()
+    ) as mock_handle, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+        await _handle_confirmation_postback(AsyncMock(), event, query, "reply-token", "U-confirm")
+
+    mock_handle.assert_not_awaited()
+    assert "すでに終了" in mock_reply.await_args.args[1]

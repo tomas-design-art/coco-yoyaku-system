@@ -992,6 +992,38 @@ async def _find_change_target_reservation(
     return None
 
 
+# 確認ボタンが、どの場面の「はい/いいえ」なのか。
+# ボタンを押した時点で会話が別の場面へ進んでいたら、その答えは適用しない。
+_CONFIRM_FORM_MODES = {
+    "booking": "autopilot_booking_confirm",
+    "usual": "autopilot_confirm_usual",
+    "cancel": "autopilot_cancel_confirm",
+    "change": "autopilot_change_confirm",
+}
+
+
+def _build_confirmation_quick_reply_items(form: str) -> list[dict]:
+    """はい/いいえをボタンで受け取る。
+
+    自由入力の「はい/いいえ」は、返信の質問文が書き換わると意味が反転する。
+    2026-09-04 実機: キャンセル確認に「改めて別の日程でご予約をお取りしましょうか？」が
+    足され、「いいえ。改めて連絡します」が取消の中止として処理された。
+    ボタンなら「何を聞いたか」と「何に答えたか」が構造で一致する。
+    """
+    return [
+        {
+            "type": "action",
+            "action": {
+                "type": "postback",
+                "label": label,
+                "data": f"action=confirm&form={form}&answer={answer}",
+                "displayText": label,
+            },
+        }
+        for label, answer in (("はい", "yes"), ("いいえ", "no"))
+    ]
+
+
 def _build_cancel_selection_items(reservations: list[Reservation]) -> list[dict]:
     items = []
     for reservation in reservations:
@@ -1268,6 +1300,19 @@ async def _compose_autopilot_reply(
             recent = (state.get("context_data") or {}).get("recent_completed_booking")
             if recent and not enriched_context.get("recent_completed_booking"):
                 enriched_context["recent_completed_booking"] = recent
+        # いま何が埋まっていて何が空いているかを、毎回そのまま渡す。
+        # これが無いと「時田先生指名で承知しました。ご希望の日時を教えてください」と、
+        # すでに聞いた日時をもう一度尋ねるループになる（2026-09-04 実機）。
+        booking_form = BookingForm.booking(state.get("draft") or {})
+        enriched_context["booking_form"] = {
+            "filled": {
+                slot.key: booking_form.value(slot.key)
+                for slot in booking_form.slots
+                if booking_form.is_filled(slot.key)
+            },
+            "missing": [slot.key for slot in booking_form.missing()],
+            "next_question": booking_form.next_question_labels(),
+        }
         if situation in _ASSUMED_DEFAULT_SITUATIONS:
             draft = state.get("draft") or {}
             for key in ("assumed_menu", "assumed_practitioner", "assumed_duration", "first_visit"):
@@ -2762,10 +2807,11 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             if reply_token:
                 # 確認は取り違えると戻せないので、文面をLLMに任せず固定で出す。
                 note = f"\n（残り{len(rest)}件は、この後で1件ずつ確認します）" if rest else ""
-                await reply_to_line(
+                await reply_text_with_quick_reply(
                     reply_token,
                     f"{start.strftime('%Y/%m/%d %H:%M')}のご予約をキャンセルしてよろしいですか？"
                     f"{note}\nはい / いいえ",
+                    _build_confirmation_quick_reply_items("cancel"),
                 )
             return
 
@@ -2839,11 +2885,12 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 )
                 await set_user_mode(db, user_id, "autopilot_cancel_confirm")
                 if reply_token:
-                    await reply_to_line(
+                    await reply_text_with_quick_reply(
                         reply_token,
                         f"{cancelled_start.strftime('%Y/%m/%d %H:%M')}のご予約をキャンセルしました。\n"
                         f"続けて {next_start.strftime('%Y/%m/%d %H:%M')} のご予約も"
                         "キャンセルしてよろしいですか？\nはい / いいえ",
+                        _build_confirmation_quick_reply_items("cancel"),
                     )
                 return
             await set_user_mode(db, user_id, "idle")
@@ -3210,7 +3257,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         await merge_user_draft(db, user_id, {"autopilot_cancel_reservation_id": reservation.id})
         await set_user_mode(db, user_id, "autopilot_cancel_confirm")
         if reply_token:
-            await reply_to_line(
+            await reply_text_with_quick_reply(
                 reply_token,
                 await _compose_autopilot_reply(
                     "cancel_confirm",
@@ -3221,6 +3268,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     },
                     parsed_intent,
                 ),
+                _build_confirmation_quick_reply_items("cancel"),
             )
         return
 
@@ -4085,6 +4133,45 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     await set_user_mode(db, user_id, "adjusting", request_id)
 
 
+async def _handle_confirmation_postback(
+    db: AsyncSession,
+    event: dict,
+    query: dict,
+    reply_token: str | None,
+    actor_user_id: str | None,
+) -> None:
+    """確認ボタンの答えを、文面の解釈を挟まずに適用する。
+
+    ボタンにはどの場面の確認かが入っている。押した時点で会話が別の場面へ
+    進んでいたら、その答えは適用せずに聞き直す（古いボタンで予約を消さない）。
+    """
+    if not actor_user_id:
+        return
+    form = (query.get("form") or [""])[0]
+    answer = (query.get("answer") or [""])[0]
+    if answer not in {"yes", "no"}:
+        return
+
+    expected_mode = _CONFIRM_FORM_MODES.get(form)
+    if expected_mode and await get_user_mode(db, actor_user_id) != expected_mode:
+        if reply_token:
+            await reply_to_line(
+                reply_token,
+                "恐れ入ります、そちらの確認はすでに終了しています。改めてご用件をお知らせください。",
+            )
+        return
+
+    # 判定済みの答えを、既存の確認処理へそのまま渡す。
+    await _handle_text_message(
+        {
+            **event,
+            "type": "message",
+            "message": {"type": "text", "text": "はい" if answer == "yes" else "いいえ"},
+        },
+        db,
+    )
+
+
 async def _handle_cancel_selection(
     db: AsyncSession,
     query: dict,
@@ -4147,6 +4234,10 @@ async def _handle_postback(event: dict, db: AsyncSession):
     action = (q.get("action") or [""])[0]
     rid = (q.get("rid") or [""])[0]
     line_user_id = (q.get("uid") or [""])[0] or None
+
+    if action == "confirm":
+        await _handle_confirmation_postback(db, event, q, reply_token, actor_user_id)
+        return
 
     if action == "cancel_select":
         await _handle_cancel_selection(db, q, reply_token, actor_user_id)
