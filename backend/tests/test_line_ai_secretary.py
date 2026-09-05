@@ -950,7 +950,7 @@ async def test_autopilot_change_proposes_slot_before_rescheduling():
     with patch("app.api.line.find_best_practitioner", new=AsyncMock(return_value=(practitioner, start_dt, end_dt, 0, 0))), patch(
         "app.api.line.merge_user_draft", new=AsyncMock()
     ) as mock_merge, patch("app.api.line.set_user_mode", new=AsyncMock()) as mock_set_mode, patch(
-        "app.api.line.reply_to_line", new=AsyncMock()
+        "app.api.line.reply_text_with_quick_reply", new=AsyncMock()
     ) as mock_reply:
         proposed = await _complete_autopilot_reschedule(
             db,
@@ -965,6 +965,11 @@ async def test_autopilot_change_proposes_slot_before_rescheduling():
     assert mock_merge.await_args.args[2]["autopilot_change_reservation_id"] == 91
     assert mock_set_mode.await_args.args[2] == "autopilot_change_confirm"
     assert "よろしいでしょうか" in mock_reply.await_args.args[1]
+    # はい/いいえはボタンで受ける（文面が変わっても意味が反転しない）
+    assert [item["action"]["data"] for item in mock_reply.await_args.args[2]] == [
+        "action=confirm&form=change&answer=yes",
+        "action=confirm&form=change&answer=no",
+    ]
 
 
 @pytest.mark.asyncio
@@ -4354,3 +4359,57 @@ def test_question_about_a_practitioner_uses_the_day_being_discussed():
 
     # 過ぎた日は使わない（古い下書きが残っていることがある）
     assert _resolve_target_date({}, today - timedelta(days=3)) == today
+
+
+def test_every_confirmation_situation_has_a_button_form():
+    """はい/いいえを待つ場面には、必ず対応するボタンの種類がある。
+
+    ボタンが無い場面が残ると、そこだけ自由入力の解釈に頼ることになり、
+    質問文が書き換わったときに意味が反転する。
+    """
+    from app.api.line import _CODE_OWNED_QUESTION_SITUATIONS, _CONFIRM_FORM_MODES
+
+    modes = set(_CONFIRM_FORM_MODES.values())
+    assert modes == {
+        "autopilot_booking_confirm",
+        "autopilot_confirm_usual",
+        "autopilot_cancel_confirm",
+        "autopilot_change_confirm",
+    }
+    # 確認の場面はコードが質問を握る側にも入っていること
+    assert "confirm_slot" in _CODE_OWNED_QUESTION_SITUATIONS
+    assert "usual_confirm" in _CODE_OWNED_QUESTION_SITUATIONS
+    assert "cancel_confirm" in _CODE_OWNED_QUESTION_SITUATIONS
+
+
+def test_no_confirmation_is_sent_without_buttons():
+    """はい/いいえを待つ返信が、ボタン無しで送られていないこと。
+
+    1箇所でもボタン無しが残ると、そこだけ自由入力の解釈に頼ることになり、
+    質問文が書き換わったときに答えの意味が反転する。
+    """
+    import inspect
+
+    from app.api import line as line_module
+
+    waiting = {"confirm_slot", "usual_confirm", "cancel_confirm"}
+    lines = inspect.getsource(line_module).splitlines()
+
+    checked = 0
+    offenders = []
+    for index, line in enumerate(lines):
+        if "await _compose_autopilot_reply(" not in line:
+            continue
+        if index + 1 >= len(lines):
+            continue
+        situation = lines[index + 1].strip().rstrip(",").strip('"')
+        if situation not in waiting:
+            continue
+        checked += 1
+        # 直前の数行に、どの送り方を使っているかが出る
+        window = " ".join(lines[max(0, index - 4):index])
+        if "reply_to_line(" in window:
+            offenders.append((index + 1, situation))
+
+    assert checked, "確認の送出が1つも見つからない（検査が空振りしている）"
+    assert not offenders, f"ボタン無しで送っている確認: {offenders}"

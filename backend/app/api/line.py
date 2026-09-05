@@ -1024,6 +1024,15 @@ def _build_confirmation_quick_reply_items(form: str) -> list[dict]:
     ]
 
 
+async def _reply_confirmation(reply_token: str | None, form: str, message: str) -> None:
+    """はい/いいえを待つ返信は、必ずボタンを添えて送る。"""
+    if not reply_token:
+        return
+    await reply_text_with_quick_reply(
+        reply_token, message, _build_confirmation_quick_reply_items(form)
+    )
+
+
 def _build_cancel_selection_items(reservations: list[Reservation]) -> list[dict]:
     items = []
     for reservation in reservations:
@@ -1420,8 +1429,9 @@ async def _complete_autopilot_reschedule(
     )
     await set_user_mode(db, user_id, "autopilot_change_confirm")
     if reply_token:
-        await reply_to_line(
+        await _reply_confirmation(
             reply_token,
+            "change",
             await _compose_autopilot_reply(
                 "confirm_slot",
                 {
@@ -2259,8 +2269,9 @@ async def _renegotiate_autopilot_change(
     )
     await set_user_mode(db, user_id, "autopilot_change_confirm")
     if reply_token:
-        await reply_to_line(
+        await _reply_confirmation(
             reply_token,
+            "change",
             await _compose_autopilot_reply(
                 "confirm_slot",
                 {
@@ -3163,8 +3174,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             return
         else:
             if reply_token:
-                await reply_to_line(
+                await _reply_confirmation(
                     reply_token,
+                    "usual",
                     await _compose_autopilot_reply(
                         "usual_confirm",
                         {
@@ -3703,8 +3715,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         if preset:
             await set_user_mode(db, user_id, "autopilot_confirm_usual")
             if reply_token:
-                await reply_to_line(
+                await _reply_confirmation(
                     reply_token,
+                    "usual",
                     await _compose_autopilot_reply(
                         "usual_confirm",
                         {
@@ -4073,8 +4086,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             await update_request(db, request_id, line_user_id=user_id, status="awaiting_patient_confirmation")
             await set_user_mode(db, user_id, "autopilot_booking_confirm", request_id)
             if reply_token:
-                await reply_to_line(
+                await _reply_confirmation(
                     reply_token,
+                    "booking",
                     await _compose_autopilot_reply(
                         "confirm_slot",
                         {
@@ -4224,8 +4238,9 @@ async def _handle_cancel_selection(
     start = reservation.start_time.astimezone(JST)
     await merge_user_draft(db, actor_user_id, {"autopilot_cancel_reservation_id": reservation.id})
     await set_user_mode(db, actor_user_id, "autopilot_cancel_confirm")
-    await reply_to_line(
+    await _reply_confirmation(
         reply_token,
+        "cancel",
         await _compose_autopilot_reply(
             "cancel_confirm",
             {
