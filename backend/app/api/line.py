@@ -1528,7 +1528,10 @@ async def _merge_autopilot_slots(
             )
 
     # 本人が担当を明言していれば、登録上の既定より本人の希望を優先する。
-    requested_practitioner = await _extract_requested_practitioner(db, text, parsed)
+    # 名前が出ていないメッセージで施術者一覧を引かない（毎回の問い合わせを避ける）。
+    requested_practitioner = None
+    if (parsed or {}).get("practitioner") or re.search(r"先生|担当", text or ""):
+        requested_practitioner = await _extract_requested_practitioner(db, text, parsed)
     if requested_practitioner:
         update.update(
             {
@@ -2520,8 +2523,18 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         ),
                     )
                 return
+        # 候補を出した後も条件は動く（「やっぱり30分で」「時田先生で」）。
+        # ここを idle 系のモードに限っていたため、候補提示中に何を言われても
+        # スロットが更新されず、会話が進むほど埋まらなくなっていた（2026-09-04 実機）。
         if (
-            current_mode in {"idle", "waiting_menu", "waiting_datetime", "waiting_time_duration"}
+            current_mode in {
+                "idle",
+                "waiting_menu",
+                "waiting_datetime",
+                "waiting_time_duration",
+                "adjusting",
+                "autopilot_booking_confirm",
+            }
             and parsed_intent.get("intent") not in {"cancel", "change", "question"}
             and not _has_cancellation_intent(text)
             and not _has_change_intent(text)

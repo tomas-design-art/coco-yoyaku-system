@@ -627,6 +627,11 @@ async def test_autopilot_candidate_selection_books_directly_without_extra_confir
         "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
     ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
         "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch(
+        # 偽のDBは問い合わせに答えられないので、他のテストと同じく差し替える
+        "app.api.line._resolve_booking_defaults", new=AsyncMock(return_value={})
+    ), patch("app.api.line.merge_user_draft", new=AsyncMock()), patch(
+        "app.api.line._resolve_menu", new=AsyncMock(return_value=None)
     ), patch("app.api.line.get_request", new=AsyncMock(return_value=request_data)), patch(
         "app.api.line.create_notification", new=AsyncMock()
     ), patch(
@@ -782,6 +787,11 @@ async def test_autopilot_candidate_time_selection_books_directly_without_extra_c
         "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
     ), patch("app.api.line.build_clinic_context", new=AsyncMock(return_value={})), patch(
         "app.api.line.parse_line_message", new=AsyncMock(return_value=parsed)
+    ), patch(
+        # 偽のDBは問い合わせに答えられないので、他のテストと同じく差し替える
+        "app.api.line._resolve_booking_defaults", new=AsyncMock(return_value={})
+    ), patch("app.api.line.merge_user_draft", new=AsyncMock()), patch(
+        "app.api.line._resolve_menu", new=AsyncMock(return_value=None)
     ), patch("app.api.line.get_request", new=AsyncMock(return_value=request_data)), patch(
         "app.api.line.create_notification", new=AsyncMock()
     ), patch("app.api.line.update_request", new=AsyncMock()), patch(
@@ -4263,3 +4273,55 @@ def test_reoffer_writes_the_searched_conditions_back_into_the_form():
     merge_block = source.split("autopilot_negotiation_failures")[-1]
     assert '"date": target_date.isoformat()' in merge_block
     assert '"duration_minutes": search_duration' in merge_block
+
+
+@pytest.mark.asyncio
+async def test_slots_keep_accumulating_after_candidates_are_offered():
+    """候補を出した後の条件変更も、ちゃんと箱へ溜める。
+
+    ここを idle 系のモードに限っていたため、候補提示中に何を言われても
+    スロットが更新されず、会話が進むほど埋まらなくなっていた（2026-09-04 実機）。
+    """
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    event = {
+        "replyToken": "reply-token",
+        "source": {"userId": "U-slot-adjusting"},
+        "message": {"type": "text", "text": "やっぱり30分でお願いします"},
+    }
+    parsed = {
+        "intent": "new",
+        "confidence": "high",
+        "constraints": [],
+        "duration_minutes": 30,
+        "has_reservation_intent": True,
+    }
+    state = {
+        "mode": "adjusting",
+        "draft": {"date": "2026-09-06", "menu_name": "マッスルセラピー", "duration_minutes": 60},
+        "request_id": "rid-1",
+        "context_data": {},
+    }
+
+    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.get_user_state", new=AsyncMock(return_value=state)
+    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="adjusting")), patch(
+        "app.api.line._get_line_display_name", new=AsyncMock(return_value="時田")
+    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
+        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.build_clinic_context", new=AsyncMock(return_value={})), patch(
+        "app.api.line.parse_line_message", new=AsyncMock(return_value=parsed)
+    ), patch(
+        "app.api.line._resolve_booking_defaults", new=AsyncMock(return_value={})
+    ), patch("app.api.line._resolve_menu", new=AsyncMock(return_value=None)), patch(
+        "app.api.line.get_request", new=AsyncMock(return_value={"alternatives": []})
+    ), patch("app.api.line.merge_user_draft", new=AsyncMock()) as mock_merge, patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ), patch("app.api.line._reply_with_loop_guard", new=AsyncMock()), patch(
+        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="承知しました。")
+    ), patch("app.api.line.reply_to_line", new=AsyncMock()):
+        await _handle_text_message(event, AsyncMock())
+
+    written = [call.args[2] for call in mock_merge.await_args_list if len(call.args) > 2]
+    assert any(update.get("duration_minutes") == 30 for update in written), written
