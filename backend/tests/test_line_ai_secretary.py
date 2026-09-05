@@ -4325,3 +4325,32 @@ async def test_slots_keep_accumulating_after_candidates_are_offered():
 
     written = [call.args[2] for call in mock_merge.await_args_list if len(call.args) > 2]
     assert any(update.get("duration_minutes") == 30 for update in written), written
+
+
+def test_question_about_a_practitioner_uses_the_day_being_discussed():
+    """明後日の話の最中に尋ねられた勤務時間へ、当日の勤務を答えない。
+
+    2026-09-04 実機: 9/6(日)の候補を見ている最中に「時田先生がいつも担当なんですけど？」
+    と尋ねたら、その日ではなく当日9/4(金)の勤務時間（10時〜21時）を答えた。
+    """
+    from datetime import timedelta
+
+    from app.services.line_facts import _resolve_target_date
+    from app.utils.datetime_jst import now_jst
+
+    today = now_jst().date()
+    discussed = today + timedelta(days=2)
+
+    # 今回のメッセージに日付が無ければ、いま話している日で答える
+    assert _resolve_target_date({}, discussed) == discussed
+    assert _resolve_target_date(None, discussed) == discussed
+
+    # 今回のメッセージに日付があればそちらが優先
+    tomorrow = today + timedelta(days=1)
+    assert _resolve_target_date({"date": tomorrow.isoformat()}, discussed) == tomorrow
+
+    # 会話の日が無ければ今日
+    assert _resolve_target_date({}, None) == today
+
+    # 過ぎた日は使わない（古い下書きが残っていることがある）
+    assert _resolve_target_date({}, today - timedelta(days=3)) == today

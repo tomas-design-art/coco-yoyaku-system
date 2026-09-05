@@ -331,3 +331,44 @@ async def test_build_day_availability_summary_marks_closed_day(monkeypatch):
     summary = await slot_scorer.build_day_availability_summary(db, date(2026, 9, 1), 60)
     assert summary["closed"] is True
     assert summary["practitioners"] == []
+
+
+@pytest.mark.asyncio
+async def test_build_same_day_candidates_never_offers_a_time_already_past(monkeypatch):
+    """今日の分は、すでに過ぎた時刻を案内しない。
+
+    2026-09-04 実機: 23時台に「本日9月4日の13:30〜14:30でしたらご案内可能です」と、
+    10時間前の枠を案内した。
+    """
+    from datetime import timedelta
+
+    prac = SimpleNamespace(id=1, name="時田", role="施術者", display_order=1)
+    day_infos = [slot_scorer._DayInfo(prac, True, [], [], 600, 1260)]
+    db, fake_bh, fake_load = _make_candidate_db(day_infos)
+    monkeypatch.setattr(slot_scorer, "get_business_hours_for_date", fake_bh)
+    monkeypatch.setattr(slot_scorer, "_load_day_infos", fake_load)
+
+    # いま 18:00 とみなす（診療は 10:00〜21:00）
+    fixed_now = datetime(2026, 9, 4, 18, 0, tzinfo=JST)
+    monkeypatch.setattr(slot_scorer, "now_jst", lambda: fixed_now)
+
+    results = await slot_scorer.build_same_day_candidates(
+        db, fixed_now.date(), time(13, 30), 60, max_results=3,
+    )
+    starts = [r.start_time.hour * 60 + r.start_time.minute for r in results]
+    assert starts, "まだ空いている時間帯があるのに候補が出ていない"
+    assert min(starts) >= 18 * 60, starts
+
+    # 別の日なら従来どおり終日から探す
+    tomorrow = (fixed_now + timedelta(days=1)).date()
+    future = await slot_scorer.build_same_day_candidates(
+        db, tomorrow, time(13, 30), 60, max_results=3,
+    )
+    assert min(r.start_time.hour * 60 + r.start_time.minute for r in future) < 18 * 60
+
+    # 閉店間際で枠が取れないなら、無理に出さない
+    late_now = datetime(2026, 9, 4, 20, 45, tzinfo=JST)
+    monkeypatch.setattr(slot_scorer, "now_jst", lambda: late_now)
+    assert await slot_scorer.build_same_day_candidates(
+        db, late_now.date(), time(20, 45), 60, max_results=3,
+    ) == []

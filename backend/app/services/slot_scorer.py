@@ -18,6 +18,7 @@ from app.models.practitioner import Practitioner
 from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
 from app.models.reservation import Reservation
 from app.services.business_hours import get_business_hours_for_date
+from app.utils.datetime_jst import now_jst
 from app.services.conflict_detector import ACTIVE_STATUSES, check_conflict
 from app.services.schedule_service import is_practitioner_working, get_practitioner_working_hours
 from app.utils.datetime_jst import JST
@@ -503,6 +504,15 @@ async def build_same_day_candidates(
     we = bh_end if window_end_min is None else min(window_end_min, bh_end)
     if ws >= we:
         ws, we = bh_start, bh_end
+
+    # 今日の分は、すでに過ぎた時刻を案内しない。
+    # 23時台に「本日13:30ならご案内できます」と、10時間前の枠を出した（2026-09-04 実機）。
+    now = now_jst()
+    if target_date == now.date():
+        ws = max(ws, now.hour * 60 + now.minute)
+        if ws + duration_minutes > we:
+            return []
+
     desired_min = min(max(desired_time.hour * 60 + desired_time.minute, ws), we)
 
     day_infos = await _load_day_infos(db, target_date, practitioners)

@@ -128,14 +128,27 @@ async def _practitioner_off_days(
     return off
 
 
-def _resolve_target_date(parsed: dict | None) -> date:
+def _resolve_target_date(parsed: dict | None, conversation_date: date | None = None) -> date:
+    """質問がどの日のことかを決める。
+
+    今回のメッセージに日付があればそれ。無ければ、いま会話で扱っている日。
+    どちらも無ければ今日。
+
+    会話の日を見ないと「明後日の話をしているのに今日の勤務時間を答える」ことになる。
+    2026-09-04 実機: 9/6(日)の話の最中に担当者の勤務を尋ねられ、その日ではなく
+    当日9/4(金)の勤務時間を答えた。
+    """
     raw = (parsed or {}).get("date")
     if raw:
         try:
             return date.fromisoformat(str(raw))
         except ValueError:
             pass
-    return now_jst().date()
+    today = now_jst().date()
+    # 過ぎた日を会話の日として使わない（古い下書きが残っていることがある）
+    if conversation_date and conversation_date >= today:
+        return conversation_date
+    return today
 
 
 async def _upcoming_reservation_facts(db: AsyncSession, patient_id: int) -> list[dict]:
@@ -207,6 +220,7 @@ async def collect_question_facts(
     parsed: dict | None = None,
     previous_category: str | None = None,
     patient_id: int | None = None,
+    conversation_date: date | None = None,
 ) -> dict | None:
     """質問に対してシステムが根拠を持つ事実を返す。答えられなければ None。
 
@@ -229,7 +243,7 @@ async def collect_question_facts(
             "upcoming_reservations": await _upcoming_reservation_facts(db, patient_id),
         }
 
-    target_date = _resolve_target_date(parsed)
+    target_date = _resolve_target_date(parsed, conversation_date)
 
     if category == "business_hours":
         # 「8月の休診日は？」「9月は？」のような期間の質問には、その月の休診日一覧で答える。

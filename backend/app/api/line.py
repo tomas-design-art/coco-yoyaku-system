@@ -3193,6 +3193,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             parsed_intent,
             previous_category=prev_draft.get("last_question_category"),
             patient_id=line_patient.id,
+            # いま会話で扱っている日。これを渡さないと、明後日の話の最中に
+            # 尋ねられた勤務時間へ、当日の勤務時間を答えてしまう。
+            conversation_date=_parse_iso_date(prev_draft.get("date")),
         )
         if facts and facts.get("category"):
             try:
