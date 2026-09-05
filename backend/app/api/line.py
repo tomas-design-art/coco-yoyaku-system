@@ -2139,6 +2139,11 @@ async def _reoffer_autopilot_candidates(
             "autopilot_offered_slots": _to_offered_slots(candidates),
             "autopilot_offer_duration": search_duration,
             "autopilot_negotiation_failures": 0,
+            # 再検索で実際に使った条件を予約フォームの箱へ戻す。
+            # ここを書かないと、返信へ渡す booking_form が古い条件のままになり、
+            # 「いま何が決まっているか」を見て話せなくなる。
+            "date": target_date.isoformat(),
+            "duration_minutes": search_duration,
         },
         request_id,
     )

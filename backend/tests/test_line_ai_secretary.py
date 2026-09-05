@@ -4246,3 +4246,20 @@ async def test_a_stale_confirmation_button_does_not_act_on_the_new_conversation(
 
     mock_handle.assert_not_awaited()
     assert "すでに終了" in mock_reply.await_args.args[1]
+
+
+def test_reoffer_writes_the_searched_conditions_back_into_the_form():
+    """再検索で使った条件を予約フォームの箱へ戻していること。
+
+    戻さないと、返信へ渡す booking_form が古い条件のままになり、
+    「いま何が決まっているか」を見て話せなくなる。
+    """
+    import inspect
+
+    from app.api.line import _reoffer_autopilot_candidates
+
+    source = inspect.getsource(_reoffer_autopilot_candidates)
+    # 失敗時の記録にも同じキーが出るため、候補が見つかった側の書き戻しを見る
+    merge_block = source.split("autopilot_negotiation_failures")[-1]
+    assert '"date": target_date.isoformat()' in merge_block
+    assert '"duration_minutes": search_duration' in merge_block
