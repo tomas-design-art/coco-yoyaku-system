@@ -7,7 +7,15 @@ import re
 from datetime import date
 
 
+from app.services.reply_plan import POLISH_PROMPT, ReplyPlan
+
 logger = logging.getLogger(__name__)
+
+_POLISH_RETRY_NOTE = (
+    "\n\n前回の整え方は、元の文面に無い質問や提案を足すか、"
+    "元の文面にあった日時・担当者・番号を落としていました。"
+    "事実と質問はそのままに、言い回しだけを整え直してください。"
+)
 
 SITUATION_GUIDES = {
     "confirm_slot": "提示した日時・担当・メニューを省略せず、この内容で良いか確認する。はい/いいえで答えられると伝える。",
@@ -674,6 +682,48 @@ async def _notify_fallback(situation: str, reason: str) -> None:
             )
     except Exception as error:
         logger.error("LINE reply fallback notification failed situation=%s error=%s", situation, error)
+
+
+async def compose_from_plan(plan: ReplyPlan) -> str:
+    """返信の骨格をLLMに整えさせる。骨格を壊されたら骨格をそのまま送る。
+
+    骨格は単体で送れる完成した文面なので、LLMが使えなくても会話は止まらない。
+    検査は骨格から決まる（伝えるはずの事実が残っているか、聞いていない質問が
+    増えていないか）ので、場面ごとの規則を足していく必要がない。
+    """
+    skeleton = plan.render()
+    try:
+        from app.config import settings
+
+        if not settings.gemini_api_key:
+            return skeleton
+
+        import httpx
+
+        prompt = POLISH_PROMPT.format(skeleton=skeleton)
+        async with httpx.AsyncClient() as client:
+            for attempt in range(2):
+                retry = "" if attempt == 0 else _POLISH_RETRY_NOTE
+                response = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent",
+                    headers={"x-goog-api-key": settings.gemini_api_key},
+                    json={
+                        "contents": [{"role": "user", "parts": [{"text": prompt + retry}]}],
+                        "generationConfig": {"temperature": 0, "maxOutputTokens": 400},
+                    },
+                    timeout=10,
+                )
+                response.raise_for_status()
+                polished = response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                reason = plan.rejects(polished)
+                if reason is None:
+                    return polished
+                logger.info("LINE reply polish rejected (attempt=%d reason=%s)", attempt + 1, reason)
+        logger.warning("LINE reply polish gave up; sending the plain wording")
+        return skeleton
+    except Exception as error:  # noqa: BLE001
+        logger.error("LINE reply polish failed: %s", error)
+        return skeleton
 
 
 async def compose_reply(situation: str, context: dict) -> str:

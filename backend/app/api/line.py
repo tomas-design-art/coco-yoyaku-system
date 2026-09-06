@@ -35,7 +35,8 @@ from app.schemas.reservation import ReservationCreate
 from app.services.conflict_detector import check_conflict
 from app.services.line_alerts import build_reservation_review_flex, push_admin_reservation_review
 from app.services.booking_form import Form as BookingForm
-from app.services.line_composer import compose_reply
+from app.services.line_composer import compose_from_plan, compose_reply
+from app.services.reply_plan import ReplyPlan
 from app.services.line_debounce import clear_debounce, is_duplicate_message, merge_debounced_message
 from app.services.line_inbox import (
     claim_pending_events,
@@ -1022,6 +1023,31 @@ def _build_confirmation_quick_reply_items(form: str) -> list[dict]:
         }
         for label, answer in (("はい", "yes"), ("いいえ", "no"))
     ]
+
+
+def _cancel_confirmation_plan(reservation: Reservation, remaining: int = 0) -> ReplyPlan:
+    """キャンセル確認の骨格。文面はここで決まり、LLMは言い回しだけ整える。"""
+    start = reservation.start_time.astimezone(JST)
+    stamp = start.strftime("%Y/%m/%d %H:%M")
+    return ReplyPlan(
+        facts=[f"{stamp}からのご予約"],
+        note=(f"残り{remaining}件は、この後で1件ずつ確認します。" if remaining else None),
+        ask="こちらのご予約をキャンセルしてよろしいですか？",
+        ask_about="キャンセル",
+        yes_no=True,
+        keep=[stamp],
+    )
+
+
+async def _reply_plan(reply_token: str | None, form: str, plan: ReplyPlan) -> None:
+    """骨格から文面を作って送る。整え方が骨格を壊していれば骨格をそのまま送る。"""
+    if not reply_token:
+        return
+    await reply_text_with_quick_reply(
+        reply_token,
+        await compose_from_plan(plan),
+        _build_confirmation_quick_reply_items(form),
+    )
 
 
 async def _reply_confirmation(reply_token: str | None, form: str, message: str) -> None:
@@ -2834,15 +2860,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 },
             )
             await set_user_mode(db, user_id, "autopilot_cancel_confirm")
-            if reply_token:
-                # 確認は取り違えると戻せないので、文面をLLMに任せず固定で出す。
-                note = f"\n（残り{len(rest)}件は、この後で1件ずつ確認します）" if rest else ""
-                await reply_text_with_quick_reply(
-                    reply_token,
-                    f"{start.strftime('%Y/%m/%d %H:%M')}のご予約をキャンセルしてよろしいですか？"
-                    f"{note}\nはい / いいえ",
-                    _build_confirmation_quick_reply_items("cancel"),
-                )
+            await _reply_plan(
+                reply_token, "cancel", _cancel_confirmation_plan(first, remaining=len(rest))
+            )
             return
 
         # 選べなかった。推測せず、同じ一覧をもう一度出す。繰り返すなら人へ渡す。
@@ -3290,20 +3310,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         reservation = upcoming[0]
         await merge_user_draft(db, user_id, {"autopilot_cancel_reservation_id": reservation.id})
         await set_user_mode(db, user_id, "autopilot_cancel_confirm")
-        if reply_token:
-            await reply_text_with_quick_reply(
-                reply_token,
-                await _compose_autopilot_reply(
-                    "cancel_confirm",
-                    {
-                        "date": reservation.start_time.astimezone(JST).strftime("%Y/%m/%d"),
-                        "start": reservation.start_time.astimezone(JST).strftime("%H:%M"),
-                        "patient_message": text,
-                    },
-                    parsed_intent,
-                ),
-                _build_confirmation_quick_reply_items("cancel"),
-            )
+        await _reply_plan(reply_token, "cancel", _cancel_confirmation_plan(reservation))
         return
 
     if is_autopilot_patient and ((parsed_intent or {}).get("intent") == "change" or _has_change_intent(text)):
@@ -4262,21 +4269,9 @@ async def _handle_cancel_selection(
         await reply_to_line(reply_token, "\u5bfe\u8c61\u306e\u3054\u4e88\u7d04\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093\u3067\u3057\u305f\u3002\u304a\u624b\u6570\u3067\u3059\u304c\u3082\u3046\u4e00\u5ea6\u304a\u77e5\u3089\u305b\u304f\u3060\u3055\u3044\u3002")
         return
 
-    start = reservation.start_time.astimezone(JST)
     await merge_user_draft(db, actor_user_id, {"autopilot_cancel_reservation_id": reservation.id})
     await set_user_mode(db, actor_user_id, "autopilot_cancel_confirm")
-    await _reply_confirmation(
-        reply_token,
-        "cancel",
-        await _compose_autopilot_reply(
-            "cancel_confirm",
-            {
-                "date": start.strftime("%Y/%m/%d"),
-                "start": start.strftime("%H:%M"),
-                "patient_message": "\u30ad\u30e3\u30f3\u30bb\u30eb\u3059\u308b\u4e88\u7d04\u3092\u9078\u629e",
-            },
-        ),
-    )
+    await _reply_plan(reply_token, "cancel", _cancel_confirmation_plan(reservation))
 
 
 async def _notify_shadow_admin(text: str, reply_token: str | None, actor_user_id: str | None) -> None:
