@@ -39,6 +39,16 @@ _OUTCOME_CLAIM = re.compile(
 )
 
 
+# 別の日を案内する言い方。骨格が言っていなければ、日付は動いていない。
+_OTHER_DAY_CLAIM = re.compile(r"別の日|別日程|他の日")
+
+# 骨格に根拠が無ければ書いてはいけない主張。
+_GROUNDED_CLAIMS = (
+    (_OUTCOME_CLAIM, "完了"),
+    (_OTHER_DAY_CLAIM, "別日の案内"),
+)
+
+
 @dataclass
 class ReplyPlan:
     """1通の返信に入れてよいものの全部。ここに無いものは書けない。"""
@@ -90,10 +100,13 @@ class ReplyPlan:
             if f"{index}." not in polished and f"{index}．" not in polished:
                 return f"候補の番号が消えている: {index}"
 
-        # 骨格が伝えていない「済んだ」を足していないか。
+        # 骨格が言っていないことを足していないか。
         # 実際には何も実行していないのに「ご予約を承りました」と書いた（2026-09-06 実機）。
-        if _OUTCOME_CLAIM.search(polished) and not _OUTCOME_CLAIM.search(self.render()):
-            return "骨格に無い完了を伝えている"
+        # 同じ日の候補なのに「別の日をご案内します」と書くのも同じ種類の作り話。
+        skeleton = self.render()
+        for pattern, label in _GROUNDED_CLAIMS:
+            if pattern.search(polished) and not pattern.search(skeleton):
+                return f"骨格に無い{label}を伝えている"
 
         asks_yes_no = bool(_YES_NO_REQUEST.search(polished))
         if asks_yes_no and not self.yes_no:
@@ -114,6 +127,150 @@ class ReplyPlan:
             return f"質問が別の話に変わっている（{self.ask_about} を尋ねていない）"
 
         return None
+
+
+def _slot_times(candidate: dict) -> list[str]:
+    return [str(candidate.get(key)) for key in ("start", "end") if candidate.get(key)]
+
+
+def _offer_plan(context: dict) -> ReplyPlan | None:
+    """候補提示の骨格。候補の中身と番号はコードが決める。"""
+    candidates = [c for c in (context.get("alternatives") or []) if isinstance(c, dict)]
+    if not candidates:
+        return None
+
+    facts: list[str] = []
+    keep: list[str] = []
+
+    # 希望の担当を出せていないなら、候補と同じ重みでその事実を先に置く。
+    preferred = context.get("preferred_practitioner")
+    if isinstance(preferred, dict) and preferred.get("name") and not preferred.get("has_candidate"):
+        name = str(preferred["name"]).split()[0]
+        facts.append(f"{name}は、ご希望の条件では空きがございませんでした。")
+        keep.append(name)
+
+    # 別の日を出すなら、黙って日付を動かさない。
+    if context.get("candidates_on_other_dates"):
+        requested = context.get("requested_date")
+        if requested:
+            facts.append(f"{requested}はご希望に沿う空きがなく、別の日をご案内します。")
+            keep.append(str(requested))
+        else:
+            facts.append("ご希望の日に空きがなく、別の日をご案内します。")
+    else:
+        facts.append("空いているお時間をご案内します。")
+
+    options: list[str] = []
+    for candidate in candidates:
+        label = candidate.get("label")
+        if not label:
+            label = " ".join(_slot_times(candidate))
+        options.append(str(label))
+        keep.extend(_slot_times(candidate))
+
+    return ReplyPlan(
+        facts=facts,
+        options=options,
+        note=context.get("first_visit_note"),
+        ask="ご希望の番号を教えていただけますか？",
+        ask_about="番号",
+        keep=[term for term in keep if term],
+    )
+
+
+_ASK_LABELS = {
+    "date": "ご希望日",
+    "time": "ご希望のお時間",
+    "menu_name": "ご希望のメニュー",
+    "menu": "ご希望のメニュー",
+    "duration_minutes": "ご希望の施術時間",
+    "practitioner": "ご希望の担当者",
+}
+
+
+def _ask_plan(situation: str, context: dict) -> ReplyPlan | None:
+    """足りない項目だけを尋ねる骨格。受け取った項目は事実として先に置く。"""
+    form = context.get("booking_form")
+    filled = (form or {}).get("filled") if isinstance(form, dict) else None
+    missing = (form or {}).get("missing") if isinstance(form, dict) else None
+
+    facts: list[str] = []
+    keep: list[str] = []
+    for key in ("date", "time", "menu"):
+        value = context.get(key)
+        if value:
+            facts.append(f"{value}ですね。")
+            keep.append(str(value))
+    if not facts and isinstance(filled, dict):
+        for key in ("date", "time"):
+            if filled.get(key):
+                facts.append(f"{filled[key]}ですね。")
+                keep.append(str(filled[key]))
+
+    wanted: list[str] = []
+    for key in context.get("missing_fields") or []:
+        label = _ASK_LABELS.get(str(key))
+        if label and label not in wanted:
+            wanted.append(label)
+    if not wanted and situation == "ask_time_for_date":
+        wanted = ["ご希望のお時間"]
+    if not wanted and situation == "ask_date_for_time":
+        wanted = ["ご希望日"]
+    if not wanted and situation == "ask_menu":
+        wanted = ["ご希望のメニュー"]
+    if not wanted and isinstance(missing, list):
+        for key in missing:
+            label = _ASK_LABELS.get(str(key))
+            if label and label not in wanted:
+                wanted.append(label)
+    if not wanted:
+        return None
+
+    return ReplyPlan(
+        facts=facts,
+        note=context.get("first_visit_note"),
+        ask=f"{'と'.join(wanted)}を教えていただけますか？",
+        ask_about=wanted[0],
+        keep=keep,
+    )
+
+
+def _usual_confirm_plan(context: dict) -> ReplyPlan | None:
+    """「いつもの」内容の確認の骨格。"""
+    menu = context.get("menu")
+    if not menu:
+        return None
+    parts = [str(menu)]
+    keep = [str(menu)]
+    duration = context.get("duration") or context.get("duration_minutes")
+    if duration:
+        parts.append(f"{duration}分")
+        keep.append(str(duration))
+    practitioner = context.get("practitioner")
+    if practitioner:
+        parts.append(f"担当: {practitioner}")
+        keep.append(str(practitioner))
+    return ReplyPlan(
+        facts=["いつもの " + "・".join(parts)],
+        ask="こちらの内容でお探ししてよろしいですか？",
+        ask_about="よろしい",
+        yes_no=True,
+        keep=keep,
+    )
+
+
+def plan_for(situation: str, context: dict) -> ReplyPlan | None:
+    """その場面の骨格を組み立てる。組み立てられない場面は None を返す。
+
+    None のときは従来どおりLLMが全文を書く。移行が済んでいない場面がそれ。
+    """
+    if situation == "offer_alternatives":
+        return _offer_plan(context)
+    if situation == "usual_confirm":
+        return _usual_confirm_plan(context)
+    if situation in {"ask_datetime", "ask_time_for_date", "ask_date_for_time", "ask_menu", "ask_missing"}:
+        return _ask_plan(situation, context)
+    return None
 
 
 POLISH_PROMPT = """あなたは接骨院の受付です。次の文面を、患者へ送る自然で温かい日本語に整えてください。

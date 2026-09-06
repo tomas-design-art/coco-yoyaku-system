@@ -36,7 +36,7 @@ from app.services.conflict_detector import check_conflict
 from app.services.line_alerts import build_reservation_review_flex, push_admin_reservation_review
 from app.services.booking_form import Form as BookingForm
 from app.services.line_composer import compose_from_plan, compose_reply
-from app.services.reply_plan import ReplyPlan
+from app.services.reply_plan import ReplyPlan, plan_for
 from app.services.line_debounce import clear_debounce, is_duplicate_message, merge_debounced_message
 from app.services.line_inbox import (
     claim_pending_events,
@@ -1392,7 +1392,13 @@ async def _compose_autopilot_reply(
                 if draft.get(key) and enriched_context.get(key) in (None, ""):
                     enriched_context[key] = draft[key]
 
-    reply = await compose_reply(situation, enriched_context)
+    # 骨格を組み立てられる場面は、コードが決めた骨格をLLMに整えさせる。
+    # 組み立てられない場面だけ、従来どおりLLMが全文を書く。
+    plan = plan_for(situation, enriched_context)
+    if plan is not None:
+        reply = await compose_from_plan(plan)
+    else:
+        reply = await compose_reply(situation, enriched_context)
     if db is not None and user_id:
         await append_conversation_history(db, user_id, "assistant", reply)
     parser_summary = {

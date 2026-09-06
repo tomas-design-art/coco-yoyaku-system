@@ -48,13 +48,13 @@ def test_a_reworded_skeleton_is_accepted():
         # 実機で起きた事故そのもの：質問が別の話へ差し替わり、「いいえ」の意味が反転した
         (
             "2026/09/06 15:00（担当: 時田）のキャンセルを承ります。\n"
-            "改めて別の日程でご予約をお取りしましょうか？\nはい / いいえ",
+            "続けて次回のご予約もお取りしましょうか？\nはい / いいえ",
             "質問が別の話",
         ),
         # 質問を足す
         (
             "2026/09/06 15:00（担当: 時田）をキャンセルしてよろしいですか？\n"
-            "別の日程もお取りしましょうか？\nはい / いいえ",
+            "次回のご予約もお取りしましょうか？\nはい / いいえ",
             "質問が増えている",
         ),
         # 確定事実を落とす
@@ -91,7 +91,7 @@ def test_a_plan_without_a_question_must_not_be_turned_into_one():
         plan.rejects("2026/09/06 15:00のご予約をキャンセルしました。\n続けて予約しますか？\nはい / いいえ") or ""
     )
     assert "質問が増えている" in (
-        plan.rejects("2026/09/06 15:00のご予約をキャンセルしました。\n別の日程をお取りしましょうか？") or ""
+        plan.rejects("2026/09/06 15:00のご予約をキャンセルしました。\n次回のご予約もお取りしましょうか？") or ""
     )
 
 
@@ -119,3 +119,104 @@ def test_a_completed_action_may_be_reported_when_the_skeleton_says_so():
         keep=["2026/09/06", "15:00"],
     )
     assert plan.rejects("2026/09/06 15:00のご予約をキャンセルしました。ご連絡ありがとうございました。") is None
+
+
+# ─────────────────────────────────────────────────────────────
+# 候補提示・質問の骨格（旧来の場面別チェックの代わり）
+# ─────────────────────────────────────────────────────────────
+
+
+def _offer_context() -> dict:
+    return {
+        "alternatives": [
+            {
+                "date": "2026-09-07",
+                "start": "17:00",
+                "end": "18:00",
+                "practitioner_id": 3,
+                "practitioner_name": "出口",
+                "label": "17:00〜18:00（担当: 出口）",
+            },
+            {
+                "date": "2026-09-07",
+                "start": "18:00",
+                "end": "19:00",
+                "practitioner_id": 3,
+                "practitioner_name": "出口",
+                "label": "18:00〜19:00（担当: 出口）",
+            },
+        ],
+        "preferred_practitioner": {"name": "時田", "has_candidate": False},
+    }
+
+
+def test_the_offer_states_who_could_not_be_offered():
+    """希望した担当を出せないなら、その事実を候補と同じ重みで伝える。"""
+    from app.services.reply_plan import plan_for
+
+    plan = plan_for("offer_alternatives", _offer_context())
+    rendered = plan.render()
+    assert "時田" in rendered
+    assert "1. 17:00〜18:00（担当: 出口）" in rendered
+    assert "2. 18:00〜19:00（担当: 出口）" in rendered
+    assert plan.rejects(rendered) is None
+
+
+@pytest.mark.parametrize(
+    "polished,expected",
+    [
+        # 指名された担当に触れずに別の担当だけ並べる
+        (
+            "空いているお時間をご案内します。\n1. 17:00〜18:00（担当: 出口）\n"
+            "2. 18:00〜19:00（担当: 出口）\nご希望の番号を教えていただけますか？",
+            "確定事実が消えている",
+        ),
+        # 同じ日の候補なのに「別の日」と言う
+        (
+            "時田は空きがございませんでした。別の日をご案内します。\n"
+            "1. 17:00〜18:00（担当: 出口）\n2. 18:00〜19:00（担当: 出口）\nご希望の番号は？",
+            "別日の案内",
+        ),
+        # 候補を出しているだけなのに予約を取ったと言う
+        (
+            "時田は空きがございませんでした。1. 17:00〜18:00（担当: 出口）"
+            "2. 18:00〜19:00（担当: 出口）でご予約を承りました。",
+            "完了",
+        ),
+    ],
+)
+def test_the_offer_cannot_be_turned_into_something_else(polished, expected):
+    from app.services.reply_plan import plan_for
+
+    reason = plan_for("offer_alternatives", _offer_context()).rejects(polished)
+    assert reason is not None
+    assert expected in reason
+
+
+def test_a_question_asks_only_for_what_is_missing():
+    """受け取った項目は事実として置き、足りない項目だけを尋ねる。"""
+    from app.services.reply_plan import plan_for
+
+    plan = plan_for(
+        "ask_time_for_date",
+        {
+            "date": "9/7(月)",
+            "booking_form": {"filled": {"date": "2026-09-07"}, "missing": ["time"]},
+        },
+    )
+    rendered = plan.render()
+    assert "9/7(月)" in rendered
+    assert "お時間" in rendered
+    assert "はい" not in rendered  # 聞いていない「はい/いいえ」を作らない
+    assert plan.rejects(rendered) is None
+    # 受け取った日付を落として聞き直すのは通さない
+    assert "確定事実が消えている" in (plan.rejects("ご希望の日時を教えていただけますか？") or "")
+
+
+def test_situations_that_are_not_migrated_have_no_skeleton():
+    """骨格を組み立てられない場面は None を返し、従来どおりLLMが書く。"""
+    from app.services.reply_plan import plan_for
+
+    assert plan_for("answer_question", {}) is None
+    assert plan_for("small_talk", {}) is None
+    assert plan_for("offer_alternatives", {"alternatives": []}) is None

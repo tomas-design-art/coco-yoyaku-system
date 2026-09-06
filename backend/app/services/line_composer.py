@@ -533,11 +533,6 @@ def _asks_more_than_one_question(situation: str, reply: str) -> bool:
     return situation == "cancel_confirm" and bool(_OFFTOPIC_IN_CANCEL_CONFIRM.search(reply))
 
 
-def _has_premature_confirmation(situation: str, reply: str) -> bool:
-    """候補提示中に、DB登録前の予約確定を患者へ誤案内していないか。"""
-    return situation == "offer_alternatives" and any(word in reply for word in _PREMATURE_CONFIRMATION_WORDS)
-
-
 # 予約の「完了」を名乗る言い方。確認（お取りしてよろしいでしょうか／お取りしましょうか）は含めない。
 _COMPLETED_BOOKING_CLAIM = re.compile(
     r"(?:予約|お席)(?:を|が|も)?\s*(?:承り|確定し|お取りし|お取りいたし|完了し|承っ)"
@@ -586,21 +581,6 @@ def _has_wrong_booking_outcome(situation: str, reply: str) -> bool:
     return False
 
 
-def _has_misleading_alternative_context(situation: str, context: dict, reply: str) -> bool:
-    """同日候補・時刻未指定の案内を、別日や満席と取り違えていないか。"""
-    if situation != "offer_alternatives":
-        return False
-    candidate_dates = {
-        str(item.get("date"))
-        for item in context.get("alternatives") or []
-        if isinstance(item, dict) and item.get("date")
-    }
-    says_other_day = bool(re.search(r"別の日程を(?:ご)?案内|別の日でしたら|別日(?:程)?を(?:ご)?案内", reply))
-    if len(candidate_dates) == 1 and says_other_day:
-        return True
-    return bool(context.get("date_only") and re.search(r"(?:希望|ご希望).{0,8}(?:時間帯|時間).{0,12}(?:満席|埋ま)", reply))
-
-
 # すでに受け取った項目を聞き直していないかを見る。
 # 「担当は承知しました。ご希望の日時を教えてください」と、直前に聞いた日時を
 # もう一度尋ねるループが実機で起きた（2026-09-04）。
@@ -629,21 +609,6 @@ def _asks_for_a_slot_already_received(context: dict, reply: str) -> bool:
             if key in filled and pattern.search(sentence):
                 return True
     return False
-
-
-def _ignores_unavailable_preferred_practitioner(context: dict, reply: str) -> bool:
-    """指名された担当者を出せないのに、その人に一言も触れていないか。
-
-    黙って別の担当者の枠を並べると、患者には指名が無視されたように見える。
-    """
-    preferred = context.get("preferred_practitioner")
-    if not isinstance(preferred, dict) or preferred.get("has_candidate"):
-        return False
-    name = str(preferred.get("name") or "")
-    if not name:
-        return False
-    surname = name.split()[0]
-    return surname not in reply
 
 
 def _has_unprompted_price_reference(context: dict, reply: str) -> bool:
@@ -841,9 +806,6 @@ async def compose_reply(situation: str, context: dict) -> str:
                 if _has_unsupported_claim(context, text):
                     reason = "unsupported_claim"
                     continue
-                if _has_premature_confirmation(situation, text):
-                    reason = "unsupported_claim"
-                    continue
                 if _has_wrong_booking_outcome(situation, text):
                     reason = "unsupported_claim"
                     continue
@@ -852,12 +814,6 @@ async def compose_reply(situation: str, context: dict) -> str:
                     continue
                 if _asks_for_a_confirmation_the_code_is_not_waiting_for(situation, text):
                     reason = "unrequested_confirmation"
-                    continue
-                if _has_misleading_alternative_context(situation, context, text):
-                    reason = "alternative_context"
-                    continue
-                if _ignores_unavailable_preferred_practitioner(context, text):
-                    reason = "ignored_preferred_practitioner"
                     continue
                 if _asks_for_a_slot_already_received(context, text):
                     reason = "reasked_known_slot"

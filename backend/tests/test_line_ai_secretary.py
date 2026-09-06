@@ -2850,41 +2850,12 @@ def test_confirmation_rejects_weekday_that_disagrees_with_confirmed_date():
     assert _has_temporal_contradiction(context, "9/4(金) 17:00〜18:00で承りました。", "confirmed") is False
 
 
-def test_offer_alternatives_cannot_claim_the_reservation_is_already_confirmed():
-    from app.services.line_composer import _has_premature_confirmation
-
-    assert _has_premature_confirmation("offer_alternatives", "19:30で承りました。") is True
-    assert _has_premature_confirmation("offer_alternatives", "ご希望の番号を教えてください。") is False
-    assert _has_premature_confirmation("confirmed", "19:30で予約を確定しました。") is False
-
-
 def test_single_offered_slot_accepts_natural_affirmative_without_number():
     from app.api.line import _select_offered_alternative
 
     alternatives = [{"date": "2026-08-24", "start": "19:30", "end": "20:30"}]
     assert _select_offered_alternative("じゃあそれでお願いします", alternatives) == 1
     assert _select_offered_alternative("もっと遅い時間はありますか？", alternatives) is None
-
-
-def test_offer_alternatives_rejects_misleading_same_day_and_unprompted_price_claims():
-    from app.services.line_composer import (
-        _has_misleading_alternative_context,
-        _has_unprompted_price_reference,
-    )
-
-    context = {
-        "alternatives": [{"date": "2026-08-24", "start": "19:30", "end": "20:30"}],
-        "date_only": True,
-        "patient_message": "明日、いつもので予約お願いします",
-    }
-    assert _has_misleading_alternative_context(
-        "offer_alternatives", context, "別の日程をご案内します。"
-    ) is True
-    assert _has_misleading_alternative_context(
-        "offer_alternatives", context, "ご希望の時間帯は埋まっています。"
-    ) is True
-    assert _has_unprompted_price_reference(context, "料金については当日スタッフよりご案内します。") is True
-    assert _has_unprompted_price_reference(context, "19:30からご案内できます。") is False
 
 
 def test_reservation_status_question_recognizes_my_booking_phrase():
@@ -4011,33 +3982,6 @@ def test_preferred_practitioner_context_flags_when_the_request_could_not_be_met(
     # 担当の指名が無ければ何も足さない
     assert _preferred_practitioner_context({}, others) == {}
     assert _preferred_practitioner_context(None, others) == {}
-
-
-def test_reply_must_mention_the_practitioner_it_could_not_offer():
-    """指名された担当に触れずに別の担当の枠だけを並べる返信を止める。
-
-    2026-09-04 実機: 時田を3回指名されたのに理由を言わず、
-    別の施術者の枠だけを出し続けてループになった。
-    """
-    from app.services.line_composer import _ignores_unavailable_preferred_practitioner
-
-    context = {"preferred_practitioner": {"name": "時田", "has_candidate": False}}
-
-    silent = "9/6(日)は 17:00〜18:00、18:00〜19:00 が空いております。ご希望の番号を教えてください。"
-    assert _ignores_unavailable_preferred_practitioner(context, silent) is True
-
-    honest = (
-        "9/6(日)の夕方以降、時田は空きがございません。"
-        "同じ日でしたら 12:30〜13:30 で時田がご案内できます。"
-        "夕方をご希望でしたら 17:00〜18:00 で別の担当となります。"
-    )
-    assert _ignores_unavailable_preferred_practitioner(context, honest) is False
-
-    # 希望担当の枠を出せているときは黙っていてよい
-    met = {"preferred_practitioner": {"name": "時田", "has_candidate": True}}
-    assert _ignores_unavailable_preferred_practitioner(met, silent) is False
-    # 指名そのものが無いときも対象外
-    assert _ignores_unavailable_preferred_practitioner({}, silent) is False
 
 
 # ─────────────────────────────────────────────────────────────
