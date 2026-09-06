@@ -964,7 +964,10 @@ async def test_autopilot_change_proposes_slot_before_rescheduling():
     assert proposed is True
     assert mock_merge.await_args.args[2]["autopilot_change_reservation_id"] == 91
     assert mock_set_mode.await_args.args[2] == "autopilot_change_confirm"
-    assert "よろしいでしょうか" in mock_reply.await_args.args[1]
+    # 言い回しはLLMが整えるので、確かめるのは骨格が伝える事実と確認の有無だけ
+    message = mock_reply.await_args.args[1]
+    assert "14:00" in message and "15:00" in message and "時田" in message
+    assert "はい / いいえ" in message
     # はい/いいえはボタンで受ける（文面が変わっても意味が反転しない）
     assert [item["action"]["data"] for item in mock_reply.await_args.args[2]] == [
         "action=confirm&form=change&answer=yes",
@@ -995,8 +998,8 @@ async def test_autopilot_change_selected_candidate_is_not_researched_or_remapped
     with patch("app.api.line.find_best_practitioner", new=AsyncMock()) as mock_find, patch(
         "app.api.line.merge_user_draft", new=AsyncMock()
     ) as mock_merge, patch("app.api.line.set_user_mode", new=AsyncMock()), patch(
-        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="確認文")
-    ) as mock_compose, patch("app.api.line.reply_to_line", new=AsyncMock()):
+        "app.api.line.reply_text_with_quick_reply", new=AsyncMock()
+    ) as mock_reply, patch("app.api.line.reply_to_line", new=AsyncMock()):
         proposed = await _complete_autopilot_reschedule(
             db,
             reservation=reservation,
@@ -1012,8 +1015,10 @@ async def test_autopilot_change_selected_candidate_is_not_researched_or_remapped
     stored = mock_merge.await_args.args[2]
     assert stored["autopilot_change_start_time_iso"].endswith("10:45:00+09:00")
     assert stored["autopilot_change_end_time_iso"].endswith("11:45:00+09:00")
-    assert mock_compose.await_args.args[1]["start"] == "10:45"
-    assert mock_compose.await_args.args[1]["end"] == "11:45"
+    # 選んだ枠がそのまま確認されること。文面の骨格はコードが作る。
+    message = mock_reply.await_args.args[1]
+    assert "10:45" in message and "11:45" in message
+    assert "よろしいですか" in message
 
 
 @pytest.mark.asyncio

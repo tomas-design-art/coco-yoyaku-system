@@ -1025,6 +1025,44 @@ def _build_confirmation_quick_reply_items(form: str) -> list[dict]:
     ]
 
 
+def _slot_confirmation_plan(
+    *,
+    start_dt: datetime,
+    end_dt: datetime,
+    practitioner_name: str | None,
+    menu_name: str | None = None,
+    note: str | None = None,
+    purpose: str = "ご予約",
+) -> ReplyPlan:
+    """枠の確認の骨格。日時・担当・メニューはここで決まり、LLMは言い回しだけ整える。"""
+    day = _format_date_with_weekday_jp(start_dt.date())
+    begin = start_dt.strftime("%H:%M")
+    finish = end_dt.strftime("%H:%M")
+    detail = f"{day} {begin}〜{finish}"
+    parts = []
+    if practitioner_name:
+        parts.append(f"担当: {practitioner_name}")
+    if menu_name:
+        parts.append(f"メニュー: {menu_name}")
+    if parts:
+        detail += "（" + "・".join(parts) + "）"
+
+    keep = [day, begin, finish]
+    if practitioner_name:
+        keep.append(practitioner_name)
+    if menu_name:
+        keep.append(menu_name)
+
+    return ReplyPlan(
+        facts=[detail],
+        note=note,
+        ask=f"こちらで{purpose}をお取りしてよろしいですか？",
+        ask_about="よろしい",
+        yes_no=True,
+        keep=keep,
+    )
+
+
 def _cancel_confirmation_plan(reservation: Reservation, remaining: int = 0) -> ReplyPlan:
     """キャンセル確認の骨格。文面はここで決まり、LLMは言い回しだけ整える。"""
     start = reservation.start_time.astimezone(JST)
@@ -1454,22 +1492,16 @@ async def _complete_autopilot_reschedule(
         },
     )
     await set_user_mode(db, user_id, "autopilot_change_confirm")
-    if reply_token:
-        await _reply_confirmation(
-            reply_token,
-            "change",
-            await _compose_autopilot_reply(
-                "confirm_slot",
-                {
-                    "date": _format_date_with_weekday_jp(start_dt.date()),
-                    "start": start_dt.strftime("%H:%M"),
-                    "end": end_dt.strftime("%H:%M"),
-                    "practitioner": practitioner.name,
-                    "patient_message": patient_message,
-                    "purpose": "予約変更後の候補確認",
-                },
-            ),
-        )
+    await _reply_plan(
+        reply_token,
+        "change",
+        _slot_confirmation_plan(
+            start_dt=start_dt,
+            end_dt=end_dt,
+            practitioner_name=practitioner.name,
+            purpose="変更後のご予約",
+        ),
+    )
     return True
 
 
@@ -2294,23 +2326,16 @@ async def _renegotiate_autopilot_change(
         },
     )
     await set_user_mode(db, user_id, "autopilot_change_confirm")
-    if reply_token:
-        await _reply_confirmation(
-            reply_token,
-            "change",
-            await _compose_autopilot_reply(
-                "confirm_slot",
-                {
-                    "date": _format_date_with_weekday_jp(start_dt.date()),
-                    "start": start_dt.strftime("%H:%M"),
-                    "end": end_dt.strftime("%H:%M"),
-                    "practitioner": best["practitioner_name"],
-                    "purpose": "予約変更後の候補確認",
-                    "patient_message": text,
-                },
-                parsed_intent,
-            ),
-        )
+    await _reply_plan(
+        reply_token,
+        "change",
+        _slot_confirmation_plan(
+            start_dt=start_dt,
+            end_dt=end_dt,
+            practitioner_name=best["practitioner_name"],
+            purpose="変更後のご予約",
+        ),
+    )
     return True
 
 
@@ -4119,25 +4144,17 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     return
             await update_request(db, request_id, line_user_id=user_id, status="awaiting_patient_confirmation")
             await set_user_mode(db, user_id, "autopilot_booking_confirm", request_id)
-            if reply_token:
-                await _reply_confirmation(
-                    reply_token,
-                    "booking",
-                    await _compose_autopilot_reply(
-                        "confirm_slot",
-                        {
-                            "patient_name": customer_name,
-                            "date": _format_date_with_weekday_jp(start_dt.date()),
-                            "start": start_dt.strftime("%H:%M"),
-                            "end": end_dt.strftime("%H:%M"),
-                            "practitioner": practitioner.name,
-                            "menu": menu.name if menu else menu_name,
-                            "first_visit_note": first_visit_note,
-                            "patient_message": text,
-                        },
-                        parsed_intent,
-                    ),
-                )
+            await _reply_plan(
+                reply_token,
+                "booking",
+                _slot_confirmation_plan(
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    practitioner_name=practitioner.name,
+                    menu_name=menu.name if menu else menu_name,
+                    note=first_visit_note,
+                ),
+            )
             return
 
         await update_request(db, request_id, line_user_id=user_id, status="alternatives_sent")
