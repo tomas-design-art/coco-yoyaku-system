@@ -2568,10 +2568,11 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         mentions_practitioner = bool(
             (parsed_intent or {}).get("practitioner") or re.search(r"先生|担当", text or "")
         )
-        if mentions_practitioner and (
-            prev_draft.get("autopilot_offered_slots")
-            or current_mode in {"adjusting", "autopilot_booking_confirm"}
-        ):
+        # 担当の指名は、日時やメニューと違って「いまの用件が何か」に左右されない。
+        # スロットの蓄積は intent が question/cancel/change だと動かないため、
+        # 「時田先生です」が質問として読まれると箱が埋まらなかった（2026-09-06 実機）。
+        # 指名かどうかの判断は解析側に任せてあるので、ここではモードで絞らない。
+        if mentions_practitioner:
             requested = await _extract_requested_practitioner(db, text, parsed_intent)
             if requested and requested.id != (merged or prev_draft).get("practitioner_id"):
                 merged = await merge_user_draft(

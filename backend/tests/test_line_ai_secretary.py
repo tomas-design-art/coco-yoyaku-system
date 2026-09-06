@@ -4644,3 +4644,136 @@ def test_ordinary_replies_are_not_mistaken_for_a_confirmation(situation, reply):
     from app.services.line_composer import _asks_for_a_confirmation_the_code_is_not_waiting_for
 
     assert _asks_for_a_confirmation_the_code_is_not_waiting_for(situation, reply) is False
+
+
+# ─────────────────────────────────────────────────────────────
+# 担当を名指しされたら「箱が埋まる」ことを、返信の文面ではなく状態で確かめる
+# Botが「承知いたしました」と書いたことは、箱が埋まった証拠にならない
+# ─────────────────────────────────────────────────────────────
+
+
+class _PractitionerDB(_EmptyDB):
+    _PRACTITIONERS = [
+        SimpleNamespace(id=1, name="時田 太郎", is_active=True, display_order=1),
+        SimpleNamespace(id=2, name="上田 花子", is_active=True, display_order=2),
+    ]
+
+    class _Result:
+        def __init__(self, items):
+            self._items = items
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return self._items
+
+        def first(self):
+            return self._items[0] if self._items else None
+
+        def scalar_one_or_none(self):
+            return None
+
+        def scalar(self):
+            return None
+
+    async def execute(self, *_args, **_kwargs):
+        return self._Result(self._PRACTITIONERS)
+
+
+async def _fill_practitioner_box(mode: str, intent: str, user_id: str) -> list[dict]:
+    """「時田先生です」を流し、会話状態へ何が書かれたかを返す。"""
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    draft = {"date": "2026-09-07", "menu_name": "マッスルセラピー", "duration_minutes": 60}
+    state = {"mode": mode, "draft": dict(draft), "request_id": None, "context_data": {}}
+    parsed = {
+        "intent": intent,
+        "confidence": "medium",
+        "constraints": [],
+        "has_reservation_intent": True,
+        "practitioner": "時田",
+    }
+    written: list[dict] = []
+
+    async def fake_merge(_db, _uid, update, *_a, **_k):
+        written.append(dict(update))
+        draft.update({k: v for k, v in update.items() if v not in (None, "")})
+        return dict(draft)
+
+    patched = {
+        "get_user_state": state,
+        "get_user_mode": mode,
+        "_get_line_display_name": "時田",
+        "_find_line_patient": patient,
+        "_get_latest_reservation_for_line_user": None,
+        "build_clinic_context": {},
+        "parse_line_message": parsed,
+        "_resolve_booking_defaults": {},
+        "_get_patient_default_preset": None,
+        "_resolve_menu": None,
+        "set_user_mode": None,
+        "build_day_availability_summary": {},
+        "build_candidates_over_days": [],
+        "create_pending_request": "rid",
+        "update_request": None,
+        "get_request": None,
+        "_compose_autopilot_reply": "（返信）",
+        "reply_to_line": None,
+        "reply_text_with_quick_reply": None,
+        "create_notification": None,
+        "_handoff_autopilot_to_human": None,
+        "_reply_with_loop_guard": False,
+    }
+    with ExitStack() as stack:
+        stack.enter_context(patch("app.api.line.settings.line_autopilot_enabled", True))
+        for name, value in patched.items():
+            stack.enter_context(patch(f"app.api.line.{name}", new=AsyncMock(return_value=value)))
+        stack.enter_context(
+            patch("app.api.line.find_best_practitioner", new=AsyncMock(return_value=(None, None, None, 0, 0)))
+        )
+        stack.enter_context(patch("app.api.line.merge_user_draft", new=fake_merge))
+        try:
+            await _handle_text_message(
+                {
+                    "replyToken": "reply-token",
+                    "source": {"userId": user_id},
+                    "message": {"type": "text", "text": "時田先生です"},
+                },
+                _PractitionerDB(),
+            )
+        except Exception:  # noqa: BLE001
+            # 箱を埋めるのは会話の前半。後半で検証用のDBが答えられずに止まっても、
+            # 埋まった分は判定できる。
+            pass
+    return written
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode,intent",
+    [
+        ("idle", "new"),
+        ("waiting_datetime", "new"),
+        ("adjusting", "new"),
+        ("autopilot_booking_confirm", "new"),
+        # 解析が「質問」と読んだ場合。ここが埋まらず、指名が何度も無視されていた
+        ("waiting_datetime", "question"),
+        ("adjusting", "question"),
+    ],
+)
+async def test_naming_a_practitioner_fills_the_box_whatever_the_message_looks_like(mode, intent):
+    """担当の指名は「いまの用件が何か」に左右されない。
+
+    スロットの蓄積は intent が question のとき動かないため、
+    「時田先生です」が質問として読まれると箱が埋まらなかった（2026-09-06 実機）。
+    ※ user_id はケースごとに変える。同じIDと同じ本文は8秒の重複判定で捨てられ、
+      「埋まらなかった」ように見えてしまう。
+    """
+    written = await _fill_practitioner_box(mode, intent, f"U-box-{mode}-{intent}")
+
+    stored = [w for w in written if "practitioner_id" in w]
+    assert stored, f"担当の箱が埋まっていない（mode={mode} intent={intent}）"
+    assert stored[0]["practitioner_id"] == 1
+    assert stored[0]["practitioner_name"] == "時田 太郎"
