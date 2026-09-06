@@ -4576,3 +4576,71 @@ async def test_a_known_date_is_not_thrown_away_when_only_the_time_is_missing():
     # 受け取った日付を返信の材料として渡していること
     context = [c.args[1] for c in mock_compose.await_args_list if c.args[0] == "ask_time_for_date"][0]
     assert "9/7" in str(context.get("date"))
+
+
+# ─────────────────────────────────────────────────────────────
+# コードが待っていない「はい/いいえ」を聞かせない
+# 2026-09-06 02:44 実機: 確認していないのに確認文を出し、
+# 患者の「はい」に「うまく聞き取れず申し訳ありません」と返した
+# ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "situation,reply",
+    [
+        (
+            "parse_failed",
+            "時田先生でのマッスルセラピー60分ですね、承知いたしました。"
+            "9月7日（月）17:00のご予約でよろしいでしょうか。はい・いいえでお教えいただけますと幸いです。",
+        ),
+        (
+            "ask_time_for_date",
+            "本日9月6日（日）の17時以降ですが、上田先生の枠でしたら17:00からご案内可能です。"
+            "こちらでご予約をお取りしてよろしいでしょうか？",
+        ),
+        (
+            "answer_question",
+            "9月7日（月）の17時以降ですね。18時以降でしたらご案内可能です。この時間でよろしいでしょうか？",
+        ),
+    ],
+)
+def test_a_confirmation_is_not_invented_when_the_code_cannot_receive_it(situation, reply):
+    """確認を待つ状態はコードが作る。作っていないのに確認を聞かせない。
+
+    聞いてしまうと、返ってきた「はい」に行き先が無く会話が止まる。
+    実機で送られた文面をそのまま使う。
+    """
+    from app.services.line_composer import _asks_for_a_confirmation_the_code_is_not_waiting_for
+
+    assert _asks_for_a_confirmation_the_code_is_not_waiting_for(situation, reply) is True
+
+
+@pytest.mark.parametrize(
+    "situation,reply",
+    [
+        ("confirm_slot", "9月7日（月）17:00のご予約でよろしいでしょうか。\nはい / いいえ"),
+        ("cancel_confirm", "2026/09/06 15:00のご予約をキャンセルしてよろしいですか？"),
+        ("usual_confirm", "いつものマッスルセラピー60分・担当は時田でよろしいでしょうか。\nはい / いいえ"),
+    ],
+)
+def test_the_situations_that_do_wait_for_yes_or_no_may_ask_for_it(situation, reply):
+    from app.services.line_composer import _asks_for_a_confirmation_the_code_is_not_waiting_for
+
+    assert _asks_for_a_confirmation_the_code_is_not_waiting_for(situation, reply) is False
+
+
+@pytest.mark.parametrize(
+    "situation,reply",
+    [
+        ("offer_alternatives", "1. 17:00〜18:00（担当：時田）\n2. 18:00〜19:00（担当：出口）\nご希望の番号を教えていただけますでしょうか。"),
+        ("ask_datetime", "9/7(月)ですね。ご希望のお時間を教えてください。"),
+        ("no_candidates", "その時間は空きがございませんでした。別の日はいかがでしょうか。"),
+        ("cancel_done", "2026/09/06 15:00のご予約をキャンセルしました。"),
+        ("answer_question", "9月の休診日は8日と22日です。"),
+    ],
+)
+def test_ordinary_replies_are_not_mistaken_for_a_confirmation(situation, reply):
+    """確認していない普通の返信まで止めない。"""
+    from app.services.line_composer import _asks_for_a_confirmation_the_code_is_not_waiting_for
+
+    assert _asks_for_a_confirmation_the_code_is_not_waiting_for(situation, reply) is False

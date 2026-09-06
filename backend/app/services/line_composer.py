@@ -375,6 +375,7 @@ _RETRY_NOTES = {
     "repeated_reply": "\n前回の返信は直近のあなた自身の返答と同じ定型的な冒頭を繰り返していました。患者の最新発言と確定事実にだけ応じ、同じ挨拶や体調への問いかけを繰り返さずに書き直してください。",
     "reasked_known_slot": "\n前回の返信は、すでに患者から受け取っている項目をもう一度尋ねていました。booking_form.filled にある項目は確定済みとして扱い、booking_form.missing にある項目だけを尋ねて書き直してください。",
     "ignored_preferred_practitioner": "\n前回の返信は、患者が指名した担当者を出せない事実に触れずに別の担当者の枠だけを並べていました。指名された担当者の名前を出し、その条件では空きが無いことを先に伝えてから候補を案内してください。",
+    "unrequested_confirmation": "\n前回の返信は「はい／いいえ」で答える確認を患者へ求めていましたが、いまは確認を受け付けられる場面ではありません。患者の「はい」を処理できず会話が止まります。確認を求めず、いま分かっている事実の案内と、足りない項目の質問だけで書き直してください。",
     "extra_question": "\n前回の返信は、いま確認すべきこと以外の質問を足していました。いま確認すべき1点だけを尋ね、再予約や別日程など他の話題は一切持ち出さずに書き直してください。",
 }
 
@@ -484,6 +485,29 @@ _CONFIRMATION_SITUATIONS = {"confirm_slot", "usual_confirm", "cancel_confirm", "
 _OFFTOPIC_IN_CANCEL_CONFIRM = re.compile(
     r"改めて.{0,6}(?:別|ご予約|予約)|別の?日程|別日|取り直|再度.{0,4}予約|変更.{0,6}(?:しますか|されますか|なさいますか)"
 )
+
+
+# 「はい/いいえ」で答えさせる形の質問。
+_ASKS_YES_NO = re.compile(
+    r"はい[\s・/／、や]{0,3}いいえ"          # はい・いいえ / はい / いいえ
+    r"|いかがでしょうか。{0,4}はい"
+    r"|よろしい(?:でしょうか|ですか|でしょうか？)"
+    r"|こちらで(?:お取り|ご予約|よろしい)"
+)
+
+
+def _asks_for_a_confirmation_the_code_is_not_waiting_for(situation: str, reply: str) -> bool:
+    """コードが待っていない「はい/いいえ」を患者へ聞いていないか。
+
+    確認を待つ状態はコードが作る。その状態でないのにLLMが
+    「〜でよろしいでしょうか。はい・いいえで」と聞くと、返ってきた「はい」に
+    行き先が無く、会話が迷子になる。
+    2026-09-06 実機: 確認していないのに確認文を出し、患者の「はい」に対して
+    「うまく聞き取れず申し訳ありません」と返した。予約は1件も作られていない。
+    """
+    if situation in _CONFIRMATION_SITUATIONS:
+        return False
+    return bool(_ASKS_YES_NO.search(reply))
 
 
 def _asks_more_than_one_question(situation: str, reply: str) -> bool:
@@ -775,6 +799,9 @@ async def compose_reply(situation: str, context: dict) -> str:
                     continue
                 if _asks_more_than_one_question(situation, text):
                     reason = "extra_question"
+                    continue
+                if _asks_for_a_confirmation_the_code_is_not_waiting_for(situation, text):
+                    reason = "unrequested_confirmation"
                     continue
                 if _has_misleading_alternative_context(situation, context, text):
                     reason = "alternative_context"
